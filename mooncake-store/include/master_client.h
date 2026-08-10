@@ -45,6 +45,22 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
     }
 }
 
+// Applies the RPC timeout overrides to any mooncake-store RPC client config.
+// Shared by the client->master pool and the store->store offload pool so the
+// two cannot drift. Unset variables leave coro_rpc's built-in 30s defaults in
+// place. A negative request timeout disables the per-request timer.
+template <typename ClientConfig>
+inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
+    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+        client_config.request_timeout_duration =
+            std::chrono::milliseconds(std::atoll(timeout_ms));
+    }
+    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+        client_config.connect_timeout_duration =
+            std::chrono::milliseconds(std::atoll(connect_ms));
+    }
+}
+
 }  // namespace detail
 
 /**
@@ -71,20 +87,13 @@ class MasterClient {
                 pool_conf.client_config.socket_config);
         }
 
-        // Per-request timeout for all client->master RPCs. coro_rpc's
-        // send_request falls back to this config value when no per-call
-        // timeout is given, so setting it here covers every RPC method
-        // uniformly. Default stays at coro_rpc's built-in 30s if unset;
-        // a negative value disables the timeout (no timer is armed).
-        if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-            pool_conf.client_config.request_timeout_duration =
-                std::chrono::milliseconds(std::atoll(timeout_ms));
-        }
-        // Optional override for the TCP/RDMA connect timeout (default 30s).
-        if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-            pool_conf.client_config.connect_timeout_duration =
-                std::chrono::milliseconds(std::atoll(connect_ms));
-        }
+        // Per-request timeout for all client->master RPCs, plus an optional
+        // override for the TCP/RDMA connect timeout. coro_rpc's send_request
+        // falls back to the config value when no per-call timeout is given, so
+        // setting it here covers every RPC method uniformly. Defaults stay at
+        // coro_rpc's built-in 30s if unset; a negative request timeout
+        // disables the timer.
+        detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
         client_pools_ =
             std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
                 pool_conf);
@@ -421,6 +430,13 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
         const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Deregisters this client's local disk segment from the master,
+     * dropping the LOCAL_DISK replicas it owns. Idempotent.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
