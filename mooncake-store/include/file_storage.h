@@ -33,8 +33,13 @@ class FileStorage {
      *
      * Latches offloading off first: the heartbeat re-mounts the segment
      * whenever the master answers SEGMENT_NOT_FOUND, which would otherwise
-     * undo this within one heartbeat interval. The latch is not reversible on
-     * success; the process is expected to exit.
+     * undo this within one heartbeat interval. The latch and the
+     * deregistration happen under offloading_mutex_, the lock the heartbeat
+     * holds across its master RPCs, so a tick that read the latch before it
+     * was set cannot resume after the deregistration and re-mount: it either
+     * finished before the drain latched, or it re-checks the latch when it
+     * acquires the lock. The latch is not reversible on success; the process
+     * is expected to exit.
      */
     tl::expected<void, ErrorCode> DrainLocalDiskSegment(
         uint64_t grace_period_ms);
@@ -173,8 +178,12 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
-    // Set by DrainLocalDiskSegment. Stops the heartbeat, which would otherwise
-    // re-mount the segment the drain just deregistered.
+    // Set by DrainLocalDiskSegment under offloading_mutex_. Stops the
+    // heartbeat -- which would otherwise re-mount the segment the drain just
+    // deregistered -- and aborts an in-flight metadata rescan. Checked at
+    // Heartbeat entry (fast path, also guards the rescan-retry block) and
+    // again under offloading_mutex_ before the heartbeat RPC, because a tick
+    // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
 };
 
