@@ -789,6 +789,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // === STEP 1: Send heartbeat and get offloading decisions ===
     {
         MutexLocker locker(&offloading_mutex_);
+        // Re-checked under the lock: the entry check above is only a fast
+        // path. A drain (which latches and deregisters under this same
+        // mutex) may have completed while this tick was parked on it; going
+        // on would hit SEGMENT_NOT_FOUND below and re-mount the segment the
+        // drain just deregistered.
+        if (draining_.load()) {
+            return {};
+        }
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
             enable_offloading_, offloading_objects);
         if (!heartbeat_result) {
@@ -898,16 +906,28 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Latch before the RPC, so a heartbeat tick that overlaps the
-    // deregistration cannot re-mount the segment behind it.
-    draining_.store(true);
+    // Latch and deregister under offloading_mutex_, the lock Heartbeat holds
+    // across its master RPCs and the SEGMENT_NOT_FOUND re-mount. The latch
+    // alone is not enough: a heartbeat that read draining_ == false before
+    // this store() and was then scheduled out would, on resume, see
+    // SEGMENT_NOT_FOUND from the deregistration below and re-mount the
+    // segment. Under the mutex, such a tick is either still parked on the
+    // lock (it re-checks draining_ once it gets it and skips) or it already
+    // finished its RPCs before we latched (anything it mounted or registered
+    // is deregistered again right here, and the master refuses registrations
+    // that arrive after this call returns -- see
+    // MasterService::NotifyOffloadSuccess).
+    {
+        MutexLocker locker(&offloading_mutex_);
+        draining_.store(true);
 
-    auto result = client_->UnmountLocalDiskSegment();
-    if (!result) {
-        LOG(ERROR) << "action=drain_local_disk_segment, error="
-                   << result.error();
-        draining_.store(false);
-        return result;
+        auto result = client_->UnmountLocalDiskSegment();
+        if (!result) {
+            LOG(ERROR) << "action=drain_local_disk_segment, error="
+                       << result.error();
+            draining_.store(false);
+            return result;
+        }
     }
 
     LOG(INFO) << "action=drain_local_disk_segment, grace_period_ms="
@@ -1274,6 +1294,17 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
             [this, &total_keys, &total_batches, &total_failures](
                 const std::vector<std::string>& keys,
                 std::vector<StorageObjectMetadata>& metadatas) {
+                // A rescan can be mid-flight when a drain deregisters the
+                // disk tier; every batch it would register from here on
+                // re-advertises the departing store. The master refuses such
+                // registrations anyway (the segment entry is gone), so this
+                // stops the scan on the first batch instead of on a refused
+                // RPC.
+                if (draining_.load()) {
+                    LOG(INFO) << "ReRegisterOffloadedObjects: aborting scan, "
+                              << "the disk tier is draining";
+                    return ErrorCode::SEGMENT_NOT_FOUND;
+                }
                 total_batches++;
                 total_keys += keys.size();
                 for (auto& metadata : metadatas) {

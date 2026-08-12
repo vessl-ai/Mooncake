@@ -1488,6 +1488,23 @@ void MasterService::ClearInvalidHandles() {
 
 void MasterService::ClearInvalidHandles(
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+    ClearStaleHandles([&alive_clients](const Replica& replica) {
+        return (replica.has_invalid_mem_handle() ||
+                replica.has_invalid_nof_handle() ||
+                replica.has_stale_local_disk_client(alive_clients)) &&
+               replica.is_completed();
+    });
+}
+
+void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
+    ClearStaleHandles([&owner](const Replica& replica) {
+        return replica.is_local_disk_replica() && replica.is_completed() &&
+               replica.get_local_disk_client_id() == owner;
+    });
+}
+
+void MasterService::ClearStaleHandles(
+    const std::function<bool(const Replica&)>& is_stale) {
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, i);
         for (auto tenant_it = shard->tenants.begin();
@@ -1495,7 +1512,7 @@ void MasterService::ClearInvalidHandles(
             auto& tenant_state = tenant_it->second;
             auto it = tenant_state.metadata.begin();
             while (it != tenant_state.metadata.end()) {
-                if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+                if (CleanupStaleHandles(it->second, is_stale, &shard)) {
                     // EraseMetadata handles processing_keys,
                     // replication_tasks, offloading_tasks (with
                     // dec_refcnt), and promotion task cleanup.
@@ -2924,6 +2941,18 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         normalized_tenant = std::move(normalized_tenant_result.value());
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // Same admission rule as NotifyOffloadSuccess's existing-object path,
+    // checked inside the same shared-lock section as the write below: a disk
+    // replica may only be registered for a client whose LOCAL_DISK segment
+    // entry still exists, so a registration cannot land after a concurrent
+    // UnmountLocalDiskSegment's sweep and survive as a stale owner. Scoped
+    // to enable_offload_, where the segment registry exists and a
+    // deregistration can race; with the subsystem off both the mount and
+    // unmount RPCs refuse, so there is nothing to check against and no race
+    // to close.
+    if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -4435,19 +4464,28 @@ bool MasterService::CleanupStaleHandles(
     ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
     MetadataShardAccessorRW* shard) {
-    bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
-        return r.is_local_disk_replica() && r.is_completed();
-    });
     // Remove those with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
-    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
-    EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
+    return CleanupStaleHandles(
+        metadata,
+        [&alive_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
-        });
+        },
+        shard);
+}
+
+bool MasterService::CleanupStaleHandles(
+    ObjectMetadata& metadata,
+    const std::function<bool(const Replica&)>& is_stale,
+    MetadataShardAccessorRW* shard) {
+    bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
+        return r.is_local_disk_replica() && r.is_completed();
+    });
+    const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    EraseReplicasWithCacheTotalAccounting(metadata, is_stale);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (before_charge > after_charge) {
         ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
@@ -4579,33 +4617,42 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // every metadata shard, so it must run without the segment lock held --
     // the same order and the same reason as the expiry branch of
     // ClientMonitorFunc.
+    //
+    // The removal takes snapshot_mutex_ exclusively. NotifyOffloadSuccess
+    // admits a disk-replica registration by checking this client's segment
+    // entry inside one shared-lock section together with the metadata write,
+    // so that section lands entirely before this removal (the sweep below
+    // erases the replica) or entirely after (the check refuses it). Without
+    // the exclusive lock a registration admitted against the old segment
+    // entry could land in a shard the sweep had already passed and survive
+    // as a stale owner.
     {
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
         segment_access.UnmountLocalDiskSegment(client_id);
     }
 
-    // The sweep classifies a LOCAL_DISK replica as stale when its owner is
-    // absent from the set it is given, so the set has to name every owner that
-    // is staying -- not just the ones the client monitor currently counts as
-    // alive. A client only enters ok_client_ by remounting, so passing the
-    // alive snapshot alone would drop the disk replicas of any peer that had
-    // not remounted yet, turning one store's deregistration into everyone's.
-    auto staying_clients = getAliveClientsSnapshot();
-    {
-        ScopedLocalDiskSegmentAccess ssd_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        for (const auto& owner : ssd_access.getClientLocalDiskSegment()) {
-            staying_clients.insert(owner.first);
-        }
-    }
-    staying_clients.erase(client_id);
-    ClearInvalidHandles(staying_clients);
+    // Sweep exactly this owner's replicas. Deliberately not a
+    // liveness-complement sweep (ClearInvalidHandles with a staying set):
+    // that classifies by absence from a point-in-time snapshot, so an owner
+    // that mounts and registers after the snapshot but before the sweep
+    // reaches its shard would have its replicas classified stale and
+    // erased -- and when that disk replica was the key's only one, the key
+    // itself. An owner-id predicate cannot misclassify a concurrent mount,
+    // whatever the interleaving.
+    ClearLocalDiskHandlesOwnedBy(client_id);
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
     return {};
+}
+
+bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
+    ScopedLocalDiskSegmentAccess ssd_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    const auto& client_segments = ssd_access.getClientLocalDiskSegment();
+    return client_segments.find(client_id) != client_segments.end();
 }
 
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
@@ -4744,6 +4791,12 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
+    // Set when an entry's replica registration is refused because the client
+    // no longer has a LOCAL_DISK segment entry (see the per-entry checks
+    // below). NACK cleanups still run for the rest of the batch; the caller
+    // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
+    bool refused_unmounted = false;
+
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -4780,6 +4833,23 @@ auto MasterService::NotifyOffloadSuccess(
         bool added_new_local_disk_replica = false;
         {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+            // A disk replica may only be registered for a client whose
+            // LOCAL_DISK segment entry still exists. Checked inside this
+            // shared-lock section, before the shard lock, so the check and
+            // the write below cannot straddle UnmountLocalDiskSegment's
+            // removal (which holds snapshot_mutex_ exclusively): either the
+            // replica lands first and its sweep erases it, or the check here
+            // sees the segment gone and refuses. Without this, a
+            // registration racing a deregistration -- an in-flight rescan
+            // batch, or an offload completion from a heartbeat that was past
+            // its own drain check -- could land after the sweep and leave
+            // the master advertising a departed owner. Scoped to
+            // enable_offload_, where the segment registry exists and a
+            // deregistration can race; with the subsystem off both the mount
+            // and unmount RPCs refuse, so there is nothing to check against
+            // and no race to close.
+            const bool segment_mounted =
+                !enable_offload_ || HasMountedLocalDiskSegment(client_id);
             MetadataAccessorRW accessor(this, request_object_id);
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
@@ -4804,8 +4874,12 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
 
-                    if (!obj_metadata.HasReplica(
-                            &Replica::fn_is_local_disk_replica)) {
+                    if (!segment_mounted) {
+                        // The offload bookkeeping above still ran; only the
+                        // registration is refused.
+                        refused_unmounted = true;
+                    } else if (!obj_metadata.HasReplica(
+                                   &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
@@ -4857,6 +4931,13 @@ auto MasterService::NotifyOffloadSuccess(
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;
                 }
+                if (res.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                    // AddReplica's own mounted-segment check refused it (the
+                    // segment entry vanished under a deregistration). Finish
+                    // the batch so remaining NACK cleanups still run.
+                    refused_unmounted = true;
+                    continue;
+                }
                 LOG(ERROR) << "Failed to add replica: error=" << res.error()
                            << ", client_id=" << client_id
                            << ", tenant_id=" << object_id.tenant_id.value()
@@ -4872,6 +4953,12 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
+    if (refused_unmounted) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", action=notify_offload_success_refused"
+                     << ", error=no_local_disk_segment";
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
     return {};
 }
 
