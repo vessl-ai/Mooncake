@@ -55,6 +55,8 @@ enum TransportType : int {
     AscendDirect,
     SUNRISE_LINK,
     TPU,
+    UB,
+    MPCOMM,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -90,6 +92,10 @@ inline const char* transportTypeName(TransportType type) {
             return "sunrise_link";
         case TPU:
             return "tpu";
+        case UB:
+            return "ub";
+        case MPCOMM:
+            return "mpcomm";
         case kNumTransportTypes:
             return "unknown";
     }
@@ -108,6 +114,8 @@ inline TransportType parseTransportType(const std::string& str) {
     if (str == "ascend") return AscendDirect;
     if (str == "sunrise_link") return SUNRISE_LINK;
     if (str == "tpu") return TPU;
+    if (str == "ub") return UB;
+    if (str == "mpcomm") return MPCOMM;
     return UNSPEC;
 }
 

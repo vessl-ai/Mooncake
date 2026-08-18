@@ -30,23 +30,12 @@ class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 }  // namespace test
 
-#ifdef STORE_USE_ETCD
-class EtcdOpLogStore;
-#endif
-
 struct MasterSnapshotManagerOptions {
-    bool enable_snapshot{false};
     uint64_t snapshot_interval_seconds{0};
     uint64_t snapshot_child_timeout_seconds{0};
     uint32_t snapshot_retention_count{0};
     std::string snapshot_backup_dir;
     bool use_snapshot_backup_dir{false};
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
-    std::string ha_backend_type;
-    std::string ha_backend_connstring;
-    std::string cluster_id;
-    bool enable_ha{false};
 };
 
 /**
@@ -96,10 +85,11 @@ class MasterSnapshotManager {
     tl::expected<ha::OpLogSequenceId, SerializationError>
     ResolveSnapshotSequenceId() const;
 
-#ifdef STORE_USE_ETCD
-    tl::expected<EtcdOpLogStore*, SerializationError>
-    GetSnapshotBoundaryOpLogStore() const;
-#endif
+    tl::expected<void, SerializationError> UploadSnapshotPayloadFile(
+        const std::vector<uint8_t>& data, const std::string& path,
+        const std::string& local_filename, const std::string& snapshot_id);
+
+    void CleanupOldSnapshot(size_t keep_count, const std::string& snapshot_id);
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -112,11 +102,6 @@ class MasterSnapshotManager {
     ha::SnapshotCatalogStore* snapshot_catalog_store_;
 
     std::unique_ptr<MasterSnapshotRepository> repository_;
-
-#ifdef STORE_USE_ETCD
-    mutable std::mutex snapshot_boundary_oplog_store_mutex_;
-    mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;
-#endif
 
     std::thread snapshot_thread_;
     std::atomic<bool> snapshot_running_{false};

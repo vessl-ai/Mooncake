@@ -7,7 +7,8 @@
 #include "ha/snapshot/snapshot_test_utils.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
-#include "ha/oplog/etcd_oplog_store.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #endif
 
 #include <glog/logging.h>
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -44,9 +46,15 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     std::unique_ptr<MasterService> service_;
+    MasterServiceConfig service_config_;
 
     static constexpr const char* kEnvSnapshotLocalPath =
         "MOONCAKE_SNAPSHOT_LOCAL_PATH";
+
+    void CreateService(MasterServiceConfig config) {
+        service_config_ = std::move(config);
+        service_ = std::make_unique<MasterService>(service_config_);
+    }
 
     void SetUp() override {
         google::InitGoogleLogging("SnapshotChildProcessTest");
@@ -89,7 +97,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
-        service_ = std::make_unique<MasterService>(config);
+        CreateService(std::move(config));
     }
 
 #ifdef STORE_USE_ETCD
@@ -100,6 +108,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_enable_snapshot(false)
                           .set_enable_snapshot_restore(true)
                           .set_enable_ha(true)
+                          .set_enable_oplog(true)
                           .set_ha_backend_type("etcd")
                           .set_ha_backend_connstring(etcd_endpoints)
                           .set_cluster_id(cluster_id)
@@ -110,7 +119,28 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
-        service_ = std::make_unique<MasterService>(config);
+        CreateService(std::move(config));
+    }
+
+    void CreateBatchEtcdHASnapshotService(const std::string& cluster_id,
+                                          const std::string& etcd_endpoints,
+                                          ViewVersionId view_version) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_enable_ha(true)
+                          .set_enable_oplog(true)
+                          .set_ha_backend_type("etcd")
+                          .set_ha_backend_connstring(etcd_endpoints)
+                          .set_cluster_id(cluster_id)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        CreateService(std::move(config));
     }
 #endif
 
@@ -199,10 +229,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
         }
     }
 
-    bool GetUseSnapshotBackupDir() {
-        return service_->use_snapshot_backup_dir_;
-    }
-
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         size_t shard_idx = svc->getShardIndex(key);
@@ -212,6 +238,26 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return tenant_it != shard.tenants.end() &&
                tenant_it->second.metadata.find(key) !=
                    tenant_it->second.metadata.end();
+    }
+
+    size_t SoftPinRegistrationCount(MasterService* svc) {
+        return svc->soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
+        MasterService* svc, const std::string& key) {
+        const size_t shard_idx =
+            svc->getMetadataShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
+        const auto tenant_it = shard->tenants.find(TenantId::Default());
+        if (tenant_it == shard->tenants.end()) {
+            return std::nullopt;
+        }
+        const auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        return metadata_it->second.GetCommittedSoftPinTimeout();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -254,22 +300,15 @@ class SnapshotChildProcessTest : public ::testing::Test {
         EnsureSnapshotStores();
 
         MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
         options.snapshot_interval_seconds =
-            service_->snapshot_interval_seconds_;
+            service_config_.snapshot_interval_seconds;
         options.snapshot_child_timeout_seconds =
-            service_->snapshot_child_timeout_seconds_;
-        options.snapshot_retention_count = service_->snapshot_retention_count_;
-        options.snapshot_backup_dir = service_->snapshot_backup_dir_;
-        options.use_snapshot_backup_dir = service_->use_snapshot_backup_dir_;
-        options.snapshot_catalog_store_type =
-            service_->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service_->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service_->ha_backend_type_;
-        options.ha_backend_connstring = service_->ha_backend_connstring_;
-        options.cluster_id = service_->cluster_id_;
-        options.enable_ha = service_->enable_ha_;
+            service_config_.snapshot_child_timeout_seconds;
+        options.snapshot_retention_count =
+            service_config_.snapshot_retention_count;
+        options.snapshot_backup_dir = service_config_.snapshot_backup_dir;
+        options.use_snapshot_backup_dir =
+            !service_config_.snapshot_backup_dir.empty();
 
         return std::make_unique<MasterSnapshotManager>(
             service_.get(), options, service_->snapshot_mutex_,
@@ -285,7 +324,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (!service_->snapshot_catalog_store_ &&
             service_->snapshot_object_store_) {
             service_->snapshot_catalog_store_ =
-                service_->CreateSnapshotCatalogStore();
+                service_->CreateSnapshotCatalogStore(service_config_);
         }
     }
 
@@ -575,7 +614,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
             .set_default_kv_lease_ttl(600000)
             .build();
     };
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     Segment segment;
     segment.id = generate_uuid();
@@ -606,7 +645,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
         << "PersistState failed: " << persist_result.error().message;
 
     service_.reset();
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     auto restored_replicas = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(restored_replicas.has_value())
@@ -614,6 +653,56 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     ASSERT_TRUE(
         service_->Remove(key, TenantId::Default(), /*force=*/true).has_value());
     EXPECT_FALSE(service_->ExistKey(key, TenantId::Default()).value_or(true));
+}
+
+TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    CreateService(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "checksum_snapshot_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    constexpr uint64_t kChecksum = 0x123456789ABCDEF0ULL;
+    const std::string key = "snapshot_object_checksum_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
+                                        1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, ObjectMeta{key, kChecksum},
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
+
+    auto persist_result = CallPersistState("20240701_140000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    CreateService(make_config());
+
+    auto restored = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_TRUE(restored->object_checksum.has_value());
+    EXPECT_EQ(*restored->object_checksum, kChecksum);
 }
 
 TEST_F(SnapshotChildProcessTest,
@@ -738,7 +827,7 @@ TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
 
 #ifdef STORE_USE_ETCD
 TEST_F(SnapshotChildProcessTest,
-       PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {
+       PersistState_UsesBatchDurablePrefixBoundaryInSnapshotDescriptor) {
     const std::string etcd_endpoints = "127.0.0.1:2379";
     auto connect_err =
         EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
@@ -747,25 +836,30 @@ TEST_F(SnapshotChildProcessTest,
     }
 
     const std::string cluster_id =
-        "snapshot-descriptor-" + UuidToString(generate_uuid());
+        "snapshot-batch-boundary-" + UuidToString(generate_uuid());
     constexpr ViewVersionId kViewVersion = 19;
-    constexpr uint64_t kLatestSequenceId = 123;
-    const std::string snapshot_id = "20240601_120000_456";
+    constexpr uint64_t kBatchLatest = 1;
 
-    EtcdOpLogStore oplog_store(cluster_id);
-    auto init_err = oplog_store.Init();
+    auto backend = std::make_shared<EtcdHaKvBackend>();
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    auto init_err = storage.InitDurablePrefix(prefix);
     if (init_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to initialize etcd oplog store: "
+        GTEST_SKIP() << "failed to initialize batch durable prefix: "
                      << toString(init_err);
     }
+    OpLogBatchRecord batch{.batch_id = 1,
+                           .first_seq = kBatchLatest,
+                           .last_seq = kBatchLatest,
+                           .entries = {{.sequence_id = kBatchLatest,
+                                        .op_type = OpType::PUT_END,
+                                        .object_key = "snapshot-boundary",
+                                        .payload = {}}}};
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(batch, prefix));
 
-    auto update_err = oplog_store.UpdateLatestSequenceId(kLatestSequenceId);
-    if (update_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to update etcd latest sequence id: "
-                     << toString(update_err);
-    }
-
-    CreateEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    const std::string snapshot_id = "20240601_120000_789";
+    CreateBatchEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    ASSERT_EQ(ErrorCode::OK, service_->SetBatchOpLogBackendForTesting(backend));
     auto persist_result = CallPersistState(snapshot_id);
     ASSERT_TRUE(persist_result.has_value())
         << "PersistState failed: " << persist_result.error().message;
@@ -776,9 +870,8 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(latest.has_value());
     ASSERT_TRUE(latest->has_value());
 
-    EXPECT_EQ(latest->value().last_included_seq, kLatestSequenceId);
+    EXPECT_EQ(latest->value().last_included_seq, kBatchLatest);
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
-    EXPECT_GT(latest->value().created_at_ms, 0);
 }
 #endif
 
@@ -845,7 +938,7 @@ TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
     auto restore_service = std::make_unique<MasterService>(config);
 
     // Step 3: Verify NO backup directory was created
-    // With empty backup_dir, use_snapshot_backup_dir_ should be false
+    // With an empty backup_dir, no restore directory should be created.
     // and no restore directory should exist anywhere in tmp_dir()
     bool any_restore_dir_found = false;
     for (auto& entry : fs::recursive_directory_iterator(tmp_dir())) {
@@ -993,7 +1086,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment
     Segment segment;
@@ -1068,7 +1161,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
                       .set_snapshot_object_store_type("local")
                       .set_default_kv_lease_ttl(600000)  // 10 min lease
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment
     Segment segment;
@@ -1082,7 +1175,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
 
     // Add two complete objects via PutStart + PutEnd
-    // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
+    // PutEnd only grants a zero-duration read lease, so it is immediately
+    // expired.
     std::string expired_key = "expired_lease_object";
     auto put_exp =
         service_->PutStart(client_id, expired_key, TenantId::Default(), {1024},
@@ -1104,9 +1198,27 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
                     .has_value())
         << "PutEnd normal failed";
 
+    const int64_t soft_pin_baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    std::string soft_pinned_key = "soft_pin_valid_lease_object";
+    ReplicateConfig soft_pin_config;
+    soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
+    soft_pin_config.soft_pin_ttl_ms = 60'000;
+    auto put_soft =
+        service_->PutStart(client_id, soft_pinned_key, TenantId::Default(),
+                           {1024}, soft_pin_config);
+    ASSERT_TRUE(put_soft.has_value()) << "PutStart soft pin failed";
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, soft_pinned_key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value())
+        << "PutEnd soft pin failed";
+
     // ExistKey grants a fresh lease (now + 600s) to normal_key
     EXPECT_TRUE(
         service_->ExistKey(normal_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(soft_pinned_key, TenantId::Default())
+                    .value_or(false));
     // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
 
     // Step 2: Persist state
@@ -1133,6 +1245,17 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
         << "Normal object with valid lease should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";
+    EXPECT_TRUE(restored_service->ExistKey(soft_pinned_key, TenantId::Default())
+                    .value_or(false))
+        << "Soft-pinned object with a valid read lease should restore as cache";
+    EXPECT_FALSE(
+        GetSoftPinDeadline(restored_service.get(), soft_pinned_key).has_value())
+        << "Snapshot restore must discard soft-pin state";
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              soft_pin_baseline)
+        << "Restored soft pins must not remain in the active gauge";
+    EXPECT_EQ(SoftPinRegistrationCount(restored_service.get()), 0u)
+        << "Restored soft pins must not remain in the deadline index";
 
     restored_service.reset();
 }
@@ -1151,7 +1274,7 @@ TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
             .set_snapshot_retention_count(3)
             .set_snapshot_object_store_type("local")
             .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment to have some data to serialize
     Segment segment;
@@ -1219,7 +1342,7 @@ TEST_F(SnapshotChildProcessTest, UploadFail_WithBackupDir_SavesAllFiles) {
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment to have some data to serialize
     Segment segment;

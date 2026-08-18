@@ -13,7 +13,7 @@ This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 **Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism (`P2PHANDSHAKE`) that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service — this is the simplest metadata handshake method and the recommended starting point (see [Quick Start](#quick-start)).
 
-For a detailed design discussion, see the [Mooncake Store Design](../design/mooncake-store.md).
+For a detailed design discussion, see the [Mooncake Store Design](../design/store/mooncake-store.md).
 
 ---
 
@@ -141,11 +141,13 @@ Runs a cluster of master instances coordinated through etcd. If the leader fails
 # Start each master instance with:
 mooncake_master \
   --enable_ha=true \
-  --etcd_endpoints="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --ha_backend_type=etcd \
+  --ha_backend_connstring="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --enable_oplog=true \
   --rpc_address=10.0.0.1
 ```
 
-Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
@@ -163,7 +165,7 @@ mooncake_master \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here. OpLog replication currently requires `ha_backend_type=etcd`.
 
 
 ---
@@ -237,6 +239,137 @@ The master resolves the current IPv4 address of `eth0` at startup and uses it as
 
 ---
 
+## High Availability (HA)
+
+Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
+
+### HA Architecture
+
+```
++------------------+     etcd batch records     +---------------+
+| Primary          | --------------------------> | Standby       |
+| OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
+| MasterService    |                              | MetadataStore |
++------------------+                              +---------------+
+       ^                                                 |
+       |         Leadership Election                      |
+       +---------------- etcd/redis/k8s ------------------+
+```
+
+### HA Configuration
+
+HA leadership and metadata replication are configured separately:
+
+- The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
+- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+
+
+- `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
+- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
+- `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
+
+For snapshot-based standby bootstrap, also configure:
+
+- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
+- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
+- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
+
+### Standby Bootstrap
+
+When a Standby starts, it follows this sequence:
+
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
+   - Load the latest snapshot from the configured catalog and object store.
+   - Rebuild object metadata and segment state from the snapshot baseline.
+2. **OpLog Catch-up**:
+   - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
+   - Poll `durable_prefix`, read batch records up to that boundary, and apply entries in strict sequence order.
+
+Supported OpLog entry types:
+- `PUT_END`: Object write completion
+- `REMOVE`: Object removal
+- `PUT_REVOKE`: Object revocation
+- `SEGMENT_MOUNT`: Segment mount event
+- `SEGMENT_UNMOUNT`: Segment unmount event
+- `SEGMENT_UPDATE`: Segment update event
+
+### Promotion and Failover
+
+When the Primary fails, the Standby is promoted through the following steps:
+
+1. **Leadership Lease**: The supervisor must acquire and retain the leadership lease before promotion begins.
+2. **Final Prefix Read and Catch-up**: The Standby stops its polling loop, reads `durable_prefix` again, and applies all durable batches. A missing prefix is accepted only when the local applied sequence is zero; otherwise promotion fails closed.
+3. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
+   - `applied_seq_id`: The latest applied OpLog sequence ID.
+   - `objects`: All object metadata from the in-memory store.
+   - `segments`: All segment registry entries.
+4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
+5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+### Example: HA Deployment with etcd
+
+Primary configuration (`primary.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+enable_oplog: true
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
+enable_snapshot: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50051
+```
+
+Standby configuration (`standby.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+enable_oplog: true
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
+enable_snapshot_restore: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50052
+```
+
+Environment variable for local snapshot storage:
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
+```
+
+Start the cluster:
+
+```bash
+# Start Primary
+mooncake_master --config_path=primary.yaml
+
+# Start Standby
+mooncake_master --config_path=standby.yaml
+```
+
+### Resetting a Legacy OpLog Namespace
+
+The batch-only implementation does not migrate or read older per-entry OpLog data. Reusing a namespace that contains legacy `latest`, numeric entry, or snapshot sidecar keys is rejected.
+
+Reset is destructive:
+
+1. Stop every Primary and Standby process that uses the cluster ID.
+2. Confirm that loss of the old metadata and snapshots is acceptable.
+3. Delete the complete `/oplog/{cluster_id}` namespace directly with the operator's etcd tooling.
+4. Start the cluster with empty state and batch-record OpLog enabled.
+
+Do not delete individual compatibility keys while any process is running, and do not retain an old snapshot baseline with a nonzero sequence after deleting `durable_prefix`.
+
 ## Metrics Endpoints
 
 The master exposes Prometheus-style metrics on `--metrics_port`:
@@ -253,10 +386,8 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 - `mooncake_tenant_quota_requested_bytes{tenant_id}`
 - `mooncake_tenant_quota_effective_bytes{tenant_id}`
-- `mooncake_tenant_quota_used_bytes{tenant_id}`
-- `mooncake_tenant_quota_reserved_bytes{tenant_id}`
-- `mooncake_tenant_quota_committed_count{tenant_id}`
-- `mooncake_tenant_quota_metadata_object_count{tenant_id}`
+- `mooncake_tenant_quota_charged_bytes{tenant_id}`
+- `mooncake_tenant_quota_admission_closed{tenant_id}`
 - `mooncake_tenant_quota_over_quota{tenant_id}`
 - `mooncake_tenant_quota_explicit_policy{tenant_id}`
 - `mooncake_tenant_quota_reject_total{tenant_id,reason}`
@@ -269,78 +400,11 @@ When tenant quota is enabled, `/metrics` also includes per-tenant quota gauges a
 
 ## Tenant Quota Management
 
-Tenant quota admission is disabled by default. Enable strict multi-tenant mode on the master when you want memory writes admitted against connector-managed per-tenant quota:
+:::{toctree}
+:maxdepth: 1
 
-```bash
-mooncake_master \
-  --enable_multi_tenants=true \
-  --tenant_quota_connector_type=file \
-  --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
-```
-
-You can also store the same YAML policy in etcd when Mooncake Store is built with `STORE_USE_ETCD=ON`:
-
-```bash
-mooncake_master \
-  --enable_multi_tenants=true \
-  --cluster_id=mooncake_cluster \
-  --tenant_quota_connector_type=etcd \
-  --tenant_quota_connector_uri=127.0.0.1:2379
-```
-
-The etcd connector stores the policy at `mooncake-store/<cluster_id>/tenant_quota_policy`. If the key does not exist, the master starts with an empty policy so the first tenant policy can be created through the admin API. It shares the process-wide store etcd client used by HA/oplog, so if HA or oplog also uses etcd, `tenant_quota_connector_uri` must match those etcd endpoints. The policy must use schema version `1`; tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters; quotas must be positive integers with optional `B`, `KB`, `MB`, `GB`, or `TB` units:
-
-```yaml
-version: 1
-
-tenants:
-  - name: tenant-a
-    quota: 200GB
-
-  - name: tenant-b
-    quota: 500GB
-```
-
-When strict multi-tenant mode is enabled, write requests must include a registered tenant. The `default` tenant is not special unless it is explicitly registered in the connector policy.
-
-The same HTTP port used for metrics exposes the tenant quota admin API:
-
-```bash
-# List tenant quota snapshots
-curl -s http://<master_host>:9003/api/v1/tenant_quotas
-
-# Query one tenant
-curl -s "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
-
-# Upsert an explicit policy. Explicit tenant policies must be positive.
-curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a" \
-  -H 'Content-Type: application/json' \
-  -d '{"requested_quota_bytes":2147483648}'
-
-# Delete an explicit policy. The tenant must not own objects or quota usage.
-curl -s -X DELETE "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
-```
-
-Each tenant quota snapshot returns:
-
-```json
-{
-  "success": true,
-  "data": {
-    "tenant_id": "tenant-a",
-    "requested_quota_bytes": 2147483648,
-    "effective_quota_bytes": 2147483648,
-    "used_bytes": 0,
-    "reserved_bytes": 0,
-    "committed_count": 0,
-    "metadata_object_count": 0,
-    "over_quota": false,
-    "has_explicit_policy": true
-  }
-}
-```
-
-In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
+Multi-Tenant Deployment <multi-tenancy>
+:::
 
 ---
 
@@ -351,7 +415,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
 - For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
 - For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
-- For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
+- For the experimental HF3FS USRBIO adapter used by descriptor-based DFS replicas, see the [HF3FS USRBIO adapter guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
 
 :::{toctree}
@@ -360,7 +424,7 @@ In HA mode, quota admin requests are served only by the active master service. S
 
 KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
-HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
+HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
 
@@ -391,6 +455,45 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 |------|---------|-------------|
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
+
+### KV Cache Event Publisher
+
+The master can publish KV cache lifecycle events over a ZMQ PUB socket for
+cache-aware indexers such as Mooncake Conductor. This feature is compiled out
+by default. Install `libzmq3-dev` and configure Mooncake Store with
+`-DENABLE_KV_EVENTS=ON` before enabling it at runtime.
+
+Both `--kv_events_bind_endpoint` and `--kv_events_backend_id` are required when
+the publisher is enabled. If either value is empty, or the ZMQ socket cannot
+bind, the master logs an error and continues with event publishing disabled.
+
+```bash
+mooncake_master \
+  --enable_kv_events=true \
+  --kv_events_bind_endpoint=tcp://0.0.0.0:5557 \
+  --kv_events_backend_id=store-node-1
+```
+
+Register an address reachable by the indexer, rather than the wildcard bind
+address, through the indexer's `POST /register` endpoint. For the event format,
+registration fields, and object-key behavior, see the {ref}`Mooncake Store
+master publisher <mooncake-store-master-publisher>` reference.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_kv_events` | `false` | Enable the ZMQ KV cache event publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
+| `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
+| `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
+| `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
+| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+
+The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
+`--kv_events_additional_salt`, `--kv_events_lora_name`,
+`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
+compatibility but are not emitted in event payloads. Supply model, block-size,
+hash-namespace, LoRA, and data-parallel metadata when registering the publisher
+with the indexer; each event carries its object's tenant ID.
 
 ### HTTP Metadata Server (Embedded)
 
@@ -475,6 +578,7 @@ mooncake_master \
 |------|---------|-------------|
 | `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
+| `--max_kv_soft_pin_ttl` | `86400000` ms | Maximum request-level soft pin TTL (24 h) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
@@ -496,8 +600,12 @@ mooncake_master \
 | `--enable_ha` | `false` | Enable HA mode |
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
-| `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
+| `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
+| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
+| `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 ```{caution}
 Metadata Snapshot And Restore is experimental feature.
@@ -568,14 +676,202 @@ When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at m
 
 When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the master preferentially allocates new objects on CXL memory.
 
-### DFS Storage
+### Legacy Shared-filesystem `DISK` Persistence
+
+The older shared-filesystem persistence path remains available independently
+of descriptor-based DFS:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root_fs_dir` | empty | Legacy DFS persistence directory; do not use with SSD offload |
-| `--global_file_segment_size` | `INT64_MAX` (unlimited) | Max available space for DFS segments; default does not cap DFS usage |
+| `--root_fs_dir` | empty | Enable legacy `DISK` replicas under `<root_fs_dir>/<cluster_id>`. The path must resolve to the same shared filesystem location on every participating client. |
+| `--global_file_segment_size` | `INT64_MAX` (unlimited) | Declared legacy file capacity used by master usage metrics. It does not configure descriptor-based DFS shard files. |
 
-`--root_fs_dir` is a legacy persistence parameter and is expected to be replaced as the distributed filesystem path is refactored. For SSD offload, configure `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` on each real client instead.
+With `--root_fs_dir` set, the master adds a legacy `DISK` replica to each new
+object and clients write it asynchronously. This path is distinct from both
+client-owned `LOCAL_DISK` SSD offload and descriptor-based `DFS` replicas. Do
+not combine `--root_fs_dir` with `--enable_offload=true`; configure real-client
+SSD offload with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
+
+(dfs-storage)=
+### Descriptor-based DFS Storage
+
+```{warning}
+**Work in progress.** Descriptor-based DFS is intended for development and
+evaluation only. It is not production-ready and is not covered by Mooncake
+Store's general fault-tolerance, HA continuity, durability, or multi-tenant
+guarantees.
+```
+
+Mooncake Store can place an additional replica in a shared distributed
+filesystem. The master allocates aligned ranges in pre-created shard files and
+publishes a descriptor containing the shard, offset, and object size. Clients
+use that descriptor to access the same files through either regular POSIX I/O
+or the HF3FS USRBIO adapter.
+
+DFS replicas are separate from `LOCAL_DISK` SSD-offload replicas. They do not
+use the legacy `--root_fs_dir` persistence path or the master's asynchronous
+offload task queue.
+
+```{note}
+DFS allocator state is not yet restored after a master restart or HA leader
+failover. Do not enable descriptor-based DFS in a deployment that requires
+master recovery, HA continuity, or multiple tenants. See the complete list of
+limitations below.
+```
+
+#### Master configuration
+
+Enable the DFS allocator in the master process and select a shared root and
+shard layout. For example, to use HF3FS:
+
+```bash
+export MOONCAKE_ENABLE_DFS=1
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_SHARD_COUNT=64
+export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
+export MOONCAKE_DFS_ALIGNMENT=4096
+export MOONCAKE_DFS_SINGLE_TENANT=true
+
+mooncake_master [other master arguments]
+```
+
+At startup, the master creates `MOONCAKE_DFS_SHARD_COUNT` shard files and
+preallocates each file to `MOONCAKE_DFS_SHARD_CAPACITY`. The example therefore
+configures 256 GiB of total logical shard capacity (`64 * 4 GiB`). Ensure the
+shared filesystem has sufficient capacity; whether all backing space is
+reserved immediately depends on the selected filesystem adapter.
+
+The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
+`MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
+regular shared filesystem.
+
+#### Client configuration
+
+Every client that may read or write a DFS replica must initialize
+`FileStorage` and select the distributed backend. Use an absolute DFS root path;
+the root string, shard count, shard capacity, and alignment must match the
+master configuration. Select an adapter that can access the same underlying
+shared files; the examples use the same adapter in every process.
+
+```bash
+export MOONCAKE_OFFLOAD_ENABLED=true
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/data/file_storage
+export MOONCAKE_MASTER=127.0.0.1:50051
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_SHARD_COUNT=64
+export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
+export MOONCAKE_DFS_ALIGNMENT=4096
+export MOONCAKE_DFS_SINGLE_TENANT=true
+
+python -m mooncake.mooncake_store_service
+```
+
+For a programmatic Python client, pass `enable_ssd_offload=True` to `setup()`
+instead of `MOONCAKE_OFFLOAD_ENABLED`. Programmatic setup still reads the
+backend-specific `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` and
+`MOONCAKE_DFS_*` variables shown above; only the launcher-level setup fields are
+supplied as Python arguments. The
+`MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` directory must already exist and be an
+absolute, writable, non-symlink directory. DFS shard data is stored under
+`MOONCAKE_DFS_ROOT_DIR`; the FileStorage path is still required for client
+initialization because the shared `FileStorageConfig` validates it even when
+the selected backend stores data in the DFS root.
+
+Native C++ clients must initialize a `DistributedStorageBackend` with the same
+DFS layout and attach it to the client with `SetDfsStorageBackend()` before
+issuing DFS reads or writes. Reads and writes use the DFS descriptor carried by
+the current query or start-operation response; no client-side descriptor cache
+is required.
+
+#### DFS configuration reference
+
+| Variable | Scope | Default | Description |
+|----------|-------|---------|-------------|
+| `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
+| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
+| `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
+| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
+| `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
+| `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
+| `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
+| `MOONCAKE_DFS_EVICTION_ENABLED` | Master | `true` | Enable DFS allocator eviction. |
+| `MOONCAKE_DFS_EVICTION_HIGH_WATERMARK` | Master | `0.9` | Usage ratio that triggers eviction. |
+| `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
+| `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
+| `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+
+#### Requesting and accessing DFS replicas
+
+Callers request DFS placement through `ReplicateConfig`:
+
+```python
+from mooncake.store import ReplicateConfig
+
+config = ReplicateConfig()
+config.replica_num = 1
+config.dfs_replica_num = 1
+store.put("key", b"value", config)
+```
+
+`dfs_replica_num` may currently be `0` or `1`. A DFS replica must be requested
+with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
+not supported.
+
+Each key hashes to exactly one DFS shard. Allocation does not fall back to a
+different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
+shard is full even if other shards have free space. A DFS object is never
+striped across shards. The selected shard must have room for the object rounded
+up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
+padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
+therefore lower than the shard file's
+logical size.
+
+For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
+memory and NoF replicas, stages device buffers to host memory when necessary,
+and then performs positional DFS writes. A successful request means the
+requested DFS `WriteAt` operations completed. It does **not** imply that an
+additional `fsync` completed. Batch operations isolate failures by key; a
+failed key is revoked without downgrading successful keys.
+
+For a same-size `Upsert`, if either the existing object or the new request has
+a DFS replica, the requested memory, NoF, and DFS replica counts must match the
+existing topology. A different-size update releases the old placement and
+allocates a new topology.
+
+On reads, the master returns the readable replica list through the normal query
+path, and the client selects the first complete replica. If it selects DFS, any
+client configured with the same DFS root and shard layout can issue positional
+reads for that descriptor.
+
+#### Current limitations
+
+- Only the `default` tenant is supported.
+- `dfs_replica_num` must be `0` or `1`, and `replica_num >= 1` is required when
+  it is enabled.
+- C and Rust clients cannot currently request or access descriptor-based DFS:
+  their replication configuration does not expose `dfs_replica_num`, and their
+  setup API cannot initialize the distributed `FileStorage` backend. Use the
+  native C++ or Python/RealClient API.
+- A DFS object must fit in its key-selected shard after alignment and allocator
+  padding; objects are not striped and allocation does not fall back to another
+  shard.
+- DFS allocator state is currently in memory. A master restart or HA leader
+  failover does not reconstruct existing DFS allocations, so DFS cannot provide
+  continuity across those events.
+- DFS cannot be enabled with snapshot generation, snapshot restore, oplog
+  recovery, or standby restore until DFS allocator state restoration is
+  implemented.
+- There is currently no background DFS retry queue or configurable
+  asynchronous acknowledgement policy.
+- DFS writes currently have no DFS-specific timeout, request cancellation, or
+  `fsync` durability guarantee.
+
+The older `--root_fs_dir` and `--global_file_segment_size` flags configure the
+legacy `DISK` path described above and are not used by descriptor-based DFS
+replicas.
 
 ### NoF (NVMe-oF SSD Pool)
 
@@ -627,7 +923,7 @@ The client derives the host id from `local_hostname` by removing the port. For e
 
 A client is configured through one of the **methods** introduced in [Start a Store Client](#start-a-store-client), plus a shared family of engine-tuning variables:
 
-- **Method A — Programmatic (`setup()` arguments)**: you pass configuration as explicit Python arguments. `MOONCAKE_*` variables are **not** read in this method.
+- **Method A — Programmatic (`setup()` arguments)**: launcher-level fields are passed as explicit Python arguments instead of being loaded through `MooncakeConfig`. Backend-specific variables read by C++, including `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` and `MOONCAKE_DFS_*`, still apply.
 - **Method B — Service / Integration (`MOONCAKE_*` + CLI)**: `mooncake.mooncake_store_service` and the vLLM/SGLang connectors read `MOONCAKE_*` environment variables (via `MooncakeConfig`).
 - **Method C — Resource-owning real client (`mooncake_client`)**: configured through `mooncake_client` CLI flags (see the **Method C** subsection below).
 - **Engine runtime tuning (`MC_*`)**: low-level variables read by the C++ Transfer Engine / store client at runtime. They are orthogonal to the above and **apply to all methods**.
@@ -648,14 +944,14 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `rdma_devices` | str | required | RDMA NIC(s), comma-separated (pass `""` for non-RDMA). **Keyword is `rdma_devices`, not `device_name`** |
 | `master_server_addr` | str | required | Master `host:port`. **Keyword is `master_server_addr`, not `master_server_address`** |
 | `engine` | TransferEngine | `None` | *(advanced)* Reuse an existing Transfer Engine instance instead of creating one |
-| `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
-| `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
+| `enable_ssd_offload` | bool | `false` | *(advanced)* Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
+| `ssd_offload_path` | str | empty | *(advanced)* FileStorage path; with the distributed backend, DFS data uses `MOONCAKE_DFS_ROOT_DIR` |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -679,8 +975,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_GLOBAL_SEGMENT_SIZE` | `global_segment_size` | `3355443200` (3.125 GiB) | DRAM contributed; accepts byte integer **or** suffixed form like `500gb` |
 | `MOONCAKE_LOCAL_BUFFER_SIZE` | `local_buffer_size` | `1073741824` (1 GiB) | Transfer Engine buffer; same parsing as above |
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
-| `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
-| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
+| `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
@@ -793,10 +1089,18 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
-| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for all client→master RPCs. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client |
+| `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
+| `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
+| `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
+| `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
 | `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
+
+RPC client I/O pool settings are read and resolved once when the process-wide
+`Environ` singleton is initialized. Changes therefore require a process
+restart. When Store and Transfer Engine run in the same process, each component
+owns the configured number of threads and `io_context` instances.
 
 #### Topology Discovery
 
@@ -833,6 +1137,14 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | `16777216` (16 MB) | Block size for hot cache **in raw bytes** (decimal integer, e.g., `2097152` for 2 MB). Suffixed forms like `"2mb"` are **not** parsed. Only read when the hot cache is enabled |
 | `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | unset | Set `1` to use memfd-backed shared memory |
 | `MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD` | unset | Minimum CountMinSketch count before a key is admitted to hot cache |
+
+#### Object-Level Checksum Diagnostics
+
+Set `MOONCAKE_STORE_CHECKSUM=1` on a Mooncake Store client process before the client is created to enable object-level CRC-64 checks. The client computes the checksum before `put`/`upsert`, stores it in master metadata, and verifies the logical `object_size` bytes returned by a full-object `get`. For complete diagnostic coverage, enable the switch on every writer and reader client. A client with the switch disabled does not generate or verify checksums; an enabled reader skips verification for objects whose metadata has no checksum.
+
+This switch is intended for corruption diagnosis, not normal production use. It adds a full data scan to writes and reads, performs device-to-host staging for GPU buffers, and disables the local hot cache. Range reads, including `get_into_ranges`, are intentionally not verified.
+
+Do not run binaries from before and after checksum support was introduced in the same deployment; Mooncake Store clients, the primary master, and the standby master must all use a checksum-capable version. Checksum-capable masters persist checksum metadata in new snapshots and can load snapshots created by older versions; objects restored from an older snapshot have no checksum and are read without verification. Snapshots containing checksum metadata cannot be restored by binaries that predate checksum support, so rolling back requires an older compatible snapshot or a fresh deployment.
 
 #### Local Memory Optimization
 

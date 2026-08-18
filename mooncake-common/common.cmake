@@ -74,12 +74,16 @@ if(BUILD_UNIT_TESTS)
 endif()
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
+       OFF)
+option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
+option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -94,9 +98,12 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
-option(USE_TPU
-       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
-       OFF)
+option(
+  USE_TPU
+  "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+  OFF)
+option(USE_VRAM_SEGMENT "option for vram segment" OFF)
+option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -195,18 +202,70 @@ endif()
 if(USE_MNNVL)
   if(NOT USE_HIP
      AND NOT USE_MUSA
-     AND NOT USE_MACA)
+     AND NOT USE_MACA
+     AND NOT USE_SUPA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
 endif()
 
+if(USE_VRAM_SEGMENT)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_VRAM_SEGMENT)
+  message(STATUS "VRAM SEGMENT is ON")
+endif()
+
 if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
-  include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+  include_directories(${CUDAToolkit_INCLUDE_DIRS})
+  # Include stubs directory so the linker can find libcuda.so on machines that
+  # have the CUDA toolkit but not a GPU driver (e.g. CI builders).  On
+  # production systems with a driver the real libcuda.so in the system library
+  # path takes precedence at both link and runtime.
+  link_directories(${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_DIR}/stubs)
+endif()
+
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+  if(NOT USE_CUDA)
+    message(FATAL_ERROR "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
+  endif()
+  list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
+  find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
+endif()
+
+if(USE_NCCL_DEVICE)
+  add_compile_definitions(USE_NCCL_DEVICE)
+  message(
+    STATUS
+      "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_NCCL_HOST)
+  add_compile_definitions(USE_NCCL_HOST)
+  message(
+    STATUS "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_SUPA)
+  add_compile_definitions(USE_SUPA)
+  message(STATUS "SUPA support is enabled")
+  if(NOT DEFINED BIREN_HOME OR BIREN_HOME STREQUAL "")
+    if(DEFINED ENV{BIREN_HOME} AND NOT "$ENV{BIREN_HOME}" STREQUAL "")
+      set(BIREN_HOME
+          "$ENV{BIREN_HOME}"
+          CACHE PATH "Biren SUPA SDK root")
+    else()
+      set(BIREN_HOME
+          "/usr/local/birensupa/all/latest"
+          CACHE PATH "Biren SUPA SDK root")
+    endif()
+  endif()
+  message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
+  include_directories(${BIREN_HOME}/supa/include)
+  link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
 endif()
 
 if(USE_TPU)
@@ -414,6 +473,85 @@ endfunction()
 if(USE_CXL)
   add_compile_definitions(USE_CXL)
   message(STATUS "CXL support is enabled")
+endif()
+
+if(USE_MPCOMM)
+  if(NOT DEFINED MPCOMM_ROOT)
+    message(
+      FATAL_ERROR
+        "USE_MPCOMM=ON requires MPCOMM_ROOT to point at the MPComm install prefix, e.g. -DMPCOMM_ROOT=/opt/mpcomm"
+    )
+  endif()
+
+  # Oldest MPComm whose ABI this transport is written against, and the major it
+  # is written for - MPComm's own package config declares SameMajorVersion
+  # compatibility, so a different major is an ABI break by its own definition. A
+  # bare find_library() can express neither, since it accepts whatever
+  # libmpcomm.so happens to be on the prefix.
+  #
+  # Queried without a version so that an install that is present but too old is
+  # reported as such, rather than looking the same as no package config at all.
+  #
+  # find_package() also consults an upper-case <PACKAGENAME>_ROOT variable, and
+  # for this package that name is exactly our own MPCOMM_ROOT, which makes CMake
+  # 3.27+ emit a CMP0144 developer warning. Opting into the new behaviour is
+  # what we want anyway - the prefix really is where the package lives - and the
+  # setting is scoped so that no other find_package() is affected.
+  set(MPCOMM_MINIMUM_VERSION 1.4)
+  set(MPCOMM_SUPPORTED_MAJOR 1)
+  if(POLICY CMP0144)
+    cmake_policy(PUSH)
+    cmake_policy(SET CMP0144 NEW)
+  endif()
+  find_package(mpcomm CONFIG QUIET HINTS ${MPCOMM_ROOT})
+  if(POLICY CMP0144)
+    cmake_policy(POP)
+  endif()
+  if(mpcomm_FOUND)
+    if(mpcomm_VERSION VERSION_LESS MPCOMM_MINIMUM_VERSION)
+      message(
+        FATAL_ERROR
+          "MPComm ${mpcomm_VERSION} found under MPCOMM_ROOT=${MPCOMM_ROOT} is too old; this transport requires >= ${MPCOMM_MINIMUM_VERSION}"
+      )
+    endif()
+    if(NOT mpcomm_VERSION_MAJOR EQUAL MPCOMM_SUPPORTED_MAJOR)
+      message(
+        FATAL_ERROR
+          "MPComm ${mpcomm_VERSION} has major ${mpcomm_VERSION_MAJOR}, but this transport is written against major ${MPCOMM_SUPPORTED_MAJOR}; MPComm declares SameMajorVersion compatibility, so this is an ABI break"
+      )
+    endif()
+  endif()
+
+  find_path(MPCOMM_INCLUDE_DIR mpcomm.h HINTS ${MPCOMM_ROOT}/include)
+  # Resolve to an absolute library path instead of relying on -L/-l. Link
+  # directories are usage requirements and get stripped when a dependency is
+  # consumed through $<LINK_ONLY:...> (mooncake_store links transfer_engine
+  # PRIVATE, so mooncake_master would otherwise see -lmpcomm without the
+  # matching -L). An absolute path survives that stripping.
+  find_library(MPCOMM_LIBRARY mpcomm HINTS ${MPCOMM_ROOT}/lib
+                                           ${MPCOMM_ROOT}/lib64)
+  if(NOT MPCOMM_INCLUDE_DIR OR NOT MPCOMM_LIBRARY)
+    message(
+      FATAL_ERROR
+        "MPComm not found under MPCOMM_ROOT=${MPCOMM_ROOT} (expected ${MPCOMM_ROOT}/include/mpcomm.h and ${MPCOMM_ROOT}/lib/libmpcomm.so)"
+    )
+  endif()
+  add_compile_definitions(USE_MPCOMM)
+  message(STATUS "MPComm transport is enabled")
+  message(STATUS "  MPComm include: ${MPCOMM_INCLUDE_DIR}")
+  message(STATUS "  MPComm library: ${MPCOMM_LIBRARY}")
+  if(mpcomm_FOUND)
+    message(STATUS "  MPComm version: ${mpcomm_VERSION}")
+  else()
+    # No package config under the prefix - for example a tree where only the
+    # headers and the library were copied into place. Say so rather than imply
+    # the version was verified: the transport still builds, but an ABI mismatch
+    # would then only surface at run time.
+    message(
+      STATUS
+        "  MPComm version: unknown (no CMake package config under ${MPCOMM_ROOT}; requires >= ${MPCOMM_MINIMUM_VERSION})"
+    )
+  endif()
 endif()
 
 if(USE_TCP)

@@ -56,6 +56,9 @@ struct XferBenchConfig {
 
     static std::string seg_name;
     static std::string seg_type;
+    // Comma-separated segment types for mixed DRAM+VRAM runs, e.g.
+    // "dram,vram". Empty falls back to --seg_type (single type).
+    static std::string seg_type_mix;
     static std::string target_seg_name;
     static std::string op_type;
     static bool check_consistency;
@@ -73,6 +76,7 @@ struct XferBenchConfig {
     static std::string workload_classes_json;
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
+    static uint64_t request_interval_us;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
     static bool deadline_bw_arbitration;
@@ -144,6 +148,7 @@ struct XferMetricStats {
 struct XferBenchStats {
     XferMetricStats total_duration;
     XferMetricStats transfer_duration;
+    XferMetricStats instant_bandwidth;
 };
 
 class XferBenchTimer {

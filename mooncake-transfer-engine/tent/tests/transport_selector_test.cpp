@@ -21,6 +21,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/transport.h"
 
@@ -185,6 +186,8 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(TCP), "tcp");
     EXPECT_STREQ(transportTypeName(AscendDirect), "ascend");
     EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
+    EXPECT_STREQ(transportTypeName(UB), "ub");
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -198,7 +201,110 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("tcp"), TCP);
     EXPECT_EQ(parseTransportType("ascend"), AscendDirect);
     EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
+    EXPECT_EQ(parseTransportType("ub"), UB);
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
+}
+
+TEST(TransportSelectorTest, UbTransportNameRoundTrips) {
+    const auto name = transportTypeName(UB);
+    EXPECT_EQ(name, "ub");
+    EXPECT_EQ(parseTransportType(name), UB);
+}
+
+TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
+    EXPECT_EQ(static_cast<int>(UNSPEC), 0);
+    EXPECT_EQ(static_cast<int>(RDMA), 1);
+    EXPECT_EQ(static_cast<int>(MNNVL), 2);
+    EXPECT_EQ(static_cast<int>(SHM), 3);
+    EXPECT_EQ(static_cast<int>(NVLINK), 4);
+    EXPECT_EQ(static_cast<int>(GDS), 5);
+    EXPECT_EQ(static_cast<int>(IOURING), 6);
+    EXPECT_EQ(static_cast<int>(TCP), 7);
+    EXPECT_EQ(static_cast<int>(AscendDirect), 8);
+    EXPECT_EQ(static_cast<int>(SUNRISE_LINK), 9);
+    EXPECT_EQ(static_cast<int>(TPU), 10);
+    EXPECT_EQ(static_cast<int>(UB), 11);
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 13);
+}
+
+// MPComm is appended after UB, so it takes wire value 12. The same integer is
+// exposed through the C API macros and the Python binding, which makes it a
+// compatibility contract rather than an implementation detail. pybind.cpp
+// carries a matching static_assert so a divergence fails the build.
+TEST(TransportTypeTest, MpcommWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(TRANSPORT_MPCOMM, static_cast<int>(MPCOMM));
+    EXPECT_EQ(TRANSPORT_UB, static_cast<int>(UB));
+    // The conversion the C API actually performs on an incoming hint.
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_MPCOMM), MPCOMM);
+    // Name mapping is what policy parsing relies on; a gap here would make
+    // "transports": ["mpcomm"] resolve to UNSPEC silently.
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
+}
+
+// Topology::NicType is serialized as an integer. These values are therefore a
+// wire-compatibility contract, not merely an implementation detail.
+TEST(TopologyTest, NicTypeWireValuesRemainStableWithUbAppended) {
+    EXPECT_EQ(static_cast<int>(Topology::NIC_RDMA), 0);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_TCP), 1);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_UNKNOWN), 2);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_UB), 3);
+}
+
+TEST(TopologyTest, LegacyJsonDefaultsDeviceAttributes) {
+    constexpr const char* kLegacyTopology = R"json(
+        {
+          "nics": [
+            {
+              "name": "legacy-nic",
+              "pci_bus_id": "0000:01:00.0",
+              "type": 2,
+              "numa_node": -1
+            }
+          ],
+          "mems": []
+        }
+    )json";
+
+    Topology topology;
+    ASSERT_TRUE(topology.parse(kLegacyTopology).ok());
+    ASSERT_EQ(topology.getNicCount(), 1u);
+    const auto* nic = topology.getNicEntry(0);
+    ASSERT_NE(nic, nullptr);
+    EXPECT_EQ(nic->type, Topology::NIC_UNKNOWN);
+    EXPECT_TRUE(nic->device_attrs.empty());
+    EXPECT_EQ(topology.toString().find("device_attrs"), std::string::npos);
+}
+
+TEST(TopologyTest, UbDeviceAttributesRoundTripThroughJson) {
+    Topology source;
+    Topology::NicEntry ub;
+    ub.name = "ub-device-0/eid-2";
+    ub.pci_bus_id = "0000:02:00.0";
+    ub.type = Topology::NIC_UB;
+    ub.numa_node = 1;
+    ub.device_attrs = {{"ub.native_name", "ub-device-0"},
+                       {"ub.device_index", "7"},
+                       {"ub.eid_index", "2"},
+                       {"ub.eid", "e1:02:03:04:05:06:07:08"},
+                       {"ub.discovery_active", "false"},
+                       {"vendor.future_attribute", "preserved"}};
+    source.nic_list_.push_back(ub);
+
+    Topology parsed;
+    ASSERT_TRUE(parsed.parse(source.toString()).ok());
+    ASSERT_EQ(parsed.getNicCount(), 1u);
+    ASSERT_EQ(parsed.getNicCount(Topology::NIC_UB), 1u);
+    const auto* round_tripped = parsed.getNicEntry(0);
+    ASSERT_NE(round_tripped, nullptr);
+    EXPECT_EQ(round_tripped->name, ub.name);
+    EXPECT_EQ(round_tripped->pci_bus_id, ub.pci_bus_id);
+    EXPECT_EQ(round_tripped->type, Topology::NIC_UB);
+    EXPECT_EQ(round_tripped->numa_node, ub.numa_node);
+    EXPECT_EQ(round_tripped->device_attrs, ub.device_attrs);
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1072,117 @@ TEST(TransportSelectorTest, ExplicitPolicyNameOverridesIntentFilter) {
     ctx.policy_name = "operator-override";
 
     EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+}
+
+// ---------------------------------------------------------------------------
+// Device mask resolution (names -> mask, once, at setTopology)
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Config> configWithDeviceList(
+    const std::vector<std::string>& devices) {
+    json policy;
+    policy["name"] = "device_pinned";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"tcp"};
+    policy["devices"] = devices;
+
+    auto conf = std::make_shared<Config>();
+    conf->set("policy", json::array({policy}));
+    return conf;
+}
+
+std::shared_ptr<Topology> topologyWithNics(size_t count) {
+    auto topology = std::make_shared<Topology>();
+    for (size_t i = 0; i < count; ++i) {
+        Topology::NicEntry nic;
+        nic.name = "mlx5_" + std::to_string(i);
+        nic.type = Topology::NIC_RDMA;
+        topology->nic_list_.push_back(nic);
+    }
+    return topology;
+}
+
+uint64_t selectDeviceMask(TransportSelector& selector) {
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = nullptr;
+    return selector.select(ctx, transports).device_mask;
+}
+
+TEST(TransportSelectorTest, DeviceMaskResolvesNamedNics) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "mlx5_3"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), (1ULL << 1) | (1ULL << 3));
+}
+
+// The mask is resolved at setTopology, so it must be stable no matter how many
+// times select() runs -- this is the regression guard for resolving (and
+// re-logging) per request.
+TEST(TransportSelectorTest, DeviceMaskIsStableAcrossSelects) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// A replaced topology must re-resolve; a stale mask would name the wrong NICs.
+TEST(TransportSelectorTest, DeviceMaskReresolvesOnNewTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_2"}));
+
+    selector.setTopology(topologyWithNics(4));
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 2);
+
+    // Same name, fewer NICs: mlx5_2 no longer exists, so the filter empties
+    // and falls open rather than pinning a NIC id that is now someone else's.
+    selector.setTopology(topologyWithNics(2));
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Fail-open is deliberate: a typo must not stop transfers. The behavior is
+// pinned here so it stays a decision rather than drifting into a hard failure.
+TEST(TransportSelectorTest, DeviceMaskFailsOpenWhenNothingResolves) {
+    TransportSelector selector(configWithDeviceList({"nope_0", "nope_1"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Partially unresolved: the names that do resolve still restrict the mask.
+TEST(TransportSelectorTest, DeviceMaskKeepsResolvedNamesOnPartialFailure) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "nope"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 1);
+}
+
+// device_mask is 64 bits wide, so a NIC at index >= 64 cannot be named. It is
+// dropped from the mask, not silently promoted to "all devices".
+TEST(TransportSelectorTest, DeviceMaskDropsNicsPastMaskWidth) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0", "mlx5_64"}));
+    selector.setTopology(topologyWithNics(66));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// No topology bound: nothing to resolve names against, so the policy cannot
+// restrict anything and must not restrict everything either.
+TEST(TransportSelectorTest, DeviceMaskAllowsAllWithoutTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
 }
 
 }  // namespace

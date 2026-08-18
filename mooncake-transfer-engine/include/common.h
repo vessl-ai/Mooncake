@@ -32,10 +32,12 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "error.h"
 
@@ -61,6 +63,7 @@ enum class HandShakeRequestType {
     Metadata = 1,
     Notify = 2,
     Probe = 3,
+    Invalid = 0xfe,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -74,6 +77,16 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
+// so concurrent first callers each allocate it and all but one are orphaned --
+// a leak LeakSanitizer fails the build on. Worker pools bind every thread at
+// startup, so they hit that window. An inline function, not a static local:
+// bindToSocket() has internal linkage, so a static local would be per-TU.
+inline std::mutex &numaNodeCpuCacheMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 static inline int bindToSocket(int socket_id) {
     if (unlikely(numa_available() < 0)) {
         LOG(WARNING) << "The platform does not support NUMA";
@@ -84,7 +97,10 @@ static inline int bindToSocket(int socket_id) {
     if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
         socket_id = 0;
     struct bitmask *cpu_list = numa_allocate_cpumask();
-    numa_node_to_cpus(socket_id, cpu_list);
+    {
+        std::lock_guard<std::mutex> guard(numaNodeCpuCacheMutex());
+        numa_node_to_cpus(socket_id, cpu_list);
+    }
     int nr_possible_cpus = numa_num_possible_cpus();
     int nr_cpus = 0;
     for (int cpu = 0; cpu < nr_possible_cpus; ++cpu) {
@@ -366,9 +382,13 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     size_t nbytes = len;
     while (nbytes && std::chrono::steady_clock::now() < deadline) {
         ssize_t rc = read(fd, pos, nbytes);
-        if (rc < 0 && (errno == EAGAIN || errno == EINTR))
+        if (rc < 0 && errno == EINTR)
             continue;
-        else if (rc < 0) {
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            LOG(WARNING) << "Socket read timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
             PLOG(ERROR) << "Socket read failed";
             return rc;
         } else if (rc == 0) {
@@ -443,13 +463,13 @@ static inline size_t getHandshakeMaxLength() {
 }
 
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
-    HandShakeRequestType type = HandShakeRequestType::Connection;
+    HandShakeRequestType type = HandShakeRequestType::Invalid;
 
     const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
-        LOG(ERROR) << "readString: failed to read length, got: " << n;
+        LOG(WARNING) << "readString: incomplete handshake length, got: " << n;
         return {type, ""};
     }
 

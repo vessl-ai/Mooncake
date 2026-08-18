@@ -109,6 +109,9 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_TCP (7)
 #define TRANSPORT_ASCEND_DIRECT (8)
 #define TRANSPORT_SUNRISE_LINK (9)
+#define TRANSPORT_TPU (10)
+#define TRANSPORT_UB (11)
+#define TRANSPORT_MPCOMM (12)
 
 struct tent_memory_options {
     char location[64];
@@ -237,6 +240,7 @@ namespace mooncake {
 namespace tent {
 class TransferEngineImpl;
 class Config;
+class Topology;
 class TransferEngine {
    public:
     TransferEngine();
@@ -259,6 +263,12 @@ class TransferEngine {
     const std::string getRpcServerAddress() const;
 
     uint16_t getRpcServerPort() const;
+
+    // Returns the live local topology (nics/mems). Empty if engine unavailable.
+    std::shared_ptr<Topology> getLocalTopology() const;
+
+    // Native {"nics","mems"} JSON dump (includes rank0/1/2). "{}" if empty.
+    std::string getLocalTopologyString() const;
 
    public:
     Status exportLocalSegment(std::string& shared_handle);

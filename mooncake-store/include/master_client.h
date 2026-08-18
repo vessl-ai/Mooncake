@@ -18,6 +18,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
+#include "store_rpc_client_io_context.h"
 #include "task_manager.h"
 
 namespace mooncake {
@@ -61,6 +62,17 @@ inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
     }
 }
 
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+    RpcClientPool::PoolConfig config;
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
+    }
+
+    ApplyRpcTimeoutEnvOverrides(config.client_config);
+    return config;
+}
+
 }  // namespace detail
 
 /**
@@ -70,34 +82,11 @@ class MasterClient {
    public:
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
-        : client_id_(client_id),
+        : client_accessor_(GetStoreRpcClientIoContextPool(),
+                           detail::MakeMasterRpcClientPoolConfig()),
+          client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
-          metrics_(metrics) {
-        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
-            pool_conf{};
-
-        // Disable alive_detect to prevent stale reconnection logs after HA
-        // failover. Old client_pool objects remain in client_pools_ map and
-        // would otherwise continue probing failed addresses indefinitely. See
-        // PR #1642.
-        pool_conf.host_alive_detect_duration = std::chrono::seconds(0);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
-            detail::MaybeEnableRdmaSocketConfig(
-                pool_conf.client_config.socket_config);
-        }
-
-        // Per-request timeout for all client->master RPCs, plus an optional
-        // override for the TCP/RDMA connect timeout. coro_rpc's send_request
-        // falls back to the config value when no per-call timeout is given, so
-        // setting it here covers every RPC method uniformly. Defaults stay at
-        // coro_rpc's built-in 30s if unset; a negative request timeout
-        // disables the timer.
-        detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
-        client_pools_ =
-            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-                pool_conf);
-    }
+          metrics_(metrics) {}
     ~MasterClient();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
@@ -228,12 +217,12 @@ class MasterClient {
 
     /**
      * @brief Ends a put operation
-     * @param key Object key
+     * @param object_meta Object key and optional checksum
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -241,7 +230,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys,
+        const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -281,10 +270,10 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<std::string>& keys);
+        const std::vector<ObjectMeta>& object_metas);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
         const std::string& key, ReplicaType replica_type);
@@ -529,6 +518,13 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode>
+    DynamicReplicaCopyStart(const std::string& key,
+                            const std::string& tenant_id,
+                            const std::string& src_segment,
+                            const std::vector<std::string>& tgt_segments,
+                            const UUID& dynamic_replication_lease_id,
+                            uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief End a copy operation
@@ -538,6 +534,10 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Revoke a copy operation
@@ -548,6 +548,10 @@ class MasterClient {
         const std::string& key);
     [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
         const std::string& key, const std::string& tenant_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Start a move operation
@@ -691,32 +695,7 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
-    /**
-     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
-     * cannot reconnect to a different address, a new coro_rpc_client pool is
-     * created if the address is different from the current one.
-     */
-    class RpcClientAccessor {
-       public:
-        void SetClientPool(
-            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-                client_pool) {
-            std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_pool_ = client_pool;
-        }
-
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-        GetClientPool() {
-            std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_pool_;
-        }
-
-       private:
-        mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-            client_pool_;
-    };
-    RpcClientAccessor client_accessor_;
+    RpcClientPool client_accessor_;
 
     // The client identification.
     const UUID client_id_;
@@ -726,9 +705,6 @@ class MasterClient {
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
-        client_pools_;
-
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client

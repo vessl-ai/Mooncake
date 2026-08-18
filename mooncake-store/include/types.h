@@ -88,6 +88,8 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
+static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
+    24 * 60 * 60 * 1000;  // 24 hours
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
@@ -336,6 +338,8 @@ enum class ErrorCode : int32_t {
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
+    /// Store checksum verification failed.
+    CHECKSUM_MISMATCH = -801,
 
     // RPC errors (Range: -900 to -999)
     RPC_FAIL = -900,     ///< RPC operation failed.
@@ -350,10 +354,15 @@ enum class ErrorCode : int32_t {
         -1004,  ///< OpLog entry not found (backend-agnostic).
     K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
     K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
+    INCOMPLETE_OPLOG_CATCH_UP =
+        -1007,  ///< Promotion catch-up could not prove all durable OpLog
+                ///< entries were applied, or unresolved skipped/missing
+                ///< gaps remain after final catch-up + second gap resolution.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

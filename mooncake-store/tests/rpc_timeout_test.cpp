@@ -151,6 +151,11 @@ TEST(RpcTimeoutTest, TimeoutEnvOverridesAreOptIn) {
     EXPECT_EQ(overridden.connect_timeout_duration,
               std::chrono::milliseconds(1000));
 
+    // The master pool is built from the same helper, so it sees them too.
+    auto master_config = detail::MakeMasterRpcClientPoolConfig();
+    EXPECT_EQ(master_config.client_config.connect_timeout_duration,
+              std::chrono::milliseconds(1000));
+
     ::unsetenv("MC_RPC_TIMEOUT_MS");
     ::unsetenv("MC_RPC_CONNECT_TIMEOUT_MS");
 }

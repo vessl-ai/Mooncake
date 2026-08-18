@@ -16,6 +16,7 @@
 #include "tent/runtime/control_plane.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -23,6 +24,7 @@
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -329,7 +331,7 @@ Status TransferEngineImpl::construct() {
 
     topology_ = std::make_shared<Topology>();
     auto loader = &Platform::getLoader(conf_);
-    CHECK_STATUS(topology_->discover({loader}));
+    CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
@@ -523,6 +525,10 @@ const std::string TransferEngineImpl::getRpcServerAddress() const {
 
 uint16_t TransferEngineImpl::getRpcServerPort() const { return port_; }
 
+std::shared_ptr<Topology> TransferEngineImpl::getLocalTopology() const {
+    return topology_;
+}
+
 Status TransferEngineImpl::exportLocalSegment(std::string& shared_handle) {
     return Status::NotImplemented(
         "exportLocalSegment not implemented" LOC_MARK);
@@ -681,6 +687,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
+    if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
     return result;
 }
@@ -795,6 +802,7 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
+    batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     batch_set_.active.insert(batch);
@@ -1457,6 +1465,11 @@ void TransferEngineImpl::attachProgressNotifier(
 Status TransferEngineImpl::commitPreparedSubmit(
     Batch* batch, const PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+    if (batch->task_list.size() > batch->max_size ||
+        prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
@@ -1499,8 +1512,19 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         if (owner.staging) {
             task.staging = true;
-            staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
-            task.post_time = std::chrono::steady_clock::now();
+            // Staging is an orchestration step, not a concrete transport
+            // attempt. ProxyManager chunks the transfer and issues the real
+            // Transport::submitTransferTasks() calls, which are counted where
+            // they recurse through the non-staging path below. Only stamp the
+            // logical request's first post time for stage decomposition here.
+            auto status = staging_proxy_->submit(&task, (BatchID)batch,
+                                                 owner.staging_params);
+            if (!status.ok()) {
+                task.staging = false;
+                task.type = UNSPEC;
+            } else {
+                task.post_time = std::chrono::steady_clock::now();
+            }
             continue;
         }
 
@@ -1544,15 +1568,21 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 batch->task_list[task_id_list[type][0]].qp_pool;
         }
 
+        auto attempt_start = std::chrono::steady_clock::now();
+        for (auto& task_id : task_id_list[type]) {
+            startTransportAttempt(batch->task_list[task_id],
+                                  static_cast<TransportType>(type),
+                                  attempt_start);
+        }
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            for (auto& task_id : task_id_list[type])
+            auto attempt_end = std::chrono::steady_clock::now();
+            for (auto& task_id : task_id_list[type]) {
+                finishTransportAttempt(batch->task_list[task_id], FAILED,
+                                       attempt_end);
                 batch->task_list[task_id].type = UNSPEC;
-        } else {
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task_id : task_id_list[type])
-                batch->task_list[task_id].post_time = now;
+            }
         }
     }
 
@@ -1717,6 +1747,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
             task.staging = true;
+            // Orchestration only; the real transport submissions issued by
+            // ProxyManager are counted where they recurse through the
+            // non-staging path below.
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
@@ -1742,12 +1775,13 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
+    startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         task.type = UNSPEC;
         return finishQueuedOwner(owner_id, FAILED);
     }
-    task.post_time = std::chrono::steady_clock::now();
     return markQueuedOwnerSubmitted(owner_id);
 }
 
@@ -2032,7 +2066,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
-    return transport->submitTransferTasks(sub_batch, {task.request});
+    startTransportAttempt(task, type, std::chrono::steady_clock::now());
+    auto status = transport->submitTransferTasks(sub_batch, {task.request});
+    if (!status.ok()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+    }
+    return status;
 }
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
@@ -2066,6 +2105,10 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
         task.type == UNSPEC)
         return;
 
+    // The current physical transport attempt has failed even if the logical
+    // request will recover through failover. Close it before task.type is
+    // overwritten by resubmitTransferTask().
+    finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
@@ -2324,37 +2367,93 @@ void TransferEngineImpl::notifyRuntimeQueueReady() {
     if (progress_worker_) progress_worker_->notifyRuntimeQueueReady();
 }
 
+std::chrono::microseconds nextPollDelay(uint64_t poll_count) {
+    // Covers a fast completion, so short transfers usually finish before the
+    // sleeping phase.
+    constexpr uint64_t kHotPolls = 128;
+    constexpr auto kMaxDelay = std::chrono::microseconds(200);
+    if (poll_count < kHotPolls) return std::chrono::microseconds(0);
+    const uint64_t shift = std::min<uint64_t>(poll_count - kHotPolls, 20);
+    const auto delay = std::chrono::microseconds(uint64_t(1) << shift);
+    return delay < kMaxDelay ? delay : kMaxDelay;
+}
+
+void waitBeforeNextPoll(uint64_t poll_count) {
+    const auto delay = nextPollDelay(poll_count);
+    if (delay.count() == 0)
+        std::this_thread::yield();
+    else
+        std::this_thread::sleep_for(delay);
+}
+
+namespace {
+// Frees the batch on every exit unless reset() already did. The wait loops
+// below leave through CHECK_STATUS early returns that used to skip freeBatch()
+// and leak the Batch slab with whatever SubBatches it held.
+class BatchGuard {
+   public:
+    BatchGuard(TransferEngineImpl& engine, BatchID batch_id)
+        : engine_(engine), batch_id_(batch_id) {}
+
+    ~BatchGuard() {
+        auto status = reset();
+        if (!status.ok())
+            LOG(WARNING) << "failed to free batch: " << status.ToString();
+    }
+
+    BatchGuard(const BatchGuard&) = delete;
+    BatchGuard& operator=(const BatchGuard&) = delete;
+
+    Status reset() {
+        if (!batch_id_) return Status::OK();
+        auto batch_id = batch_id_;
+        batch_id_ = 0;
+        return engine_.freeBatch(batch_id);
+    }
+
+   private:
+    TransferEngineImpl& engine_;
+    BatchID batch_id_;
+};
+}  // namespace
+
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
+    BatchGuard batch_guard(*this, batch_id);
     TransferStatus xfer_status;
-    while (true) {
+    for (uint64_t poll_count = 0;; ++poll_count) {
         CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s != PENDING) {
-            freeBatch(batch_id);
+            // Deliberately dropping the free status, as the pre-existing code
+            // did: callers of this path get the transfer outcome, not the
+            // cleanup outcome. transferSync() propagates it instead.
+            (void)batch_guard.reset();
             return xfer_status.s == COMPLETED
                        ? Status::OK()
                        : Status::InternalError(
                              "Transfer failed: " +
                              std::to_string((int)xfer_status.s));
         }
+        waitBeforeNextPoll(poll_count);
     }
 }
 
 Status TransferEngineImpl::transferSync(
     const std::vector<Request>& request_list) {
     auto batch_id = allocateBatch(request_list.size());
+    BatchGuard batch_guard(*this, batch_id);
     CHECK_STATUS(submitTransfer(batch_id, request_list));
-    while (true) {
+    for (uint64_t poll_count = 0;; ++poll_count) {
         TransferStatus xfer_status;
         CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s == COMPLETED) break;
         if (xfer_status.s != PENDING) {
-            CHECK_STATUS(freeBatch(batch_id));
+            CHECK_STATUS(batch_guard.reset());
             return Status::InternalError(
                 "Transfer via stage buffer failed" LOC_MARK);
         }
+        waitBeforeNextPoll(poll_count);
     }
-    CHECK_STATUS(freeBatch(batch_id));
-    return Status::OK();
+    return batch_guard.reset();
 }
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
@@ -2373,9 +2472,10 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
     TransferStatusEnum new_status) {
 #if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
+        auto end_time = std::chrono::steady_clock::now();
+        finishTransportAttempt(task, new_status, end_time);
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
-            auto end_time = std::chrono::steady_clock::now();
             double latency_seconds =
                 std::chrono::duration<double>(end_time - start_time).count();
             if (new_status == COMPLETED) {
@@ -2386,7 +2486,11 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                     TentMetrics::instance().recordWriteCompleted(
                         task.type, task.request.length, latency_seconds);
                 }
-                // Causal chain stage decomposition
+                // Causal chain stage decomposition. These stage metrics stay
+                // attributed to the final (task.type) transport and measure the
+                // full request span for backward compatibility; per-attempt and
+                // initial-transport breakdowns live in the additive
+                // tent_transport_attempt_* metrics instead.
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
                         std::chrono::duration<double, std::micro>(
@@ -2446,6 +2550,44 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
         }
     }
 #endif  // TENT_METRICS_ENABLED
+}
+
+void TransferEngineImpl::startTransportAttempt(
+    TaskInfo& task, TransportType type,
+    std::chrono::steady_clock::time_point post_time) {
+    if (task.derived) return;
+    if (task.post_time.time_since_epoch().count() == 0) {
+        task.post_time = post_time;
+    }
+    task.attempt_post_time = post_time;
+    // Capture the transport now so the attempt is attributed correctly even if
+    // task.type is overwritten by failover before finishTransportAttempt().
+    task.attempt_type = type;
+    task.attempt_active = true;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordTransportAttemptStarted(type,
+                                                          task.request.opcode);
+#else
+    (void)type;
+#endif
+}
+
+void TransferEngineImpl::finishTransportAttempt(
+    TaskInfo& task, TransferStatusEnum status,
+    std::chrono::steady_clock::time_point end_time) {
+    if (!task.attempt_active) return;
+    task.attempt_active = false;
+#if TENT_METRICS_ENABLED
+    auto post_time = task.attempt_post_time;
+    if (post_time.time_since_epoch().count() == 0) return;
+    double latency_us =
+        std::chrono::duration<double, std::micro>(end_time - post_time).count();
+    TentMetrics::instance().recordTransportAttemptFinished(
+        task.attempt_type, task.request.opcode, status, latency_us);
+#else
+    (void)status;
+    (void)end_time;
+#endif
 }
 
 }  // namespace tent

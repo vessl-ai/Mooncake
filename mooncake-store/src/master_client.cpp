@@ -261,15 +261,27 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::CopyStart> {
     static constexpr const char* value = "CopyStart";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
+    static constexpr const char* value = "DynamicReplicaCopyStart";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyEnd> {
+    static constexpr const char* value = "DynamicReplicaCopyEnd";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
     static constexpr const char* value = "CopyRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyRevoke> {
+    static constexpr const char* value = "DynamicReplicaCopyRevoke";
 };
 
 template <>
@@ -429,13 +441,9 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
 
     MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ != master_addr) {
-        // WARNING: The existing client pool cannot be erased. So if there are a
-        // lot of different addresses, there will be resource leak problems.
-        auto client_pool = client_pools_->at(master_addr);
-        client_accessor_.SetClientPool(client_pool);
+        client_accessor_.GetOrCreateClientPool(master_addr);
         client_addr_param_ = master_addr;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result =
@@ -611,24 +619,25 @@ MasterClient::BatchPutStart(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
-                                                   ReplicaType replica_type) {
+tl::expected<void, ErrorCode> MasterClient::PutEnd(
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
-    timer.LogRequest("keys_count=", keys.size());
+    timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), client_id_, keys, replica_type, tenant_id_.value());
+        object_metas.size(), client_id_, object_metas, replica_type,
+        tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -701,23 +710,23 @@ MasterClient::BatchUpsertStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
-    const std::string& key, ReplicaType replica_type) {
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, key, replica_type, tenant_id_.value());
+        client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchUpsertEnd(
-    const std::vector<std::string>& keys) {
+    const std::vector<ObjectMeta>& object_metas) {
     ScopedVLogTimer timer(1, "MasterClient::BatchUpsertEnd");
-    timer.LogRequest("keys_count=", keys.size());
+    timer.LogRequest("keys_count=", object_metas.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertEnd, void>(
-        keys.size(), client_id_, keys, tenant_id_.value());
+        object_metas.size(), client_id_, object_metas, tenant_id_.value());
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -1146,6 +1155,26 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
     return result;
 }
 
+tl::expected<CopyStartResponse, ErrorCode>
+MasterClient::DynamicReplicaCopyStart(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyStart");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", src_segment=", src_segment,
+                     ", tgt_segments_count=", tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::DynamicReplicaCopyStart,
+                             CopyStartResponse>(
+        client_id_, key, tenant_id, src_segment, tgt_segments,
+        dynamic_replication_lease_id, dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     const UUID& task_id) {
     ScopedVLogTimer timer(1, "MasterClient::QueryTask");
@@ -1173,6 +1202,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyEnd(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyEnd(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyEnd");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyEnd, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
     size_t batch_size) {
     ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
@@ -1195,6 +1239,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(
 
     auto result = invoke_rpc<&WrappedMasterService::CopyRevoke, void>(
         client_id_, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyRevoke(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyRevoke");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyRevoke, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
     timer.LogResponseExpected(result);
     return result;
 }

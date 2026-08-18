@@ -49,6 +49,36 @@ std::string Config::dump(int indent) const {
     return config_data_.dump(indent);
 }
 
+bool Config::dumpSubtree(const std::string& key_path, std::string* out) const {
+    if (!out || key_path.empty()) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const json* node = &config_data_;
+    std::string::size_type start = 0;
+    bool nested_found = true;
+    while (start < key_path.size()) {
+        auto pos = key_path.find(kDelimiter, start);
+        auto segment = key_path.substr(start, pos - start);
+        start = (pos == std::string::npos) ? key_path.size() : pos + 1;
+        if (segment.empty()) continue;
+        auto it = node->find(segment);
+        if (it == node->end()) {
+            nested_found = false;
+            break;
+        }
+        node = &(*it);
+    }
+    if (nested_found && !node->is_null()) {
+        *out = node->dump();
+        return true;
+    }
+    auto flat_it = config_data_.find(key_path);
+    if (flat_it != config_data_.end() && !flat_it->is_null()) {
+        *out = flat_it->dump();
+        return true;
+    }
+    return false;
+}
+
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
@@ -145,6 +175,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // Consumed by filterInfiniBandDevices() in the platform probes.
     setArrayConfig(config, "MC_TE_FILTERS", "topology/rdma_whitelist");
     setArrayConfig(config, "MC_TE_FILTERS_EXCLUDE", "topology/rdma_blacklist");
+    // Classic TE custom topology file path. Maps into TENT config so the same
+    // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
+    // topology/priority_matrix in MC_TENT_CONF still takes precedence.
+    setConfig(config, "MC_CUSTOM_TOPO_JSON", "topology/custom_json_path");
     return status;
 }
 
@@ -168,7 +202,14 @@ bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
 
 int ConfigHelper::parseInt(const std::string& str, int default_value) {
     try {
-        return std::stoi(str);
+        size_t parsed = 0;
+        int value = std::stoi(str, &parsed);
+        if (parsed != str.size()) {
+            LOG(WARNING) << "Invalid integer value '" << str
+                         << "', using default: " << default_value;
+            return default_value;
+        }
+        return value;
     } catch (const std::exception& e) {
         LOG(WARNING) << "Failed to parse integer '" << str << "': " << e.what()
                      << ", using default: " << default_value;
@@ -179,7 +220,13 @@ int ConfigHelper::parseInt(const std::string& str, int default_value) {
 uint16_t ConfigHelper::parsePort(const std::string& str,
                                  uint16_t default_value) {
     try {
-        int port = std::stoi(str);
+        size_t parsed = 0;
+        int port = std::stoi(str, &parsed);
+        if (parsed != str.size()) {
+            LOG(WARNING) << "Invalid port value '" << str
+                         << "', using default: " << default_value;
+            return default_value;
+        }
         if (port > 0 && port <= 65535) {
             return static_cast<uint16_t>(port);
         } else {
