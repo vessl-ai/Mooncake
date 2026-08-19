@@ -642,9 +642,7 @@ class MooncakeStoreService:
             if ret != 0:
                 return web.Response(
                     status=500,
-                    text=json.dumps(
-                        {"error": f"Unmount local disk failed, ret={ret}"}
-                    ),
+                    text=json.dumps({"error": f"Unmount local disk failed, ret={ret}"}),
                     content_type="application/json",
                 )
 

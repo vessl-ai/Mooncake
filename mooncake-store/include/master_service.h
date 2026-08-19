@@ -34,6 +34,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
@@ -95,7 +96,7 @@ class MasterServiceHATest;
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
 // Friended so the LOCAL_DISK deregistration interleaving tests can run the
-// two halves of UnmountLocalDiskSegment (segment removal, replica sweep)
+// two halves of UnmountLocalDiskSegment (deregistration, replica sweep)
 // with a competing mount + register serialized between them, pinning the
 // interleaving instead of hoping a thread scheduler produces it.
 class LocalDiskUnmountInterleavingTest;
@@ -721,22 +722,22 @@ class MasterService {
      * @brief Deregisters a client's file storage segment from the master. This
      * function is idempotent.
      *
-     * Drops the client's segment entry and then its LOCAL_DISK replicas --
-     * the outcome the client-expiry branch of ClientMonitorFunc reaches after
-     * one client_ttl. Exposing it as an operation lets a store that is
-     * shutting down deregister while it can still serve, instead of leaving
-     * the master advertising it as an owner until the TTL elapses. Object
-     * metadata whose last replica was on that disk is erased, exactly as on
-     * expiry; a store that comes back re-adopts its files through the
+     * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
+     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
+     * reaches after one client_ttl. Exposing it as an operation lets a store
+     * that is shutting down deregister while it can still serve, instead of
+     * leaving the master advertising it as an owner until the TTL elapses.
+     * Object metadata whose last replica was on that disk is erased, exactly
+     * as on expiry; a store that comes back re-adopts its files through the
      * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
      *
      * The replica sweep targets exactly this owner (see
-     * ClearLocalDiskHandlesOwnedBy), and the segment entry is removed under
-     * the exclusive snapshot_mutex_ so no registration admitted against the
-     * old segment can land after the sweep: NotifyOffloadSuccess checks the
-     * segment entry and writes the replica inside one shared-lock section,
-     * which therefore falls entirely before the removal (registered, then
-     * swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
+     * exclusive snapshot_mutex_ so no registration admitted against the old
+     * one can land after the sweep: NotifyOffloadSuccess checks the
+     * registration and writes the replica inside one shared-lock section,
+     * which therefore falls entirely before the deregistration (registered,
+     * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -970,14 +971,11 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
-    // Helper to get a snapshot of alive clients (under client_mutex_ shared
-    // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
@@ -1936,17 +1934,18 @@ class MasterService {
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-replica
     // shard bookkeeping) instead of duplicating it.
-    bool CleanupStaleHandles(TenantState& tenant_state, ObjectMetadata& metadata,
-                             const std::function<bool(const Replica&)>& is_stale,
-                             MetadataShardAccessorRW* shard = nullptr);
+    bool CleanupStaleHandles(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::function<bool(const Replica&)>& is_stale,
+        MetadataShardAccessorRW* shard = nullptr);
 
-    // True when client_id currently has a LOCAL_DISK segment entry.
-    // Momentarily takes the segment map lock, so callers must not hold it;
-    // call before taking a metadata shard lock. Callers that need the answer
-    // to stay true across a later metadata write must hold snapshot_mutex_
-    // (shared) across both -- UnmountLocalDiskSegment removes the segment
-    // entry under the exclusive lock, so the check and the write cannot
-    // straddle a deregistration.
+    // True when client_id currently has a LOCAL_DISK registration.
+    // Momentarily takes the LocalSsdManager registry lock, so callers must not
+    // hold it; call before taking a metadata shard lock. Callers that need the
+    // answer to stay true across a later metadata write must hold
+    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
+    // deregisters the client under the exclusive lock, so the check and the
+    // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
@@ -1954,8 +1953,8 @@ class MasterService {
     auto AllocateAndInsertMetadata(
         MetadataShardAccessorRW& shard, const UUID& client_id,
         const std::string& key, uint64_t value_length,
-        const ReplicateConfig& config, const std::string& group_id,
-        const TenantId& tenant_id,
+        const ReplicateConfig& config, const std::string& writer_host_id,
+        const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
         uint64_t& quota_deficit_bytes,
@@ -1989,9 +1988,9 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
-    // Pushes an offload mirror for `replica` onto its host client's
-    // LocalDiskSegment. When `mirror_clients` is non-null, the destination
-    // client is appended to it on success.
+    // Pushes an offload mirror for `replica` onto its host client's LocalSSD
+    // mailbox. When `mirror_clients` is non-null, the destination client is
+    // appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
@@ -2016,7 +2015,7 @@ class MasterService {
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
-     * entry into the holder client's LocalDiskSegment::promotion_objects map.
+     * task into the holder client's LocalSSD mailbox.
      * Caller is responsible for refcnt-pinning the source replica and
      * recording the task in the shard's promotion_tasks map.
      */
@@ -2027,8 +2026,8 @@ class MasterService {
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
      * observed. Applies the gating chain (frequency / watermark / dedup /
      * cap), refcnt-pins the source LOCAL_DISK replica, records a
-     * PromotionTask, and pushes onto the holder client's promotion_objects
-     * map. Acquires its own RW shard accessor; safe to call after
+     * PromotionTask, and pushes onto the holder client's LocalSSD mailbox.
+     * Acquires its own RW shard accessor; safe to call after
      * GetReplicaList's RO accessor has been released.
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
@@ -2630,6 +2629,7 @@ class MasterService {
 
     // Segment management
     SegmentManager segment_manager_;
+    LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     const AllocationStrategyType allocation_strategy_type_;
@@ -2804,6 +2804,7 @@ class MasterService {
 
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

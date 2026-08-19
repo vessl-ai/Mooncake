@@ -1042,19 +1042,19 @@ TEST_F(MasterServiceSSDTest, UnmountLocalDiskSegmentKeepsReAdoptionWorking) {
                          .size = 1024};
     ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
-    ASSERT_TRUE(service
-                    ->GetReplicaList("ssd_unmount_disk_only_key",
-                                     TenantId::Default())
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->GetReplicaList("ssd_unmount_disk_only_key", TenantId::Default())
+            .has_value());
 
     ASSERT_TRUE(service->UnmountLocalDiskSegment(client_id).has_value());
 
     // Erased, the same as on client expiry: the disk held its last replica. A
     // read gets a clean miss rather than a dead peer.
-    EXPECT_FALSE(service
-                     ->GetReplicaList("ssd_unmount_disk_only_key",
-                                      TenantId::Default())
-                     .has_value());
+    EXPECT_FALSE(
+        service
+            ->GetReplicaList("ssd_unmount_disk_only_key", TenantId::Default())
+            .has_value());
 
     // A store that comes back re-adopts its files, so deregistering costs a
     // restart nothing.
@@ -1115,20 +1115,17 @@ TEST_F(MasterServiceSSDTest, NotifyOffloadSuccessAfterUnmountIsRefused) {
 }
 
 // Friended by MasterService: runs the two halves of UnmountLocalDiskSegment
-// (segment-entry removal, replica sweep) as separate steps, so a competing
-// mount + register can be serialized between them -- the interleaving is
-// pinned by construction instead of hoping a scheduler produces it. The
-// helpers are members of this class because friendship does not extend to
-// the TEST_F-generated subclasses.
+// (deregistration, replica sweep) as separate steps, so a competing mount +
+// register can be serialized between them -- the interleaving is pinned by
+// construction instead of hoping a scheduler produces it. The helpers are
+// members of this class because friendship does not extend to the
+// TEST_F-generated subclasses.
 class LocalDiskUnmountInterleavingTest : public MasterServiceSSDTest {
    protected:
-    static void RemoveSegmentEntryHalf(MasterService& service,
-                                       const UUID& client_id) {
+    static void DeregisterHalf(MasterService& service, const UUID& client_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
             service.snapshot_mutex_);
-        ScopedSegmentAccess segment_access =
-            service.segment_manager_.getSegmentAccess();
-        segment_access.UnmountLocalDiskSegment(client_id);
+        service.local_ssd_manager_.UnregisterClient(client_id);
     }
 
     static void SweepHalf(MasterService& service, const UUID& client_id) {
@@ -1147,9 +1144,9 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     PutAndOffload(*service, leaving, "ssd_interleave_leaving_key", 1024,
                   leaving_segment);
 
-    // First half of UnmountLocalDiskSegment(leaving): the segment entry is
-    // removed; the sweep has not run.
-    RemoveSegmentEntryHalf(*service, leaving);
+    // First half of UnmountLocalDiskSegment(leaving): the client is
+    // deregistered; the sweep has not run.
+    DeregisterHalf(*service, leaving);
 
     // The interleaving under test: another store mounts and registers a
     // replica before the sweep reaches its shard. Whether the client monitor
@@ -1179,8 +1176,8 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     EXPECT_TRUE(leaving_replicas.value().replicas[0].is_memory_replica());
 
     // ...while the late mounter's registration survived the sweep.
-    auto late_replicas = service->GetReplicaList("ssd_interleave_late_key",
-                                                 TenantId::Default());
+    auto late_replicas =
+        service->GetReplicaList("ssd_interleave_late_key", TenantId::Default());
     ASSERT_TRUE(late_replicas.has_value());
     ASSERT_EQ(1u, late_replicas.value().replicas.size());
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
