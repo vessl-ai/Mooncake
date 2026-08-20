@@ -223,27 +223,30 @@ DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
-DEFINE_bool(enable_periodic_malloc_trim, false,
-            "Periodically call malloc_trim(0) (or the jemalloc epoch+purge "
-            "equivalent when built with STORE_USE_JEMALLOC) on the eviction "
-            "thread, to return freed heap pages to the OS. Mitigates "
-            "allocator-level RSS growth seen under long-running "
-            "insert/erase churn on the metadata maps, independent of "
-            "master_key_count staying flat");
-DEFINE_uint64(malloc_trim_interval_ms, 60000,
-              "Minimum interval in milliseconds between periodic "
-              "malloc_trim calls when enable_periodic_malloc_trim is set. "
-              "0 is treated as invalid and clamped to the default");
-DEFINE_bool(enable_metadata_rehash_on_erase, false,
-            "Periodically shrink a tenant's metadata map (rehash(0)) after "
-            "a batch of EraseMetadata calls, so its bucket array does not "
-            "stay sized for a past peak key count once the load factor "
-            "drops. Independent of enable_periodic_malloc_trim");
-DEFINE_uint64(metadata_rehash_erase_interval, 4096,
-              "Number of EraseMetadata calls against one tenant's metadata "
-              "map, within one shard, between rehash-shrink checks when "
-              "enable_metadata_rehash_on_erase is set. 0 is treated as "
-              "invalid and clamped to the default");
+DEFINE_double(malloc_trim_growth_ratio, 0.25,
+              "Bound on resident memory: once RSS has grown this fraction "
+              "past where the last malloc_trim(0) left it, another runs. "
+              "glibc never returns a free chunk wedged between two live "
+              "ones, so without this the master's RSS grows with the number "
+              "of metadata insert/erase operations performed -- not with "
+              "what it stores -- and never recedes. Gating on RSS growth "
+              "holds RSS at rss_at_last_trim x (1 + ratio) at any write "
+              "rate, which a fixed interval cannot; gating on the "
+              "allocator's free RATIO would not work at all, because a trim "
+              "returns the pages under free chunks and leaves the chunks in "
+              "glibc's bins, moving RSS by tens of MB and the ratio by "
+              "~0.008. Set 0 to disable trimming, and then size the "
+              "master's memory limit for the whole run rather than the "
+              "working set. No effect under STORE_USE_JEMALLOC, which "
+              "returns memory on its own schedule");
+DEFINE_validator(malloc_trim_growth_ratio, [](const char* flagname,
+                                              double value) {
+    if (value < 0.0 || value >= 1.0) {
+        LOG(ERROR) << flagname << " must be in [0, 1); got " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
@@ -555,18 +558,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
-    default_config.GetBool("enable_periodic_malloc_trim",
-                           &master_config.enable_periodic_malloc_trim,
-                           FLAGS_enable_periodic_malloc_trim);
-    default_config.GetUInt64("malloc_trim_interval_ms",
-                             &master_config.malloc_trim_interval_ms,
-                             FLAGS_malloc_trim_interval_ms);
-    default_config.GetBool("enable_metadata_rehash_on_erase",
-                           &master_config.enable_metadata_rehash_on_erase,
-                           FLAGS_enable_metadata_rehash_on_erase);
-    default_config.GetUInt64("metadata_rehash_erase_interval",
-                             &master_config.metadata_rehash_erase_interval,
-                             FLAGS_metadata_rehash_erase_interval);
+    default_config.GetDouble("malloc_trim_growth_ratio",
+                             &master_config.malloc_trim_growth_ratio,
+                             FLAGS_malloc_trim_growth_ratio);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",
