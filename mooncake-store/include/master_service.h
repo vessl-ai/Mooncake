@@ -1631,13 +1631,6 @@ class MasterService {
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
 
-        // Number of EraseMetadata() calls against `metadata` since the last
-        // rehash-shrink check. Only consulted when
-        // enable_metadata_rehash_on_erase_ is set; see EraseMetadata(). Not
-        // part of tenant content, so it is deliberately excluded from
-        // Empty() below.
-        uint64_t erases_since_rehash{0};
-
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
@@ -1988,12 +1981,12 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
-    // Returns freed heap pages to the OS: glibc malloc_trim(0), or the
-    // jemalloc epoch+purge equivalent when built with STORE_USE_JEMALLOC.
-    // Called periodically from EvictionThreadFunc when
-    // enable_periodic_malloc_trim_ is set. See master_service.cpp for the
-    // allocator-selection rationale.
-    void PeriodicMallocTrim();
+    // Returns the allocator's free-but-retained memory to the OS when it
+    // exceeds malloc_trim_free_ratio_ of what the allocator holds. Called
+    // from EvictionThreadFunc; cheap to call often because the decision is
+    // a mallinfo2() read and the trim itself only happens when the
+    // watermark says so. See master_service.cpp for the mechanism.
+    void MaybeTrimHeap();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -2107,27 +2100,31 @@ class MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
-    // Periodic malloc_trim(0) (or jemalloc-purge) mitigation for allocator
-    // RSS growth under long-running erase/insert churn on the metadata
-    // maps. See PeriodicMallocTrim(). Off by default (config:
-    // enable_periodic_malloc_trim, malloc_trim_interval_ms) — this changes
-    // background CPU/latency behavior and is meant to be opted into
-    // deliberately, not enabled silently for existing deployments.
-    bool enable_periodic_malloc_trim_{false};
-    uint64_t malloc_trim_interval_ms_{60000};
-    std::chrono::steady_clock::time_point next_malloc_trim_time_{};
-
-    // Periodic per-tenant metadata map rehash-shrink after a batch of
-    // erases (config: enable_metadata_rehash_on_erase,
-    // metadata_rehash_erase_interval). See EraseMetadata(). Off by default
-    // for the same reason as above.
-    bool enable_metadata_rehash_on_erase_{false};
-    uint64_t metadata_rehash_erase_interval_{4096};
-    // Below this load factor (size / bucket_count), a rehash-shrink check
-    // actually shrinks the map. Not exposed as a gflag: it only tunes how
-    // aggressively an already-opted-in rehash fires, not whether the
-    // feature is active.
-    static constexpr double kMetadataRehashLoadFactorThreshold = 0.25;
+    // Watermark-gated heap trimming (see MaybeTrimHeap()). ON by default:
+    // without it the master's RSS grows with the number of metadata
+    // insert/erase operations it has ever performed and never recedes, so
+    // this is not an optimisation to opt into but the thing that keeps the
+    // process inside its memory limit. The only knob is the ratio, and
+    // setting it to 0 disables trimming.
+    double malloc_trim_free_ratio_{0.25};
+    // Never trim more often than this. The trim costs a few hundred
+    // milliseconds and there is no point paying it before churn has
+    // rebuilt a free pool worth reclaiming. Hardcoded: no prior art
+    // suggests a reason to tune it per deployment.
+    static constexpr std::chrono::seconds kMinTrimInterval{30};
+    // Never trim below this much free memory however bad the ratio looks —
+    // a small process can sit at a high free fraction while holding almost
+    // nothing, and trimming that is pure cost.
+    static constexpr size_t kMinTrimFreeBytes = 64ULL << 20;  // 64 MiB
+    // How often the watermark is even LOOKED AT. The eviction thread loops
+    // every kEvictionThreadSleepMs (10 ms) and mallinfo2() walks every
+    // arena under their locks, so the deciding read needs its own, much
+    // slower, cadence -- otherwise the check costs more than the leak.
+    static constexpr std::chrono::seconds kTrimCheckInterval{5};
+    // Both touched only by the eviction thread (MaybeTrimHeap() has one
+    // caller, EvictionThreadFunc()), so they need no synchronisation.
+    std::chrono::steady_clock::time_point next_trim_check_time_{};
+    std::chrono::steady_clock::time_point last_trim_time_{};
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;

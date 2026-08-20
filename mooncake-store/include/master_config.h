@@ -129,16 +129,12 @@ struct MasterConfig {
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
-    // Periodic malloc_trim(0) (or jemalloc-purge) mitigation for allocator
-    // RSS growth under long-running erase/insert churn on the metadata
-    // maps. See MasterService::PeriodicMallocTrim().
-    bool enable_periodic_malloc_trim = false;
-    uint64_t malloc_trim_interval_ms = 60000;
-
-    // Periodic per-tenant metadata map rehash-shrink after a batch of
-    // erases. See MasterService::EraseMetadata().
-    bool enable_metadata_rehash_on_erase = false;
-    uint64_t metadata_rehash_erase_interval = 4096;
+    // Bound on how much memory the allocator may hold free rather than
+    // return to the OS: trim once free bytes exceed this fraction of held
+    // bytes. Bounds RSS at roughly live x (1 + ratio) regardless of write
+    // rate, which no fixed interval can do. 0 disables trimming entirely.
+    // See MasterService::MaybeTrimHeap().
+    double malloc_trim_free_ratio = 0.25;
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
     // async copy back to MEMORY so the next Get is fast.
@@ -256,10 +252,7 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
-    bool enable_periodic_malloc_trim = false;
-    uint64_t malloc_trim_interval_ms = 60000;
-    bool enable_metadata_rehash_on_erase = false;
-    uint64_t metadata_rehash_erase_interval = 4096;
+    double malloc_trim_free_ratio = 0.25;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -320,10 +313,7 @@ class MasterServiceSupervisorConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
-        enable_periodic_malloc_trim = config.enable_periodic_malloc_trim;
-        malloc_trim_interval_ms = config.malloc_trim_interval_ms;
-        enable_metadata_rehash_on_erase = config.enable_metadata_rehash_on_erase;
-        metadata_rehash_erase_interval = config.metadata_rehash_erase_interval;
+        malloc_trim_free_ratio = config.malloc_trim_free_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -520,10 +510,7 @@ class WrappedMasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
-    bool enable_periodic_malloc_trim = false;
-    uint64_t malloc_trim_interval_ms = 60000;
-    bool enable_metadata_rehash_on_erase = false;
-    uint64_t metadata_rehash_erase_interval = 4096;
+    double malloc_trim_free_ratio = 0.25;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -618,10 +605,7 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
-        enable_periodic_malloc_trim = config.enable_periodic_malloc_trim;
-        malloc_trim_interval_ms = config.malloc_trim_interval_ms;
-        enable_metadata_rehash_on_erase = config.enable_metadata_rehash_on_erase;
-        metadata_rehash_erase_interval = config.metadata_rehash_erase_interval;
+        malloc_trim_free_ratio = config.malloc_trim_free_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -746,10 +730,7 @@ class WrappedMasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
-        enable_periodic_malloc_trim = config.enable_periodic_malloc_trim;
-        malloc_trim_interval_ms = config.malloc_trim_interval_ms;
-        enable_metadata_rehash_on_erase = config.enable_metadata_rehash_on_erase;
-        metadata_rehash_erase_interval = config.metadata_rehash_erase_interval;
+        malloc_trim_free_ratio = config.malloc_trim_free_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
@@ -1209,10 +1190,7 @@ class MasterServiceConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
-    bool enable_periodic_malloc_trim = false;
-    uint64_t malloc_trim_interval_ms = 60000;
-    bool enable_metadata_rehash_on_erase = false;
-    uint64_t metadata_rehash_erase_interval = 4096;
+    double malloc_trim_free_ratio = 0.25;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
@@ -1303,10 +1281,7 @@ class MasterServiceConfig {
         offload_force_evict = config.offload_force_evict;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
-        enable_periodic_malloc_trim = config.enable_periodic_malloc_trim;
-        malloc_trim_interval_ms = config.malloc_trim_interval_ms;
-        enable_metadata_rehash_on_erase = config.enable_metadata_rehash_on_erase;
-        metadata_rehash_erase_interval = config.metadata_rehash_erase_interval;
+        malloc_trim_free_ratio = config.malloc_trim_free_ratio;
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;

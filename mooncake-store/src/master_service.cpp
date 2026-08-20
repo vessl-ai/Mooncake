@@ -6,7 +6,6 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -26,16 +25,13 @@
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
-// PeriodicMallocTrim() allocator selection: STORE_USE_JEMALLOC (see
-// mooncake-store/CMakeLists.txt, default OFF) links the master against
-// jemalloc as its global allocator, in which case glibc's malloc_trim(0)
-// is the wrong primitive (jemalloc does not implement it — see
-// PeriodicMallocTrim() for why calling it anyway would be a silent no-op
-// rather than a harmless one). Default builds use glibc, where
-// <malloc.h> declares malloc_trim.
-#if defined(STORE_USE_JEMALLOC)
-#include <jemalloc/jemalloc.h>
-#elif defined(__GLIBC__)
+// MaybeTrimHeap() needs glibc's <malloc.h> for mallinfo2() and
+// malloc_trim(). STORE_USE_JEMALLOC (mooncake-store/CMakeLists.txt,
+// default OFF) replaces glibc's allocator wholesale, and jemalloc returns
+// memory on its own decay schedule and implements neither call -- so under
+// that build MaybeTrimHeap() is a no-op that says so once, rather than
+// calling an untested jemalloc equivalent from here.
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
 #include <malloc.h>
 #endif
 
@@ -383,41 +379,23 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    // Periodic malloc_trim(0) / jemalloc-purge mitigation for allocator RSS
-    // growth observed under long-running erase/insert churn (see
-    // PeriodicMallocTrim()). Off by default: this is a background-thread
-    // behavior change meant to be A/B'd deliberately, not switched on for
-    // existing deployments by an upgrade.
-    enable_periodic_malloc_trim_ = config.enable_periodic_malloc_trim;
-    malloc_trim_interval_ms_ = config.malloc_trim_interval_ms;
-    if (enable_periodic_malloc_trim_ && malloc_trim_interval_ms_ == 0) {
-        LOG(WARNING) << "malloc_trim_interval_ms=0 with "
-                        "enable_periodic_malloc_trim=true; clamping to "
-                        "60000 to avoid trimming on every eviction-thread "
-                        "tick (every "
-                     << kEvictionThreadSleepMs << "ms)";
-        malloc_trim_interval_ms_ = 60000;
-    }
-    if (enable_periodic_malloc_trim_) {
-        LOG(INFO) << "Periodic malloc_trim enabled: interval_ms="
-                  << malloc_trim_interval_ms_;
-    }
-
-    // Periodic per-tenant metadata map rehash-shrink after a batch of
-    // erases (see EraseMetadata()). Off by default for the same reason as
-    // above.
-    enable_metadata_rehash_on_erase_ = config.enable_metadata_rehash_on_erase;
-    metadata_rehash_erase_interval_ = config.metadata_rehash_erase_interval;
-    if (enable_metadata_rehash_on_erase_ &&
-        metadata_rehash_erase_interval_ == 0) {
-        LOG(WARNING) << "metadata_rehash_erase_interval=0 with "
-                        "enable_metadata_rehash_on_erase=true; clamping to "
-                        "4096 to avoid rehashing on every erase";
-        metadata_rehash_erase_interval_ = 4096;
-    }
-    if (enable_metadata_rehash_on_erase_) {
-        LOG(INFO) << "Metadata rehash-on-erase enabled: erase_interval="
-                  << metadata_rehash_erase_interval_;
+    // Watermark-gated heap trimming (see MaybeTrimHeap()). On unless the
+    // ratio is explicitly zeroed, because the master's RSS otherwise grows
+    // with every metadata insert/erase it has ever done and never recedes.
+    malloc_trim_free_ratio_ = config.malloc_trim_free_ratio;
+    if (malloc_trim_free_ratio_ <= 0.0) {
+        LOG(WARNING) << "malloc_trim_free_ratio=" << malloc_trim_free_ratio_
+                     << ": heap trimming is DISABLED. Resident memory will "
+                        "grow with metadata churn and will not be returned "
+                        "to the OS; size the master's memory limit for the "
+                        "whole run, not the working set";
+    } else {
+        LOG(INFO) << "Heap trimming enabled: trim when free bytes exceed "
+                  << malloc_trim_free_ratio_
+                  << " of held bytes (checked every "
+                  << kTrimCheckInterval.count() << "s, at most once per "
+                  << kMinTrimInterval.count() << "s, floor "
+                  << (kMinTrimFreeBytes >> 20) << "MiB)";
     }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
@@ -2233,40 +2211,6 @@ MasterService::EraseMetadata(
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
 
-    // Periodic rehash-shrink: unordered_map never shrinks its bucket array
-    // on erase (only rehash()/reserve() touch it), so a tenant's metadata
-    // map that grew to a peak size and then had many keys erased keeps
-    // paying for buckets it no longer needs. Every caller of EraseMetadata
-    // already holds this shard's exclusive lock (tenant_state can only be
-    // reached through a MetadataShardAccessorRW), so rehashing here needs
-    // no extra locking. Gated by an erase counter rather than firing on
-    // every call: rehash() is an O(size) reallocation, and calling it once
-    // per erase would trade the RSS growth this is meant to fix for
-    // pathological CPU cost on the erase path.
-    if (enable_metadata_rehash_on_erase_ &&
-        ++tenant_state.erases_since_rehash >= metadata_rehash_erase_interval_) {
-        tenant_state.erases_since_rehash = 0;
-        const size_t bucket_count = tenant_state.metadata.bucket_count();
-        const size_t size = tenant_state.metadata.size();
-        // Only shrink when the map is mostly empty relative to its bucket
-        // array; a tenant still near its peak size gains nothing from a
-        // rehash and would just pay its O(size) cost for free.
-        if (bucket_count > 0 &&
-            static_cast<double>(size) <
-                kMetadataRehashLoadFactorThreshold *
-                    static_cast<double>(bucket_count)) {
-            // rehash(0) asks for the smallest bucket count that keeps
-            // load_factor() <= max_load_factor() for the *current* size —
-            // a real shrink-to-fit, unlike reserve() (which a library is
-            // free to treat as a no-op when shrinking).
-            tenant_state.metadata.rehash(0);
-            VLOG(1) << "action=metadata_shard_rehash tenant="
-                    << tenant_id.value() << " size=" << size
-                    << " bucket_count_before=" << bucket_count
-                    << " bucket_count_after="
-                    << tenant_state.metadata.bucket_count();
-        }
-    }
 
     return next;
 }
@@ -9071,12 +9015,6 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
-    // Defer the first trim by one full interval rather than firing
-    // immediately on thread start (next_malloc_trim_time_ default-
-    // constructs to the epoch, which would otherwise be <= now() on the
-    // very first loop iteration).
-    next_malloc_trim_time_ = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(malloc_trim_interval_ms_);
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -9141,15 +9079,10 @@ void MasterService::EvictionThreadFunc() {
             RunPromotionCandidateRetry();
         }
 
-        if (enable_periodic_malloc_trim_) {
-            const auto steady_now = std::chrono::steady_clock::now();
-            if (steady_now >= next_malloc_trim_time_) {
-                PeriodicMallocTrim();
-                next_malloc_trim_time_ =
-                    std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(malloc_trim_interval_ms_);
-            }
-        }
+        // Unconditional call: MaybeTrimHeap() owns both the cadence of
+        // its own check and the decision to trim, so there is no interval
+        // state for this loop to carry.
+        MaybeTrimHeap();
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
@@ -9158,56 +9091,94 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_stopped";
 }
 
-// Returns freed heap pages to the OS. Two allocator paths:
+// Returns the allocator's free-but-retained memory to the OS when it has
+// grown past a fraction of what the allocator holds.
 //
-// - glibc (the default: STORE_USE_JEMALLOC is OFF unless explicitly built
-//   with it — see mooncake-store/CMakeLists.txt): malloc_trim(0) is the
-//   documented remedy for glibc's arenas holding onto freed pages after
-//   long-running allocate/free churn, even though every individual
-//   allocation was freed correctly. "0" means the default end-of-heap
-//   padding is left in place rather than trimmed to zero.
+// Why a watermark and not a timer. glibc never returns a free chunk that
+// sits between two live ones, so a server that churns a metadata map
+// accumulates free-but-held memory in proportion to the number of
+// operations it has performed -- not to how much it is storing. Measured on
+// this master (INF-363): 233.7 bytes of permanent RSS per put at a 244k-key
+// working set, with the live key count flat to within 1%, and RSS never
+// receding (VmHWM == VmRSS for entire runs). malloc_trim(0) reclaims it --
+// 66.3 MB, 21.6% of RSS, in ~300 ms on a live process.
 //
-// - jemalloc (STORE_USE_JEMALLOC): jemalloc does not implement
-//   malloc_trim(); calling glibc's malloc_trim in a jemalloc build would
-//   silently trim glibc's own (empty) arenas — nothing was ever allocated
-//   from them, since jemalloc owns malloc/free/calloc/realloc in that
-//   build — appearing to "work" while doing nothing for the RSS jemalloc
-//   actually holds. The equivalent there is an epoch refresh (so the
-//   allocator's cached stats are current) followed by a purge of all
-//   arenas' dirty pages. MALLCTL_ARENAS_ALL is jemalloc's documented
-//   sentinel arena index meaning "all arenas" for mallctls of the form
-//   "arena.<i>.<command>".
-void MasterService::PeriodicMallocTrim() {
+// A fixed interval reclaims *eventually*; it cannot bound anything, because
+// how much piles up between two ticks depends entirely on the write rate. A
+// watermark on the free fraction can: trimming whenever free bytes exceed
+// `ratio` of held bytes keeps resident memory near live x (1 + ratio) no
+// matter how fast the churn is. That is the difference between a scheduled
+// cleanup and a bound, and it is why this is on by default.
+//
+// Three guards, and each one exists for a measured reason:
+//   * kTrimCheckInterval -- the caller loops every 10 ms and mallinfo2()
+//     walks every arena under their locks, so the deciding read gets its
+//     own slow cadence. Without this the check would cost more than the
+//     problem.
+//   * kMinTrimInterval -- the trim itself costs a few hundred ms. Paying it
+//     again before churn has rebuilt anything worth reclaiming is waste.
+//   * kMinTrimFreeBytes -- a small process can sit at a high free fraction
+//     while holding almost nothing.
+//
+// mallinfo2(), not mallinfo(): the older struct uses `int` fields and
+// silently overflows past 2 GiB, which is exactly the size range this code
+// exists to handle. mallinfo2() has been in glibc since 2.33.
+void MasterService::MaybeTrimHeap() {
 #if defined(STORE_USE_JEMALLOC)
-    uint64_t epoch = 1;
-    size_t epoch_sz = sizeof(epoch);
-    int rc = mallctl("epoch", &epoch, &epoch_sz, &epoch, epoch_sz);
-    if (rc != 0) {
-        LOG(WARNING) << "action=periodic_malloc_trim allocator=jemalloc "
-                        "step=epoch_refresh rc="
-                     << rc;
-        return;
-    }
-    char purge_mib[32];
-    std::snprintf(purge_mib, sizeof(purge_mib), "arena.%d.purge",
-                 MALLCTL_ARENAS_ALL);
-    rc = mallctl(purge_mib, nullptr, nullptr, nullptr, 0);
-    if (rc != 0) {
-        LOG(WARNING) << "action=periodic_malloc_trim allocator=jemalloc "
-                        "step=purge rc="
-                     << rc;
-        return;
-    }
-    VLOG(1) << "action=periodic_malloc_trim allocator=jemalloc";
+    // jemalloc owns malloc/free in this build and returns memory on its own
+    // decay schedule (background_thread, dirty_decay_ms). It implements
+    // neither mallinfo2() nor malloc_trim(), and calling glibc's would
+    // inspect and trim glibc's own never-used arenas -- succeeding while
+    // doing nothing. Say so once and leave it to the allocator.
+    LOG_FIRST_N(WARNING, 1)
+        << "action=heap_trim skipped=true allocator=jemalloc: jemalloc "
+           "returns memory on its own decay schedule; tune it with "
+           "MALLOC_CONF (background_thread, dirty_decay_ms) rather than "
+           "malloc_trim_free_ratio";
 #elif defined(__GLIBC__)
+    if (malloc_trim_free_ratio_ <= 0.0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_trim_check_time_) {
+        return;
+    }
+    next_trim_check_time_ = now + kTrimCheckInterval;
+    if (now - last_trim_time_ < kMinTrimInterval) {
+        return;
+    }
+
+    const auto before = mallinfo2();
+    // held: the sbrk heap glibc has taken from the OS plus the chunks it
+    // manages via mmap. free: ordinary free chunks plus fastbins -- the
+    // memory that is ours on paper and unusable in practice.
+    const size_t held_before = before.arena + before.hblkhd;
+    const size_t free_before = before.fordblks + before.fsmblks;
+    if (free_before < kMinTrimFreeBytes) {
+        return;
+    }
+    if (static_cast<double>(free_before) <
+        malloc_trim_free_ratio_ * static_cast<double>(held_before)) {
+        return;
+    }
+
+    // "0" leaves glibc's default end-of-heap padding in place instead of
+    // trimming to zero; the interior free pages are released either way.
     malloc_trim(0);
-    VLOG(1) << "action=periodic_malloc_trim allocator=glibc";
+    last_trim_time_ = std::chrono::steady_clock::now();
+
+    const auto after = mallinfo2();
+    LOG(INFO) << "action=heap_trim held_before=" << held_before
+              << " free_before=" << free_before << " held_after="
+              << (after.arena + after.hblkhd) << " free_after="
+              << (after.fordblks + after.fsmblks) << " ratio_threshold="
+              << malloc_trim_free_ratio_;
 #else
     LOG_FIRST_N(WARNING, 1)
-        << "action=periodic_malloc_trim allocator=unknown skipped=true: "
-           "enable_periodic_malloc_trim is set but this build is neither "
-           "glibc nor STORE_USE_JEMALLOC, so there is no verified trim "
-           "primitive to call here";
+        << "action=heap_trim skipped=true allocator=unknown: this build is "
+           "neither glibc nor STORE_USE_JEMALLOC, so there is no trim "
+           "primitive here that has been tested. Resident memory will grow "
+           "with metadata churn";
 #endif
 }
 
