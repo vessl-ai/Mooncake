@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -24,6 +25,19 @@
 #include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
+
+// PeriodicMallocTrim() allocator selection: STORE_USE_JEMALLOC (see
+// mooncake-store/CMakeLists.txt, default OFF) links the master against
+// jemalloc as its global allocator, in which case glibc's malloc_trim(0)
+// is the wrong primitive (jemalloc does not implement it — see
+// PeriodicMallocTrim() for why calling it anyway would be a silent no-op
+// rather than a harmless one). Default builds use glibc, where
+// <malloc.h> declares malloc_trim.
+#if defined(STORE_USE_JEMALLOC)
+#include <jemalloc/jemalloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
@@ -367,6 +381,43 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+    }
+
+    // Periodic malloc_trim(0) / jemalloc-purge mitigation for allocator RSS
+    // growth observed under long-running erase/insert churn (see
+    // PeriodicMallocTrim()). Off by default: this is a background-thread
+    // behavior change meant to be A/B'd deliberately, not switched on for
+    // existing deployments by an upgrade.
+    enable_periodic_malloc_trim_ = config.enable_periodic_malloc_trim;
+    malloc_trim_interval_ms_ = config.malloc_trim_interval_ms;
+    if (enable_periodic_malloc_trim_ && malloc_trim_interval_ms_ == 0) {
+        LOG(WARNING) << "malloc_trim_interval_ms=0 with "
+                        "enable_periodic_malloc_trim=true; clamping to "
+                        "60000 to avoid trimming on every eviction-thread "
+                        "tick (every "
+                     << kEvictionThreadSleepMs << "ms)";
+        malloc_trim_interval_ms_ = 60000;
+    }
+    if (enable_periodic_malloc_trim_) {
+        LOG(INFO) << "Periodic malloc_trim enabled: interval_ms="
+                  << malloc_trim_interval_ms_;
+    }
+
+    // Periodic per-tenant metadata map rehash-shrink after a batch of
+    // erases (see EraseMetadata()). Off by default for the same reason as
+    // above.
+    enable_metadata_rehash_on_erase_ = config.enable_metadata_rehash_on_erase;
+    metadata_rehash_erase_interval_ = config.metadata_rehash_erase_interval;
+    if (enable_metadata_rehash_on_erase_ &&
+        metadata_rehash_erase_interval_ == 0) {
+        LOG(WARNING) << "metadata_rehash_erase_interval=0 with "
+                        "enable_metadata_rehash_on_erase=true; clamping to "
+                        "4096 to avoid rehashing on every erase";
+        metadata_rehash_erase_interval_ = 4096;
+    }
+    if (enable_metadata_rehash_on_erase_) {
+        LOG(INFO) << "Metadata rehash-on-erase enabled: erase_interval="
+                  << metadata_rehash_erase_interval_;
     }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
@@ -2181,6 +2232,42 @@ MasterService::EraseMetadata(
         shard->OnDiskReplicaRemoved(had_completed_disk);
     }
     UnregisterGroupMember(tenant_state, tenant_id, key, group_id);
+
+    // Periodic rehash-shrink: unordered_map never shrinks its bucket array
+    // on erase (only rehash()/reserve() touch it), so a tenant's metadata
+    // map that grew to a peak size and then had many keys erased keeps
+    // paying for buckets it no longer needs. Every caller of EraseMetadata
+    // already holds this shard's exclusive lock (tenant_state can only be
+    // reached through a MetadataShardAccessorRW), so rehashing here needs
+    // no extra locking. Gated by an erase counter rather than firing on
+    // every call: rehash() is an O(size) reallocation, and calling it once
+    // per erase would trade the RSS growth this is meant to fix for
+    // pathological CPU cost on the erase path.
+    if (enable_metadata_rehash_on_erase_ &&
+        ++tenant_state.erases_since_rehash >= metadata_rehash_erase_interval_) {
+        tenant_state.erases_since_rehash = 0;
+        const size_t bucket_count = tenant_state.metadata.bucket_count();
+        const size_t size = tenant_state.metadata.size();
+        // Only shrink when the map is mostly empty relative to its bucket
+        // array; a tenant still near its peak size gains nothing from a
+        // rehash and would just pay its O(size) cost for free.
+        if (bucket_count > 0 &&
+            static_cast<double>(size) <
+                kMetadataRehashLoadFactorThreshold *
+                    static_cast<double>(bucket_count)) {
+            // rehash(0) asks for the smallest bucket count that keeps
+            // load_factor() <= max_load_factor() for the *current* size —
+            // a real shrink-to-fit, unlike reserve() (which a library is
+            // free to treat as a no-op when shrinking).
+            tenant_state.metadata.rehash(0);
+            VLOG(1) << "action=metadata_shard_rehash tenant="
+                    << tenant_id.value() << " size=" << size
+                    << " bucket_count_before=" << bucket_count
+                    << " bucket_count_after="
+                    << tenant_state.metadata.bucket_count();
+        }
+    }
+
     return next;
 }
 
@@ -8984,6 +9071,12 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    // Defer the first trim by one full interval rather than firing
+    // immediately on thread start (next_malloc_trim_time_ default-
+    // constructs to the epoch, which would otherwise be <= now() on the
+    // very first loop iteration).
+    next_malloc_trim_time_ = std::chrono::steady_clock::now() +
+                             std::chrono::milliseconds(malloc_trim_interval_ms_);
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -9048,11 +9141,74 @@ void MasterService::EvictionThreadFunc() {
             RunPromotionCandidateRetry();
         }
 
+        if (enable_periodic_malloc_trim_) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_malloc_trim_time_) {
+                PeriodicMallocTrim();
+                next_malloc_trim_time_ =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(malloc_trim_interval_ms_);
+            }
+        }
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
 
     VLOG(1) << "action=eviction_thread_stopped";
+}
+
+// Returns freed heap pages to the OS. Two allocator paths:
+//
+// - glibc (the default: STORE_USE_JEMALLOC is OFF unless explicitly built
+//   with it — see mooncake-store/CMakeLists.txt): malloc_trim(0) is the
+//   documented remedy for glibc's arenas holding onto freed pages after
+//   long-running allocate/free churn, even though every individual
+//   allocation was freed correctly. "0" means the default end-of-heap
+//   padding is left in place rather than trimmed to zero.
+//
+// - jemalloc (STORE_USE_JEMALLOC): jemalloc does not implement
+//   malloc_trim(); calling glibc's malloc_trim in a jemalloc build would
+//   silently trim glibc's own (empty) arenas — nothing was ever allocated
+//   from them, since jemalloc owns malloc/free/calloc/realloc in that
+//   build — appearing to "work" while doing nothing for the RSS jemalloc
+//   actually holds. The equivalent there is an epoch refresh (so the
+//   allocator's cached stats are current) followed by a purge of all
+//   arenas' dirty pages. MALLCTL_ARENAS_ALL is jemalloc's documented
+//   sentinel arena index meaning "all arenas" for mallctls of the form
+//   "arena.<i>.<command>".
+void MasterService::PeriodicMallocTrim() {
+#if defined(STORE_USE_JEMALLOC)
+    uint64_t epoch = 1;
+    size_t epoch_sz = sizeof(epoch);
+    int rc = mallctl("epoch", &epoch, &epoch_sz, &epoch, epoch_sz);
+    if (rc != 0) {
+        LOG(WARNING) << "action=periodic_malloc_trim allocator=jemalloc "
+                        "step=epoch_refresh rc="
+                     << rc;
+        return;
+    }
+    char purge_mib[32];
+    std::snprintf(purge_mib, sizeof(purge_mib), "arena.%d.purge",
+                 MALLCTL_ARENAS_ALL);
+    rc = mallctl(purge_mib, nullptr, nullptr, nullptr, 0);
+    if (rc != 0) {
+        LOG(WARNING) << "action=periodic_malloc_trim allocator=jemalloc "
+                        "step=purge rc="
+                     << rc;
+        return;
+    }
+    VLOG(1) << "action=periodic_malloc_trim allocator=jemalloc";
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+    VLOG(1) << "action=periodic_malloc_trim allocator=glibc";
+#else
+    LOG_FIRST_N(WARNING, 1)
+        << "action=periodic_malloc_trim allocator=unknown skipped=true: "
+           "enable_periodic_malloc_trim is set but this build is neither "
+           "glibc nor STORE_USE_JEMALLOC, so there is no verified trim "
+           "primitive to call here";
+#endif
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
