@@ -223,21 +223,24 @@ DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     }
     return true;
 });
-DEFINE_double(malloc_trim_free_ratio, 0.25,
-              "Bound on the memory the allocator may hold free instead of "
-              "returning it: once free bytes exceed this fraction of held "
-              "bytes, malloc_trim(0) runs. glibc never returns a free chunk "
-              "wedged between two live ones, so without this the master's "
-              "RSS grows with the number of metadata insert/erase "
-              "operations performed -- not with what it stores -- and never "
-              "recedes. The watermark keeps resident memory near "
-              "live x (1 + ratio) at any write rate, which a fixed "
-              "interval cannot. Set 0 to disable trimming, and then size "
-              "the master's memory limit for the whole run rather than the "
+DEFINE_double(malloc_trim_growth_ratio, 0.25,
+              "Bound on resident memory: once RSS has grown this fraction "
+              "past where the last malloc_trim(0) left it, another runs. "
+              "glibc never returns a free chunk wedged between two live "
+              "ones, so without this the master's RSS grows with the number "
+              "of metadata insert/erase operations performed -- not with "
+              "what it stores -- and never recedes. Gating on RSS growth "
+              "holds RSS at rss_at_last_trim x (1 + ratio) at any write "
+              "rate, which a fixed interval cannot; gating on the "
+              "allocator's free RATIO would not work at all, because a trim "
+              "returns the pages under free chunks and leaves the chunks in "
+              "glibc's bins, moving RSS by tens of MB and the ratio by "
+              "~0.008. Set 0 to disable trimming, and then size the "
+              "master's memory limit for the whole run rather than the "
               "working set. No effect under STORE_USE_JEMALLOC, which "
               "returns memory on its own schedule");
-DEFINE_validator(malloc_trim_free_ratio, [](const char* flagname,
-                                            double value) {
+DEFINE_validator(malloc_trim_growth_ratio, [](const char* flagname,
+                                              double value) {
     if (value < 0.0 || value >= 1.0) {
         LOG(ERROR) << flagname << " must be in [0, 1); got " << value;
         return false;
@@ -555,9 +558,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
-    default_config.GetDouble("malloc_trim_free_ratio",
-                             &master_config.malloc_trim_free_ratio,
-                             FLAGS_malloc_trim_free_ratio);
+    default_config.GetDouble("malloc_trim_growth_ratio",
+                             &master_config.malloc_trim_growth_ratio,
+                             FLAGS_malloc_trim_growth_ratio);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
     default_config.GetUInt32("promotion_admission_threshold",

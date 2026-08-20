@@ -33,6 +33,8 @@
 // calling an untested jemalloc equivalent from here.
 #if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
 #include <malloc.h>
+#include <unistd.h>
+#include <cstdio>
 #endif
 
 #include "http_metadata_server.h"
@@ -379,23 +381,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
-    // Watermark-gated heap trimming (see MaybeTrimHeap()). On unless the
+    // Growth-triggered heap trimming (see MaybeTrimHeap()). On unless the
     // ratio is explicitly zeroed, because the master's RSS otherwise grows
     // with every metadata insert/erase it has ever done and never recedes.
-    malloc_trim_free_ratio_ = config.malloc_trim_free_ratio;
-    if (malloc_trim_free_ratio_ <= 0.0) {
-        LOG(WARNING) << "malloc_trim_free_ratio=" << malloc_trim_free_ratio_
+    malloc_trim_growth_ratio_ = config.malloc_trim_growth_ratio;
+    if (malloc_trim_growth_ratio_ <= 0.0) {
+        LOG(WARNING) << "malloc_trim_growth_ratio="
+                     << malloc_trim_growth_ratio_
                      << ": heap trimming is DISABLED. Resident memory will "
                         "grow with metadata churn and will not be returned "
                         "to the OS; size the master's memory limit for the "
                         "whole run, not the working set";
     } else {
-        LOG(INFO) << "Heap trimming enabled: trim when free bytes exceed "
-                  << malloc_trim_free_ratio_
-                  << " of held bytes (checked every "
+        LOG(INFO) << "Heap trimming enabled: trim when RSS grows "
+                  << malloc_trim_growth_ratio_
+                  << " past the last trim (floor "
+                  << (kMinTrimGrowthBytes >> 20) << "MiB, checked every "
                   << kTrimCheckInterval.count() << "s, at most once per "
-                  << kMinTrimInterval.count() << "s, floor "
-                  << (kMinTrimFreeBytes >> 20) << "MiB)";
+                  << kMinTrimInterval.count() << "s)";
     }
 
     // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
@@ -9091,52 +9094,82 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_stopped";
 }
 
-// Returns the allocator's free-but-retained memory to the OS when it has
-// grown past a fraction of what the allocator holds.
+namespace {
+
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
+// Resident set size in bytes, from field 2 of /proc/self/statm (resident
+// pages). Deliberately not mallinfo2(): that walks every arena under its
+// lock -- there were 56 of them on the master this was measured on -- and
+// this is on a path that gets consulted on a timer. Returns 0 if the read
+// fails, which the caller treats as "do not act".
+size_t ReadResidentBytes() {
+    static const long page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return 0;
+    }
+    std::FILE* f = std::fopen("/proc/self/statm", "re");
+    if (f == nullptr) {
+        return 0;
+    }
+    unsigned long long total_pages = 0;
+    unsigned long long resident_pages = 0;
+    const int matched = std::fscanf(f, "%llu %llu", &total_pages,
+                                    &resident_pages);
+    std::fclose(f);
+    if (matched != 2) {
+        return 0;
+    }
+    return static_cast<size_t>(resident_pages) *
+           static_cast<size_t>(page_size);
+}
+#endif
+
+}  // namespace
+
+// Returns the pages under the allocator's free memory to the OS once
+// resident memory has grown past where the last trim left it.
 //
-// Why a watermark and not a timer. glibc never returns a free chunk that
-// sits between two live ones, so a server that churns a metadata map
-// accumulates free-but-held memory in proportion to the number of
-// operations it has performed -- not to how much it is storing. Measured on
-// this master (INF-363): 233.7 bytes of permanent RSS per put at a 244k-key
-// working set, with the live key count flat to within 1%, and RSS never
-// receding (VmHWM == VmRSS for entire runs). malloc_trim(0) reclaims it --
-// 66.3 MB, 21.6% of RSS, in ~300 ms on a live process.
+// WHY THIS EXISTS. glibc never returns a free chunk that sits between two
+// live ones, so a server that churns a metadata map accumulates
+// free-but-resident memory in proportion to the number of operations it has
+// performed -- not to how much it is storing. Measured on this master
+// (INF-363): 233.7 bytes of permanent RSS per put at a 244k-key working
+// set, with the live key count flat to within 1%, and RSS never receding
+// (VmHWM == VmRSS for entire runs). malloc_trim(0) reclaims it: 67.4 MB in
+// ~300 ms on a live process.
 //
-// A fixed interval reclaims *eventually*; it cannot bound anything, because
-// how much piles up between two ticks depends entirely on the write rate. A
-// watermark on the free fraction can: trimming whenever free bytes exceed
-// `ratio` of held bytes keeps resident memory near live x (1 + ratio) no
-// matter how fast the churn is. That is the difference between a scheduled
-// cleanup and a bound, and it is why this is on by default.
+// WHY THE TRIGGER IS RSS AND NOT THE ALLOCATOR'S FREE RATIO. The obvious
+// design -- trim when mallinfo2() says free bytes exceed some fraction of
+// held bytes -- does not work, and the rig said so before this was built.
+// Across one malloc_trim on the live master, RSS fell 67.4 MB while the
+// free/held ratio moved from 0.323 to 0.315. That is not noise: the trim
+// returns the *pages* under free chunks and leaves the *chunks* in glibc's
+// bins, where they are still the allocator's to hand out. A trigger the
+// action cannot move fires again at every hysteresis window, which is a
+// timer wearing a watermark's rationale. RSS is the quantity the trim
+// actually changes, so RSS is the quantity to gate on.
 //
-// Three guards, and each one exists for a measured reason:
-//   * kTrimCheckInterval -- the caller loops every 10 ms and mallinfo2()
-//     walks every arena under their locks, so the deciding read gets its
-//     own slow cadence. Without this the check would cost more than the
-//     problem.
-//   * kMinTrimInterval -- the trim itself costs a few hundred ms. Paying it
-//     again before churn has rebuilt anything worth reclaiming is waste.
-//   * kMinTrimFreeBytes -- a small process can sit at a high free fraction
-//     while holding almost nothing.
-//
-// mallinfo2(), not mallinfo(): the older struct uses `int` fields and
-// silently overflows past 2 GiB, which is exactly the size range this code
-// exists to handle. mallinfo2() has been in glibc since 2.33.
+// WHAT IT BOUNDS. Trimming when RSS has grown ratio past the last trim's
+// resting point holds RSS <= rss_at_last_trim_ x (1 + ratio), and that
+// resting point sits just above live data. On the numbers above: a trim
+// lands RSS at ~247 MB, so at 0.25 the next fires near 308 MB against
+// ~240 MB of live data, and it holds at any write rate -- a faster writer
+// only arrives at the ceiling sooner. That is the difference between a
+// bound and a schedule, and it is why this is on by default.
 void MasterService::MaybeTrimHeap() {
 #if defined(STORE_USE_JEMALLOC)
     // jemalloc owns malloc/free in this build and returns memory on its own
     // decay schedule (background_thread, dirty_decay_ms). It implements
-    // neither mallinfo2() nor malloc_trim(), and calling glibc's would
-    // inspect and trim glibc's own never-used arenas -- succeeding while
-    // doing nothing. Say so once and leave it to the allocator.
+    // malloc_trim() not at all, and calling glibc's would trim glibc's own
+    // never-used arenas -- succeeding while doing nothing. Say so once and
+    // leave it to the allocator.
     LOG_FIRST_N(WARNING, 1)
         << "action=heap_trim skipped=true allocator=jemalloc: jemalloc "
            "returns memory on its own decay schedule; tune it with "
            "MALLOC_CONF (background_thread, dirty_decay_ms) rather than "
-           "malloc_trim_free_ratio";
+           "malloc_trim_growth_ratio";
 #elif defined(__GLIBC__)
-    if (malloc_trim_free_ratio_ <= 0.0) {
+    if (malloc_trim_growth_ratio_ <= 0.0) {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -9144,35 +9177,58 @@ void MasterService::MaybeTrimHeap() {
         return;
     }
     next_trim_check_time_ = now + kTrimCheckInterval;
+
+    const size_t rss = ReadResidentBytes();
+    if (rss == 0) {
+        LOG_FIRST_N(WARNING, 1)
+            << "action=heap_trim skipped=true reason=rss_unreadable: could "
+               "not read /proc/self/statm, so growth cannot be measured and "
+               "no trim will be attempted";
+        return;
+    }
+    // First look: adopt the current RSS as the floor rather than trimming a
+    // process that has not grown yet.
+    if (rss_at_last_trim_ == 0) {
+        rss_at_last_trim_ = rss;
+        return;
+    }
+    if (rss <= rss_at_last_trim_) {
+        // Shrank on its own (or the floor is stale after a shrink); follow
+        // it down so the next trigger is measured from where we are.
+        rss_at_last_trim_ = rss;
+        return;
+    }
+    const size_t growth = rss - rss_at_last_trim_;
+    const size_t threshold = std::max<size_t>(
+        kMinTrimGrowthBytes,
+        static_cast<size_t>(malloc_trim_growth_ratio_ *
+                            static_cast<double>(rss_at_last_trim_)));
+    if (growth < threshold) {
+        return;
+    }
     if (now - last_trim_time_ < kMinTrimInterval) {
         return;
     }
 
+    // held/free are logged, not decided on -- see the comment above. They
+    // are what makes a trim's effect legible after the fact.
     const auto before = mallinfo2();
-    // held: the sbrk heap glibc has taken from the OS plus the chunks it
-    // manages via mmap. free: ordinary free chunks plus fastbins -- the
-    // memory that is ours on paper and unusable in practice.
-    const size_t held_before = before.arena + before.hblkhd;
-    const size_t free_before = before.fordblks + before.fsmblks;
-    if (free_before < kMinTrimFreeBytes) {
-        return;
-    }
-    if (static_cast<double>(free_before) <
-        malloc_trim_free_ratio_ * static_cast<double>(held_before)) {
-        return;
-    }
-
-    // "0" leaves glibc's default end-of-heap padding in place instead of
+    // "0" leaves glibc's default end-of-heap padding in place rather than
     // trimming to zero; the interior free pages are released either way.
     malloc_trim(0);
     last_trim_time_ = std::chrono::steady_clock::now();
-
+    const size_t rss_after = ReadResidentBytes();
+    if (rss_after != 0) {
+        rss_at_last_trim_ = rss_after;
+    }
     const auto after = mallinfo2();
-    LOG(INFO) << "action=heap_trim held_before=" << held_before
-              << " free_before=" << free_before << " held_after="
+    LOG(INFO) << "action=heap_trim rss_before=" << rss << " rss_after="
+              << rss_after << " growth_that_triggered=" << growth
+              << " threshold=" << threshold << " held_before="
+              << (before.arena + before.hblkhd) << " free_before="
+              << (before.fordblks + before.fsmblks) << " held_after="
               << (after.arena + after.hblkhd) << " free_after="
-              << (after.fordblks + after.fsmblks) << " ratio_threshold="
-              << malloc_trim_free_ratio_;
+              << (after.fordblks + after.fsmblks);
 #else
     LOG_FIRST_N(WARNING, 1)
         << "action=heap_trim skipped=true allocator=unknown: this build is "
