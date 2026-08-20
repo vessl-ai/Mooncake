@@ -25,16 +25,27 @@
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
-// MaybeTrimHeap() needs glibc's <malloc.h> for mallinfo2() and
-// malloc_trim(). STORE_USE_JEMALLOC (mooncake-store/CMakeLists.txt,
-// default OFF) replaces glibc's allocator wholesale, and jemalloc returns
-// memory on its own decay schedule and implements neither call -- so under
-// that build MaybeTrimHeap() is a no-op that says so once, rather than
-// calling an untested jemalloc equivalent from here.
+// MaybeTrimHeap() needs glibc's <malloc.h> for malloc_trim() and, for the
+// numbers it logs, mallinfo2() or its predecessor. STORE_USE_JEMALLOC
+// (mooncake-store/CMakeLists.txt, default OFF) replaces glibc's allocator
+// wholesale, and jemalloc returns memory on its own decay schedule and
+// implements neither call -- so under that build MaybeTrimHeap() is a no-op
+// that says so once, rather than calling an untested jemalloc equivalent
+// from here.
 #if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
 #include <malloc.h>
 #include <unistd.h>
 #include <cstdio>
+// mallinfo2() arrived in glibc 2.33. The manylinux2_28 image that builds the
+// python wheel is glibc 2.28, where only the older mallinfo() exists, so
+// naming mallinfo2() unconditionally makes this file compile on the store's
+// own toolchain and fail on the wheel's. Both are real build targets, so the
+// call is selected here instead.
+#if defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 33)
+#define MOONCAKE_HAVE_MALLINFO2 1
+#endif
+#endif
 #endif
 
 #include "http_metadata_server.h"
@@ -9122,6 +9133,31 @@ size_t ReadResidentBytes() {
     return static_cast<size_t>(resident_pages) *
            static_cast<size_t>(page_size);
 }
+
+// The four mallinfo fields MaybeTrimHeap() logs, widened to size_t. On glibc
+// >= 2.33 they come from mallinfo2() and are size_t at the source. Before
+// that, mallinfo()'s fields are `int` and wrap on a heap above 2 GiB -- which
+// is the size range this code exists for, so on that path read them as
+// indicative only. Nothing is decided on them either way: the trim decision
+// reads /proc via ReadResidentBytes() above, which is unaffected.
+struct HeapInfo {
+    size_t arena;
+    size_t hblkhd;
+    size_t fordblks;
+    size_t fsmblks;
+};
+
+HeapInfo ReadHeapInfo() {
+#ifdef MOONCAKE_HAVE_MALLINFO2
+    const auto m = mallinfo2();
+#else
+    const auto m = mallinfo();
+#endif
+    return HeapInfo{static_cast<size_t>(m.arena),
+                    static_cast<size_t>(m.hblkhd),
+                    static_cast<size_t>(m.fordblks),
+                    static_cast<size_t>(m.fsmblks)};
+}
 #endif
 
 }  // namespace
@@ -9212,7 +9248,7 @@ void MasterService::MaybeTrimHeap() {
 
     // held/free are logged, not decided on -- see the comment above. They
     // are what makes a trim's effect legible after the fact.
-    const auto before = mallinfo2();
+    const HeapInfo before = ReadHeapInfo();
     // "0" leaves glibc's default end-of-heap padding in place rather than
     // trimming to zero; the interior free pages are released either way.
     malloc_trim(0);
@@ -9221,7 +9257,7 @@ void MasterService::MaybeTrimHeap() {
     if (rss_after != 0) {
         rss_at_last_trim_ = rss_after;
     }
-    const auto after = mallinfo2();
+    const HeapInfo after = ReadHeapInfo();
     LOG(INFO) << "action=heap_trim rss_before=" << rss << " rss_after="
               << rss_after << " growth_that_triggered=" << growth
               << " threshold=" << threshold << " held_before="
