@@ -1631,6 +1631,13 @@ class MasterService {
         std::unordered_map<std::string, std::unordered_set<std::string>>
             group_members;  // group_id → set of keys
 
+        // Number of EraseMetadata() calls against `metadata` since the last
+        // rehash-shrink check. Only consulted when
+        // enable_metadata_rehash_on_erase_ is set; see EraseMetadata(). Not
+        // part of tenant content, so it is deliberately excluded from
+        // Empty() below.
+        uint64_t erases_since_rehash{0};
+
         bool Empty() const {
             return metadata.empty() && processing_keys.empty() &&
                    replication_tasks.empty() && offloading_tasks.empty() &&
@@ -1981,6 +1988,12 @@ class MasterService {
 
     // Eviction thread function
     void EvictionThreadFunc();
+    // Returns freed heap pages to the OS: glibc malloc_trim(0), or the
+    // jemalloc epoch+purge equivalent when built with STORE_USE_JEMALLOC.
+    // Called periodically from EvictionThreadFunc when
+    // enable_periodic_malloc_trim_ is set. See master_service.cpp for the
+    // allocator-selection rationale.
+    void PeriodicMallocTrim();
     void NofHeartbeatThreadFunc();
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
@@ -2093,6 +2106,28 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    // Periodic malloc_trim(0) (or jemalloc-purge) mitigation for allocator
+    // RSS growth under long-running erase/insert churn on the metadata
+    // maps. See PeriodicMallocTrim(). Off by default (config:
+    // enable_periodic_malloc_trim, malloc_trim_interval_ms) — this changes
+    // background CPU/latency behavior and is meant to be opted into
+    // deliberately, not enabled silently for existing deployments.
+    bool enable_periodic_malloc_trim_{false};
+    uint64_t malloc_trim_interval_ms_{60000};
+    std::chrono::steady_clock::time_point next_malloc_trim_time_{};
+
+    // Periodic per-tenant metadata map rehash-shrink after a batch of
+    // erases (config: enable_metadata_rehash_on_erase,
+    // metadata_rehash_erase_interval). See EraseMetadata(). Off by default
+    // for the same reason as above.
+    bool enable_metadata_rehash_on_erase_{false};
+    uint64_t metadata_rehash_erase_interval_{4096};
+    // Below this load factor (size / bucket_count), a rehash-shrink check
+    // actually shrinks the map. Not exposed as a gflag: it only tunes how
+    // aggressively an already-opted-in rehash fires, not whether the
+    // feature is active.
+    static constexpr double kMetadataRehashLoadFactorThreshold = 0.25;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;

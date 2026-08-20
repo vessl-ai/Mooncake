@@ -74,6 +74,9 @@ else()
 endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+if (STORE_USE_JEMALLOC)
+  add_compile_definitions(STORE_USE_JEMALLOC)
+endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
 if(WITH_STORE)
