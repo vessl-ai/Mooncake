@@ -47,7 +47,11 @@ DEFINE_uint64(segment_size, 64 * GiB, "Size of each segment");
 DEFINE_uint64(num_clients, 4, "Number of clients to perform operations");
 DEFINE_uint64(num_threads, 1,
               "Number of threads in each client to perform operations");
-DEFINE_string(operation, "BatchPut", "Operation to perform");
+DEFINE_string(operation, "BatchPut",
+              "Operation to perform: Put, Get, BatchPut, BatchGet or "
+              "BatchExistKey. BatchExistKey is what a hicache fleet actually "
+              "drives at a master -- it is the lookup a prefix-cache hit test "
+              "makes, and it dominates a serving cell's master traffic");
 DEFINE_uint64(num_keys, 10 * 1000,
               "Number of keys to prefill for Get operations on each thread");
 DEFINE_uint64(batch_size, 128, "Batch size for batch operations");
@@ -57,6 +61,15 @@ DEFINE_double(
     prefill_ratio, 0.0,
     "Ratio of segment capacity to prefill before test (0.0-1.0). "
     "E.g., 0.95 means fill segments to 95% before starting benchmark");
+DEFINE_uint64(wait_register_sec, 0,
+              "After the opening mounts, wait up to this many seconds for "
+              "every client to reach the master's OK state before starting "
+              "load. A client only becomes OK by remounting, and a remount of "
+              "a segment that already holds replicas fails, so a run that "
+              "needs the master to have clients it can expire has to register "
+              "them while the master is still empty. 0 keeps the previous "
+              "behaviour: start load immediately and leave the clients "
+              "unregistered");
 DEFINE_int64(mount_extra_at_sec, -1,
              "Second of the load phase at which one further client joins and "
              "mounts one more segment. Negative disables it. This is the "
@@ -361,6 +374,10 @@ class SegmentClient {
 
     int64_t mount_latency_us() const { return mount_latency_us_; }
 
+    // True once a Ping has come back OK, which is the master saying this
+    // client is in ok_client_ and therefore something it can expire.
+    bool registered() const { return registered_.load(); }
+
     ~SegmentClient() {
         if (remount_future_.valid()) {
             remount_future_.wait();
@@ -404,6 +421,7 @@ class SegmentClient {
 
         const bool need_remount = ping_result.value().client_status ==
                                   mooncake::ClientStatus::NEED_REMOUNT;
+        registered_.store(!need_remount);
         RecordPing(elapsed_ms, epoch_ms, latency_us,
                    need_remount ? "need_remount" : "ok");
 
@@ -442,6 +460,7 @@ class SegmentClient {
     mooncake::Segment segment_;
     std::future<void> remount_future_;
     int64_t mount_latency_us_ = 0;
+    std::atomic<bool> registered_{false};
 };
 
 static std::atomic<uint64_t> gCompletedOperations = 0;
@@ -451,6 +470,7 @@ enum class BenchOperation {
     GET,
     BATCH_PUT,
     BATCH_GET,
+    BATCH_EXIST_KEY,
 };
 
 static inline BenchOperation ParseOperation(const std::string& operation_str) {
@@ -462,6 +482,8 @@ static inline BenchOperation ParseOperation(const std::string& operation_str) {
         return BenchOperation::BATCH_PUT;
     } else if (operation_str == "BatchGet") {
         return BenchOperation::BATCH_GET;
+    } else if (operation_str == "BatchExistKey") {
+        return BenchOperation::BATCH_EXIST_KEY;
     } else {
         throw std::invalid_argument("Invalid operation");
     }
@@ -566,6 +588,17 @@ class BenchClient {
         return success_cnt;
     }
 
+    uint64_t BatchExistKey(const std::vector<std::string>& keys) {
+        uint64_t success_cnt = 0;
+        auto exist_results = master_client_.BatchExistKey(keys);
+        for (auto& exist_result : exist_results) {
+            if (exist_result.has_value()) {
+                success_cnt++;
+            }
+        }
+        return success_cnt;
+    }
+
     uint64_t BatchGet(const std::vector<std::string>& keys) {
         uint64_t success_cnt = 0;
         auto get_results = master_client_.BatchGetReplicaList(keys);
@@ -646,7 +679,8 @@ class BenchClient {
         }
 
         if (operation == BenchOperation::GET ||
-            operation == BenchOperation::BATCH_GET) {
+            operation == BenchOperation::BATCH_GET ||
+            operation == BenchOperation::BATCH_EXIST_KEY) {
             PrefillKeys(key_id, batch_size, value_size, num_keys);
         }
 
@@ -674,6 +708,10 @@ class BenchClient {
                 case BenchOperation::BATCH_GET:
                     keys = GenerateGetKeys(key_id, batch_size);
                     gCompletedOperations.fetch_add(BatchGet(keys));
+                    break;
+                case BenchOperation::BATCH_EXIST_KEY:
+                    keys = GenerateGetKeys(key_id, batch_size);
+                    gCompletedOperations.fetch_add(BatchExistKey(keys));
                     break;
                 default:
                     break;
@@ -750,6 +788,35 @@ int main(int argc, char** argv) {
         }
     }
     LOG(INFO) << "Segments mounted";
+
+    if (FLAGS_wait_register_sec > 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(FLAGS_wait_register_sec);
+        size_t registered = 0;
+        while (std::chrono::steady_clock::now() < deadline) {
+            registered = 0;
+            {
+                std::lock_guard<std::mutex> guard(segment_clients_mutex);
+                for (auto& segment_client : segment_clients) {
+                    if (segment_client->registered()) {
+                        registered++;
+                    }
+                }
+            }
+            if (registered == segment_clients.size()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        LOG(INFO) << "action=wait_register_done, registered=" << registered
+                  << ", of=" << segment_clients.size()
+                  << ", elapsed_ms=" << ElapsedMs();
+        if (registered != segment_clients.size()) {
+            LOG(ERROR) << "action=wait_register_incomplete: the master has "
+                          "fewer clients than this run assumes, so an expiry "
+                          "it triggers will not be the one being measured";
+        }
+    }
 
     // Prefill segments if requested
     if (FLAGS_prefill_ratio > 0.0) {
