@@ -61,6 +61,12 @@ DEFINE_double(
     prefill_ratio, 0.0,
     "Ratio of segment capacity to prefill before test (0.0-1.0). "
     "E.g., 0.95 means fill segments to 95% before starting benchmark");
+DEFINE_bool(independent_ping, false,
+            "Give every client its own ping thread instead of pinging all of "
+            "them in turn from one. A store pod pings on its own timer, so "
+            "one shared pinger cannot distinguish a master that stopped "
+            "answering from a pinger that is blocked on the first client in "
+            "its list. Off by default, which is the previous behaviour");
 DEFINE_uint64(wait_register_sec, 0,
               "After the opening mounts, wait up to this many seconds for "
               "every client to reach the master's OK state before starting "
@@ -447,6 +453,24 @@ class SegmentClient {
         }
     }
 
+    // Ping this client on its own timer, the way a store pod does. Stopped by
+    // the jthread's destructor, which runs before the members Ping() touches.
+    void StartOwnPingThread() {
+        own_ping_thread_ = std::jthread([this](std::stop_token stop_token) {
+            unset_cpu_affinity();
+            static const auto OneSecond = std::chrono::seconds(1);
+            while (!stop_token.stop_requested()) {
+                auto start_time = std::chrono::steady_clock::now();
+                Ping();
+                auto time_elapsed =
+                    std::chrono::steady_clock::now() - start_time;
+                if (OneSecond > time_elapsed) {
+                    std::this_thread::sleep_for(OneSecond - time_elapsed);
+                }
+            }
+        });
+    }
+
    private:
     void RecordPing(int64_t elapsed_ms, int64_t epoch_ms, int64_t latency_us,
                     const char* outcome) {
@@ -461,6 +485,9 @@ class SegmentClient {
     std::future<void> remount_future_;
     int64_t mount_latency_us_ = 0;
     std::atomic<bool> registered_{false};
+    // Declared last so its destructor stops the thread before anything the
+    // thread's Ping() reads is destroyed.
+    std::jthread own_ping_thread_;
 };
 
 static std::atomic<uint64_t> gCompletedOperations = 0;
@@ -760,7 +787,7 @@ int main(int argc, char** argv) {
         while (!stop_token.stop_requested()) {
             std::chrono::nanoseconds time_elapsed;
             auto start_time = std::chrono::steady_clock::now();
-            {
+            if (!FLAGS_independent_ping) {
                 std::lock_guard<std::mutex> guard(segment_clients_mutex);
                 for (auto& segment_client : segment_clients) {
                     segment_client->Ping();
@@ -779,6 +806,9 @@ int main(int argc, char** argv) {
         auto segment_client = std::make_unique<SegmentClient>(
             "segment_client_" + std::to_string(i), FLAGS_master_server,
             kSegmentBase + i * FLAGS_segment_size, FLAGS_segment_size);
+        if (FLAGS_independent_ping) {
+            segment_client->StartOwnPingThread();
+        }
         LOG(INFO) << "segment_name=" << segment_client->name()
                   << ", action=mount_segment, epoch_ms=" << EpochMs()
                   << ", latency_us=" << segment_client->mount_latency_us();
@@ -949,6 +979,9 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             LOG(ERROR) << "action=extra_mount_failed, error=" << e.what();
             continue;
+        }
+        if (FLAGS_independent_ping) {
+            extra_client->StartOwnPingThread();
         }
         LOG(INFO) << "action=extra_mount_end, epoch_ms=" << EpochMs()
                   << ", elapsed_ms=" << ElapsedMs() << ", latency_us="
