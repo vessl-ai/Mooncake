@@ -97,6 +97,18 @@ DEFINE_string(metrics_names, "",
               "Comma-separated metric names to keep from each scrape. Empty "
               "keeps every metric the endpoint exports, which is the safe "
               "default: a name guessed wrong is a column of silence");
+DEFINE_uint64(extra_clients, 1,
+              "How many clients join at --mount_extra_at_sec, all at once");
+DEFINE_int64(unmount_storm_at_sec, -1,
+             "At this second of the load phase, --storm_clients clients that "
+             "joined five seconds earlier all unmount their segments at once "
+             "(-1 = never)");
+DEFINE_uint64(storm_clients, 12, "Clients taking part in the unmount storm");
+DEFINE_uint64(storm_segment_size, 64 * 1024 * 1024,
+              "Segment size of each unmount-storm client");
+DEFINE_int64(stop_pinging_client0_at_sec, -1,
+             "At this second of the load phase segment_client_0 stops "
+             "pinging, the way a dead store pod does (-1 = never)");
 DEFINE_string(ping_csv, "",
               "Where each client's own Ping outcome is written, as "
               "elapsed_ms,epoch_ms,segment_name,latency_us,outcome. This is "
@@ -389,13 +401,40 @@ class SegmentClient {
             remount_future_.wait();
         }
 
+        if (unmounted_.load()) {
+            return;
+        }
         auto unmount_result = master_client_.UnmountSegment(segment_.id);
         if (!unmount_result.has_value()) {
             LOG(ERROR) << "Failed to unmount segment " << segment_.name;
         }
     }
 
+    void StopPinging() { stopped_pinging_.store(true); }
+
+    // Unmounts now and makes the destructor skip it.
+    void UnmountNow() {
+        const auto begin = std::chrono::steady_clock::now();
+        auto result = master_client_.UnmountSegment(segment_.id);
+        const int64_t us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin)
+                .count();
+        unmounted_.store(true);
+        LOG(INFO) << "segment_name=" << segment_.name
+                  << ", action=storm_unmount, latency_us=" << us
+                  << ", ok=" << result.has_value();
+        if (gPingLog) {
+            gPingLog->Append(
+                ElapsedMs(), EpochMs(), segment_.name, us,
+                result.has_value() ? "unmount_ok" : "unmount_failed");
+        }
+    }
+
     void Ping() {
+        if (stopped_pinging_.load()) {
+            return;
+        }
         if (remount_future_.valid() &&
             remount_future_.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
@@ -485,6 +524,8 @@ class SegmentClient {
     std::future<void> remount_future_;
     int64_t mount_latency_us_ = 0;
     std::atomic<bool> registered_{false};
+    std::atomic<bool> stopped_pinging_{false};
+    std::atomic<bool> unmounted_{false};
     // Declared last so its destructor stops the thread before anything the
     // thread's Ping() reads is destroyed.
     std::jthread own_ping_thread_;
@@ -757,6 +798,8 @@ int main(int argc, char** argv) {
     std::mutex segment_clients_mutex;
     std::jthread ping_thread;
     std::vector<std::unique_ptr<BenchClient>> bench_clients;
+    std::vector<std::unique_ptr<SegmentClient>> storm_clients;
+    std::vector<std::future<void>> storm_unmounts;
 
     google::InitGoogleLogging("MasterBench");
     FLAGS_logtostderr = true;
@@ -958,6 +1001,51 @@ int main(int argc, char** argv) {
                   << ", elapsed_ms=" << ElapsedMs();
         last_completed = curr_completed;
 
+        if (FLAGS_stop_pinging_client0_at_sec >= 0 &&
+            static_cast<int64_t>(i) == FLAGS_stop_pinging_client0_at_sec) {
+            std::lock_guard<std::mutex> guard(segment_clients_mutex);
+            segment_clients.front()->StopPinging();
+            LOG(INFO) << "action=client0_stopped_pinging, epoch_ms="
+                      << EpochMs() << ", elapsed_ms=" << ElapsedMs();
+        }
+        if (FLAGS_unmount_storm_at_sec >= 5 &&
+            static_cast<int64_t>(i) == FLAGS_unmount_storm_at_sec - 5) {
+            std::vector<std::future<std::unique_ptr<SegmentClient>>> joins;
+            for (size_t s = 0; s < FLAGS_storm_clients; s++) {
+                joins.push_back(std::async(std::launch::async, [s] {
+                    return std::make_unique<SegmentClient>(
+                        "storm_client_" + std::to_string(s),
+                        FLAGS_master_server,
+                        kSegmentBase +
+                            (FLAGS_num_segments + 64) * FLAGS_segment_size +
+                            s * FLAGS_storm_segment_size,
+                        FLAGS_storm_segment_size);
+                }));
+            }
+            for (auto& join : joins) {
+                auto client = join.get();
+                if (FLAGS_independent_ping) {
+                    client->StartOwnPingThread();
+                }
+                storm_clients.push_back(std::move(client));
+            }
+            LOG(INFO) << "action=storm_clients_joined, count="
+                      << storm_clients.size() << ", elapsed_ms=" << ElapsedMs();
+        }
+        if (FLAGS_unmount_storm_at_sec >= 0 &&
+            static_cast<int64_t>(i) == FLAGS_unmount_storm_at_sec) {
+            LOG(INFO) << "action=unmount_storm_begin, epoch_ms=" << EpochMs()
+                      << ", elapsed_ms=" << ElapsedMs();
+            std::vector<std::future<void>> unmounts;
+            for (auto& client : storm_clients) {
+                unmounts.push_back(
+                    std::async(std::launch::async,
+                               [raw = client.get()] { raw->UnmountNow(); }));
+            }
+            // Not waited on: the load loop keeps its one-second cadence.
+            storm_unmounts = std::move(unmounts);
+        }
+
         if (FLAGS_mount_extra_at_sec < 0 ||
             static_cast<int64_t>(i) != FLAGS_mount_extra_at_sec) {
             continue;
@@ -970,23 +1058,32 @@ int main(int argc, char** argv) {
         LOG(INFO) << "action=extra_mount_begin, epoch_ms=" << EpochMs()
                   << ", elapsed_ms=" << ElapsedMs()
                   << ", segment_size=" << extra_segment_size;
-        std::unique_ptr<SegmentClient> extra_client;
-        try {
-            extra_client = std::make_unique<SegmentClient>(
-                "segment_client_extra", FLAGS_master_server,
-                kSegmentBase + FLAGS_num_segments * FLAGS_segment_size,
-                extra_segment_size);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "action=extra_mount_failed, error=" << e.what();
-            continue;
+        std::vector<std::future<std::unique_ptr<SegmentClient>>> joins;
+        for (size_t e = 0; e < FLAGS_extra_clients; e++) {
+            joins.push_back(
+                std::async(std::launch::async, [e, extra_segment_size] {
+                    return std::make_unique<SegmentClient>(
+                        "segment_client_extra_" + std::to_string(e),
+                        FLAGS_master_server,
+                        kSegmentBase +
+                            (FLAGS_num_segments + e) * FLAGS_segment_size,
+                        extra_segment_size);
+                }));
         }
-        if (FLAGS_independent_ping) {
-            extra_client->StartOwnPingThread();
-        }
-        LOG(INFO) << "action=extra_mount_end, epoch_ms=" << EpochMs()
-                  << ", elapsed_ms=" << ElapsedMs() << ", latency_us="
-                  << extra_client->mount_latency_us();
-        {
+        for (auto& join : joins) {
+            std::unique_ptr<SegmentClient> extra_client;
+            try {
+                extra_client = join.get();
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "action=extra_mount_failed, error=" << e.what();
+                continue;
+            }
+            if (FLAGS_independent_ping) {
+                extra_client->StartOwnPingThread();
+            }
+            LOG(INFO) << "action=extra_mount_end, epoch_ms=" << EpochMs()
+                      << ", elapsed_ms=" << ElapsedMs()
+                      << ", latency_us=" << extra_client->mount_latency_us();
             std::lock_guard<std::mutex> guard(segment_clients_mutex);
             segment_clients.push_back(std::move(extra_client));
         }
@@ -1014,6 +1111,10 @@ int main(int argc, char** argv) {
 
     LOG(INFO) << "Disconnecting from master...";
     bench_clients.clear();
+    for (auto& unmount : storm_unmounts) {
+        unmount.wait();
+    }
+    storm_clients.clear();
     segment_clients.clear();
     LOG(INFO) << "Disconnected from master";
     gPingLog.reset();
