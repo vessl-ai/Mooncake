@@ -1121,10 +1121,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool ambiguous_endpoint = false;
         bool unsupported_cxl = false;
         std::unordered_set<ObjectMetadata*> affected_objects;
-        bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
-            });
+        // RIG ONLY (INF-504): run the post-promotion shard walk on every
+        // remount so its cost can be measured without an HA failover.
+        static const bool rig_force_remount_scan =
+            std::getenv("MC_RIG_FORCE_REMOUNT_SCAN") != nullptr;
+        bool any_standby_kept_alive =
+            rig_force_remount_scan ||
+            std::any_of(segments.begin(), segments.end(),
+                        [this](const Segment& segment) {
+                            return standby_accounted_memory_bytes_.contains(
+                                segment.name);
+                        });
         for (size_t shard_index = 0;
              any_standby_kept_alive && shard_index < kNumShards;
              ++shard_index) {
