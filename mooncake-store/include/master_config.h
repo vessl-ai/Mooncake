@@ -47,10 +47,6 @@ struct MasterConfig {
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
-    // Client mass-expiry circuit breaker; see
-    // DEFAULT_CLIENT_MASS_EXPIRY_GUARD.
-    bool client_mass_expiry_guard = DEFAULT_CLIENT_MASS_EXPIRY_GUARD;
-    int64_t client_mass_expiry_grace_sec = DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
     uint32_t nof_heartbeat_failures_threshold;
@@ -256,8 +252,6 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
-    bool client_mass_expiry_guard = DEFAULT_CLIENT_MASS_EXPIRY_GUARD;
-    int64_t client_mass_expiry_grace_sec = DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC;
     double malloc_trim_growth_ratio = 0.25;
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
@@ -310,8 +304,6 @@ class MasterServiceSupervisorConfig {
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_mass_expiry_guard = config.client_mass_expiry_guard;
-        client_mass_expiry_grace_sec = config.client_mass_expiry_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -507,8 +499,6 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool client_mass_expiry_guard = DEFAULT_CLIENT_MASS_EXPIRY_GUARD;
-    int64_t client_mass_expiry_grace_sec = DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -605,8 +595,6 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_mass_expiry_guard = config.client_mass_expiry_guard;
-        client_mass_expiry_grace_sec = config.client_mass_expiry_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -731,8 +719,6 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_mass_expiry_guard = config.client_mass_expiry_guard;
-        client_mass_expiry_grace_sec = config.client_mass_expiry_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -830,9 +816,6 @@ class MasterServiceConfigBuilder {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool client_mass_expiry_guard_ = DEFAULT_CLIENT_MASS_EXPIRY_GUARD;
-    int64_t client_mass_expiry_grace_sec_ =
-        DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC;
     int64_t nof_heartbeat_interval_sec_ = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms_ =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -933,19 +916,6 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
         client_live_ttl_sec_ = ttl;
-        return *this;
-    }
-
-    // Client mass-expiry circuit breaker; see
-    // DEFAULT_CLIENT_MASS_EXPIRY_GUARD.
-    MasterServiceConfigBuilder& set_client_mass_expiry_guard(bool guard) {
-        client_mass_expiry_guard_ = guard;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_client_mass_expiry_grace_sec(
-        int64_t grace_sec) {
-        client_mass_expiry_grace_sec_ = grace_sec;
         return *this;
     }
 
@@ -1209,8 +1179,6 @@ class MasterServiceConfig {
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool client_mass_expiry_guard = DEFAULT_CLIENT_MASS_EXPIRY_GUARD;
-    int64_t client_mass_expiry_grace_sec = DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
     uint32_t nof_heartbeat_probe_timeout_ms =
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
@@ -1303,8 +1271,6 @@ class MasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
-        client_mass_expiry_guard = config.client_mass_expiry_guard;
-        client_mass_expiry_grace_sec = config.client_mass_expiry_grace_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
         nof_heartbeat_failures_threshold =
@@ -1403,8 +1369,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         nof_eviction_high_watermark_ratio_;
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
-    config.client_mass_expiry_guard = client_mass_expiry_guard_;
-    config.client_mass_expiry_grace_sec = client_mass_expiry_grace_sec_;
     config.nof_heartbeat_interval_sec = nof_heartbeat_interval_sec_;
     config.nof_heartbeat_probe_timeout_ms = nof_heartbeat_probe_timeout_ms_;
     config.nof_heartbeat_failures_threshold = nof_heartbeat_failures_threshold_;
