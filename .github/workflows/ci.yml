@@ -27,7 +27,7 @@ jobs:
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [spell-check, check-paths]
     if: &run-ci-for-source-changes needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -558,7 +558,7 @@ jobs:
               - '.github/workflows/ci.yml'
 
   build-wheel-cu13:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [spell-check, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -568,19 +568,19 @@ jobs:
       version-override: 0.0.0.dev0
 
   build-wheel-efa:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [spell-check, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
   build-wheel-rocm:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [spell-check, check-paths]
     if: needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
   tent-ci:
-    needs: [spell-check, clang-format, check-paths]
+    needs: [spell-check, check-paths]
     if: needs.check-paths.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
