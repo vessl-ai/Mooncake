@@ -109,6 +109,15 @@ DEFINE_uint64(storm_segment_size, 64 * 1024 * 1024,
 DEFINE_int64(stop_pinging_client0_at_sec, -1,
              "At this second of the load phase segment_client_0 stops "
              "pinging, the way a dead store pod does (-1 = never)");
+DEFINE_int64(graceful_exit_client0_at_sec, -1,
+             "RIG ONLY (INF-522): at this second of the load phase "
+             "segment_client_0 leaves the way a drained store pod does: "
+             "GracefulUnmountSegment with --graceful_grace_sec (a plain "
+             "UnmountSegment when 0), then it keeps pinging for the grace "
+             "plus --graceful_margin_sec, then stops pinging (-1 = never)");
+DEFINE_uint64(graceful_grace_sec, 5, "Grace period of the graceful exit");
+DEFINE_uint64(graceful_margin_sec, 2,
+              "Seconds client0 keeps pinging after the grace ends");
 DEFINE_string(ping_csv, "",
               "Where each client's own Ping outcome is written, as "
               "elapsed_ms,epoch_ms,segment_name,latency_us,outcome. This is "
@@ -428,6 +437,39 @@ class SegmentClient {
             gPingLog->Append(
                 ElapsedMs(), EpochMs(), segment_.name, us,
                 result.has_value() ? "unmount_ok" : "unmount_failed");
+        }
+    }
+
+    // RIG ONLY (INF-522): a drained store's exit, as the master sees it.
+    void GracefulExit(uint64_t grace_sec, uint64_t margin_sec) {
+        const auto begin = std::chrono::steady_clock::now();
+        auto result =
+            grace_sec == 0
+                ? master_client_.UnmountSegment(segment_.id)
+                : master_client_.GracefulUnmountSegment(segment_.id,
+                                                        grace_sec * 1000);
+        const int64_t us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin)
+                .count();
+        unmounted_.store(true);
+        LOG(INFO) << "segment_name=" << segment_.name
+                  << ", action=graceful_unmount, latency_us=" << us
+                  << ", ok=" << result.has_value()
+                  << ", epoch_ms=" << EpochMs();
+        if (gPingLog) {
+            gPingLog->Append(ElapsedMs(), EpochMs(), segment_.name, us,
+                             result.has_value() ? "graceful_unmount_ok"
+                                                : "graceful_unmount_failed");
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(grace_sec + margin_sec));
+        StopPinging();
+        LOG(INFO) << "segment_name=" << segment_.name
+                  << ", action=graceful_stopped_pinging, epoch_ms="
+                  << EpochMs() << ", elapsed_ms=" << ElapsedMs();
+        if (gPingLog) {
+            gPingLog->Append(ElapsedMs(), EpochMs(), segment_.name, 0,
+                             "graceful_stopped_pinging");
         }
     }
 
@@ -800,6 +842,7 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<BenchClient>> bench_clients;
     std::vector<std::unique_ptr<SegmentClient>> storm_clients;
     std::vector<std::future<void>> storm_unmounts;
+    std::future<void> graceful_exit;
 
     google::InitGoogleLogging("MasterBench");
     FLAGS_logtostderr = true;
@@ -1008,6 +1051,17 @@ int main(int argc, char** argv) {
             LOG(INFO) << "action=client0_stopped_pinging, epoch_ms="
                       << EpochMs() << ", elapsed_ms=" << ElapsedMs();
         }
+        if (FLAGS_graceful_exit_client0_at_sec >= 0 &&
+            static_cast<int64_t>(i) == FLAGS_graceful_exit_client0_at_sec) {
+            std::lock_guard<std::mutex> guard(segment_clients_mutex);
+            SegmentClient* client0 = segment_clients.front().get();
+            LOG(INFO) << "action=client0_graceful_exit_begin, epoch_ms="
+                      << EpochMs() << ", elapsed_ms=" << ElapsedMs();
+            graceful_exit = std::async(std::launch::async, [client0] {
+                client0->GracefulExit(FLAGS_graceful_grace_sec,
+                                      FLAGS_graceful_margin_sec);
+            });
+        }
         if (FLAGS_unmount_storm_at_sec >= 5 &&
             static_cast<int64_t>(i) == FLAGS_unmount_storm_at_sec - 5) {
             std::vector<std::future<std::unique_ptr<SegmentClient>>> joins;
@@ -1113,6 +1167,9 @@ int main(int argc, char** argv) {
     bench_clients.clear();
     for (auto& unmount : storm_unmounts) {
         unmount.wait();
+    }
+    if (graceful_exit.valid()) {
+        graceful_exit.wait();
     }
     storm_clients.clear();
     segment_clients.clear();
