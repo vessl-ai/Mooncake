@@ -147,14 +147,13 @@ inline constexpr size_t kMinTrackedClientsForSilenceEvidence = 2;
 struct ClientMassExpiryInputs {
     bool guard_enabled = true;
     std::chrono::seconds grace{0};
+    std::chrono::seconds client_live_ttl{0};
     size_t expired_count = 0;
     // Clients the monitor tracks, i.e. the size of its own ttl map.
     size_t tracked_clients = 0;
     ExclusiveClientLockHolds holds;
     std::chrono::steady_clock::time_point now{};
-    // Last tick that popped at least one heartbeat, and so the left edge of
-    // the window an exclusive hold has to overlap to explain this tick's
-    // candidates: a hold that released before it is refuted by that heartbeat.
+    // Last tick that popped at least one heartbeat.
     std::chrono::steady_clock::time_point last_ping_batch_at{};
     // Newest deadline among the clients this tick would expire.
     std::chrono::steady_clock::time_point newest_expired_deadline{};

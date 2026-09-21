@@ -11205,17 +11205,14 @@ ClientMassExpiryDecision EvaluateClientMassExpiry(
         return decision;
     }
 
-    // The window a hold has to overlap to be this tick's explanation:
-    // [last_ping_batch_at, now]. It opens at the last tick that popped a
-    // heartbeat, because a hold that released before that heartbeat is
-    // refuted by it -- the master demonstrably went back to serving pings
-    // afterwards, so it can no longer be what kept these candidates from
-    // being heard, and they are genuinely gone. It runs to now, because a
-    // hold in progress at this instant is stopping heartbeats at this
-    // instant whatever it did earlier (Overlaps takes any in_progress_start
-    // <= now).
+    // The window in which the newest candidate's heartbeat could have been
+    // refreshed and was not: one TTL back from its deadline, and forward to
+    // now, because a hold running at this instant is stopping heartbeats at
+    // this instant whatever it did earlier.
+    const auto window_start =
+        inputs.newest_expired_deadline - inputs.client_live_ttl;
     decision.exclusive_hold_overlap =
-        inputs.holds.Overlaps(inputs.last_ping_batch_at, inputs.now);
+        inputs.holds.Overlaps(window_start, inputs.now);
     decision.master_silent =
         inputs.last_ping_batch_at < inputs.newest_expired_deadline;
     decision.is_mass_expiry =
@@ -11308,7 +11305,8 @@ void MasterService::ClientMonitorFunc() {
 
         // Update the client ttl. A client's deadline is stamped by the tick
         // that popped that client's ping, so it is that tick's time plus the
-        // ttl.
+        // ttl -- which is why the ttl has to be subtracted back off a deadline
+        // to recover the window the heartbeat could have arrived in.
         PodUUID pod_client_id;
         bool popped_ping = false;
         while (client_ping_queue_.pop(pod_client_id)) {
@@ -11343,14 +11341,9 @@ void MasterService::ClientMonitorFunc() {
         // it cannot do that from the absence of heartbeats, which looks
         // identical either way. It measures the cause instead.
         //
-        // Primary condition: an exclusive client_mutex_ hold overlapped
-        // [last_ping_batch_at, now], the stretch over which this master has
-        // no heartbeat of its own to show. A completed hold therefore counts
-        // only while no heartbeat has been popped since it released: once one
-        // has, the master is demonstrably serving pings again, that hold is
-        // refuted as an explanation, and candidates still overdue are
-        // genuinely gone. A hold in progress counts unconditionally, since it
-        // is stopping heartbeats at this instant. Ping's whole body is a
+        // Primary condition: an exclusive client_mutex_ hold overlapped the
+        // window in which these clients' heartbeats could have been refreshed,
+        // [newest_expired_deadline - client_ttl, now]. Ping's whole body is a
         // shared-lock read of ok_client_ and a push onto a lock-free queue, so
         // an exclusive holder of client_mutex_ is the one thing that stops the
         // handler running at all -- and the master knows when it holds that
@@ -11361,25 +11354,6 @@ void MasterService::ClientMonitorFunc() {
         // the same lock exclusively and is deliberately not instrumented: a
         // previous tick's expiry work must not come back as evidence that the
         // master was stalling.
-        //
-        // That left edge moves with the heartbeat stream, and it has to: a
-        // pinned one -- the candidate's own last pop, newest_expired_deadline
-        // minus the ttl -- never advances while now does, so a routine
-        // few-millisecond hold that happened to land inside a dying client's
-        // last ttl window went on deferring that client for the whole grace
-        // while every other client's heartbeats were flowing. The narrowing
-        // never widens the window: the candidate's last pop is by definition
-        // at or before last_ping_batch_at, and the two coincide exactly when
-        // the newest candidate is the last client the master heard from, which
-        // is the single-client case and the whole-fleet case -- so those keep
-        // the protection they had. It is also why the edge is the heartbeat
-        // stream rather than the wall clock: a hold can release and leave the
-        // master starved for many more ticks (the UnmountSegment ->
-        // ClearInvalidHandles sweep holds snapshot_mutex_ across all shards
-        // for 8.5-9.6 s at 14M keys), and through that no heartbeat is popped,
-        // so last_ping_batch_at does not advance and the released hold stays
-        // evidence. A "holds within the last tick or two" rule would have aged
-        // it out mid-stall and erased the keys.
         //
         // Secondary condition: the master has processed no ping at all since
         // the newest candidate went overdue, and it tracks at least
@@ -11404,15 +11378,9 @@ void MasterService::ClientMonitorFunc() {
         //     -- no hold overlapped, and one tracked client is not evidence.
         //   1-client cell, a ReMountSegment stall                defer
         //     -- the remount's hold overlaps the window.
-        //   a client dies, then somebody else's short mount holds  expire now
-        //     -- the hold released and heartbeats were popped after it, so it
-        //        does not explain a client still overdue. Under a pinned left
-        //        edge this deferred the death for the whole grace.
         //   13 clients, one stall, expiries split 6/7            defer
-        //     -- the hold overlaps both ticks' windows, because a stall that
-        //        blocks Ping pops no heartbeat and so cannot move the window's
-        //        left edge past itself; the split is irrelevant, which is the
-        //        whole point of judging the cause.
+        //     -- the hold overlaps both ticks' windows; the split is
+        //        irrelevant, which is the whole point of judging the cause.
         //   13 clients, one stall, split 1/12                    defer
         //     -- likewise; a lone candidate inside a real stall is deferred.
         //   13 clients, healthy master, a majority genuinely die expire now
@@ -11443,6 +11411,7 @@ void MasterService::ClientMonitorFunc() {
         const ClientMassExpiryDecision decision = EvaluateClientMassExpiry({
             .guard_enabled = client_mass_expiry_guard_,
             .grace = client_mass_expiry_grace_,
+            .client_live_ttl = std::chrono::seconds(client_live_ttl_sec_),
             .expired_count = expired_clients.size(),
             // client_ttl is this thread's own map, so reading its size needs
             // no lock -- and the breaker must not take one, since it runs
