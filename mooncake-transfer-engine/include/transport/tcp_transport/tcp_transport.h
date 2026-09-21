@@ -213,7 +213,7 @@ class TcpTransport : public Transport {
     std::atomic_bool running_;
     std::unique_ptr<TcpIoPool> io_pool_;
     size_t num_io_threads_ = 1;
-    bool enable_connection_pool_ = true;
+    bool enable_connection_pool_ = false;
 
     // Client-side bounded work queues and fixed connection lanes.
     struct ConnectionKey {
