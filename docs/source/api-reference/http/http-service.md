@@ -260,6 +260,29 @@ Basic health check endpoint for service availability verification.
 curl http://localhost:8080/health
 ```
 
+#### `/version`
+Report the master version. Always available, including while the master is in
+standby.
+
+**Method**: `GET`
+**Content-Type**: `application/json; charset=utf-8`
+**Response**: JSON object with:
+- `version` (string): Store version used for RPC handshake compatibility
+- `display_version` (string): Human-readable release plus short git hash
+
+**Example**:
+```bash
+curl http://localhost:8080/version
+```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
+
+Real clients expose the same `/version` payload on their own client HTTP port
+when `enable_client_http_server` is on. See
+[Client Metrics Endpoint](../../getting_started/observability.md#client-metrics-endpoint).
+
 ## Store REST API Endpoints
 
 The following endpoints are served by the Python store REST service, which wraps
@@ -474,7 +497,10 @@ Safe to call more than once.
 ```
 
 `grace_period_seconds` is optional and defaults to `0`, which returns as soon as
-the master has dropped the segment.
+the master has dropped the segment. Must be a non-negative integer no greater
+than 3600 (1 hour); a malformed body or an out-of-range value gets a `400`
+without touching the store, so a mistake here (seconds where milliseconds were
+meant, say) cannot block a preStop hook for hours.
 
 **Success Response**:
 ```json
