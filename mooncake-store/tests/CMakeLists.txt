@@ -469,3 +469,4 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+add_store_test(offload_tput_test offload_tput_test.cpp)
