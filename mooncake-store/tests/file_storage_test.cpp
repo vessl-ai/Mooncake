@@ -274,6 +274,8 @@ class FileStorageTest : public ::testing::Test {
         bool offload_released = false;  // queued offload task, after them
         int64_t fenced_gauge = -1;
         bool fenced_offload_reached_backend = false;
+        size_t carried_before_fence = 0;  // carry_before_fence only
+        size_t carried_after_fence = 0;   // carried tasks + pooled keys
     };
 
     static constexpr int kRealFilesystemCheck = -1;
@@ -290,9 +292,11 @@ class FileStorageTest : public ::testing::Test {
     // check_errno (kRealFilesystemCheck: the real check on the live test
     // directory). One put leaves an offload task queued at the master for
     // this store. Runs two reads, then two heartbeats, and records what
-    // happened.
+    // happened. With carry_before_fence, one heartbeat first takes the task
+    // and defers its key to the backend's ungrouped pool (#3006 carry).
     void RunDiskErrorScenario(const std::string& name, int read_errno,
-                              int check_errno, DiskFenceOutcome& out) {
+                              int check_errno, DiskFenceOutcome& out,
+                              bool carry_before_fence = false) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
@@ -341,7 +345,7 @@ class FileStorageTest : public ::testing::Test {
         out.gauge_exported =
             HasSample(metrics_text, "mooncake_ssd_disk_fenced");
         BucketBackendConfig bucket_config;
-        bucket_config.bucket_keys_limit = 1;
+        bucket_config.bucket_keys_limit = carry_before_fence ? 2 : 1;
         auto backend = std::make_shared<FailingReadBackend>(
             config, bucket_config, read_errno);
         file_storage.storage_backend_ = backend;
@@ -361,6 +365,11 @@ class FileStorageTest : public ::testing::Test {
             MutexLocker locker(&file_storage.offloading_mutex_);
             file_storage.enable_offloading_ = true;
         }
+        if (carry_before_fence) {
+            (void)file_storage.Heartbeat();
+            out.carried_before_fence =
+                file_storage.deferred_task_by_storage_key_.size();
+        }
 
         for (int i = 0; i < 2; ++i) {
             std::string read_buffer(64, '\0');
@@ -374,13 +383,16 @@ class FileStorageTest : public ::testing::Test {
 
         out.fenced = file_storage.disk_fenced_.load();
         out.backend_loads = backend->loads;
+        out.carried_after_fence =
+            file_storage.deferred_task_by_storage_key_.size() +
+            backend->UngroupedOffloadingObjectsSize();
         std::vector<OffloadTaskItem> items;
         out.segment_mounted =
             client->OffloadObjectHeartbeat(true, items).has_value();
         out.offload_released =
             client->Upsert(offload_key, slices, replicate).has_value();
         out.fenced_gauge = metric.ssd_disk_fenced.value();
-        if (out.fenced) {
+        if (out.fenced && !carry_before_fence) {
             // Offload work already in hand must not reach a fenced disk. The
             // key has a memory replica on this store, so without the fence
             // this offload would reach the backend.
@@ -1726,6 +1738,20 @@ TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
     EXPECT_EQ(out.filesystem_checks, 0);
     EXPECT_EQ(out.backend_loads, 1);
     EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+}
+
+// A task carried across a bucket deferral (#3006) is NACKed by the fence:
+// nothing re-emits the pool afterwards, and the task would pin its source
+// replica until the master's TTL reaper.
+TEST_F(FileStorageTest, DiskFenceNacksCarriedOffloadTasks) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_carry", EIO, EIO, out,
+                         /*carry_before_fence=*/true);
+    EXPECT_EQ(out.carried_before_fence, 1u);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_EQ(out.carried_after_fence, 0u);
     EXPECT_TRUE(out.offload_released);
 }
 

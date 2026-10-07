@@ -241,6 +241,9 @@ class FileStorage {
     int CheckFilesystem(bool sync_first) const;
     // Heartbeat: latch the drain and hand pending offload work back.
     void ApplyDiskFence();
+    // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
+    // pool and drop the pool (see deferred_task_by_storage_key_).
+    void NackCarriedOffloadTasks();
     // Heartbeat, while draining_: unmount until the master acknowledges it
     // (the master treats an already-unmounted segment as success).
     void UnmountLocalDiskIfPending();
