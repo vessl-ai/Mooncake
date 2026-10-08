@@ -137,7 +137,7 @@ class StorageFile {
         return tl::make_unexpected(code);
     }
 
-    // errno of the first failed syscall; 0 for logical failures (short I/O).
+    // errno of the first failed syscall; 0 for logical failures (e.g. EOF).
     int sys_errno() const { return sys_errno_; }
 
     /**
@@ -253,6 +253,9 @@ class UringFile : public StorageFile {
    private:
     bool use_direct_io_;
     static constexpr size_t ALIGNMENT_ = 4096;
+
+    /// After a failed ring call: keep the errno of its first failed CQE.
+    void record_ring_errno();
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.
     void *alloc_aligned_buffer(size_t size) const;
