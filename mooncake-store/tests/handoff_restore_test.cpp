@@ -518,19 +518,21 @@ TEST_F(HandoffRestoreTest, DiskReplicasOfUnregisteredOwnersAreDropped) {
         MasterService old_master(MakeConfig());
         Populate(old_master, 1, 2);
         // Key(0,0) gains a LOCAL_DISK replica; "disk-only" has only one.
+        Replica disk_copy(stores_[0].client_id, kObjectSize, "disk-endpoint",
+                          ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(old_master
+                        .AddReplica(stores_[0].client_id, Key(0, 0),
+                                    TenantId::Default(), disk_copy)
+                        .has_value());
         StorageObjectMetadata disk;
         disk.data_size = kObjectSize;
         disk.transport_endpoint = "disk-endpoint";
         std::vector<OffloadTaskItem> tasks{
             OffloadTaskItem{.tenant_id = "default",
-                            .key = Key(0, 0),
-                            .size = static_cast<int64_t>(kObjectSize)},
-            OffloadTaskItem{.tenant_id = "default",
                             .key = "disk-only",
                             .size = static_cast<int64_t>(kObjectSize)}};
         ASSERT_TRUE(
-            old_master
-                .NotifyOffloadSuccess(stores_[0].client_id, tasks, {disk, disk})
+            old_master.NotifyOffloadSuccess(stores_[0].client_id, tasks, {disk})
                 .has_value());
         auto written = Write(old_master, dir.path());
         // Offload is off, so the owner has no LocalSSD registration: its L4
