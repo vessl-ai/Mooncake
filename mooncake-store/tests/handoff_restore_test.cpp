@@ -186,6 +186,20 @@ class HandoffRestoreTest : public ::testing::Test {
         return keys;
     }
 
+    // Disk-only objects of `store`: put, offloaded (task-backed completion),
+    // then the memory copy dropped.
+    void PutDiskOnly(MasterService& service, const Store& store,
+                     const std::vector<std::string>& keys,
+                     const std::string& endpoint) {
+        for (const auto& key : keys) Put(service, store, key);
+        auto done = Offload(service, store, endpoint, keys.size());
+        ASSERT_EQ(done.size(), keys.size());
+        auto cleared = service.BatchReplicaClear(keys, store.client_id,
+                                                 store.segments[0].name);
+        ASSERT_TRUE(cleared.has_value());
+        ASSERT_EQ(cleared->size(), keys.size());
+    }
+
     // A registration without an offload task (FileStorage rescan path).
     static bool Register(MasterService& service, const UUID& client_id,
                          const std::string& key, const std::string& endpoint,
@@ -232,10 +246,11 @@ class HandoffRestoreTest : public ::testing::Test {
         // The heartbeat takes all 30 tasks; 20 complete, 10 are in flight.
         offloaded_ = Offload(old_master, stores_[0], "disk-0", 20);
         ASSERT_EQ(offloaded_.size(), 20u);
+        std::vector<std::string> disk_only;
         for (int i = 0; i < 5; ++i) {
-            ASSERT_TRUE(Register(old_master, stores_[0].client_id,
-                                 "disk-only-" + std::to_string(i), "disk-0"));
+            disk_only.push_back("disk-only-" + std::to_string(i));
         }
+        PutDiskOnly(old_master, stores_[0], disk_only, "disk-0");
         auto written = Write(old_master, dir);
         if (out) *out = written;
     }
@@ -525,16 +540,12 @@ TEST_F(HandoffRestoreTest, DiskReplicasOfUnregisteredOwnersAreDropped) {
                         .AddReplica(stores_[0].client_id, Key(0, 0),
                                     TenantId::Default(), disk_copy)
                         .has_value());
-        StorageObjectMetadata disk;
-        disk.data_size = kObjectSize;
-        disk.transport_endpoint = "disk-endpoint";
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = "default",
-                            .key = "disk-only",
-                            .size = static_cast<int64_t>(kObjectSize)}};
-        ASSERT_TRUE(
-            old_master.NotifyOffloadSuccess(stores_[0].client_id, tasks, {disk})
-                .has_value());
+        Replica disk_only(stores_[0].client_id, kObjectSize, "disk-endpoint",
+                          ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(old_master
+                        .AddReplica(stores_[0].client_id, "disk-only",
+                                    TenantId::Default(), disk_only)
+                        .has_value());
         auto written = Write(old_master, dir.path());
         // Offload is off, so the owner has no LocalSSD registration: its L4
         // state is not exported (it would re-register on the new master).
@@ -688,13 +699,13 @@ TEST_F(HandoffRestoreTest, L4OfStoreRestartedDuringTheRollIsNeverTrusted) {
     EXPECT_FALSE(HasDisk(master, offloaded_.front(), stores_[0].client_id));
 
     // The new process registers its LocalSSD tier and re-registers its disk
-    // keys as after a cold start; nothing of the old process opens.
+    // keys as after a cold start. A re-registration (no offload task taken)
+    // never registers a disk replica: neither a new object nor one attached
+    // to the restored object whose disk replica belonged to the old process,
+    // which stays unreadable until the TTL offboarding erases it.
     EnableL4(master, restarted);
     ASSERT_TRUE(Register(master, restarted.client_id, "fresh-disk", "disk-0b"));
-    EXPECT_TRUE(HasDisk(master, "fresh-disk", restarted.client_id));
-    // A re-registration never attaches to an existing object (S1), here
-    // the restored one whose disk replica belonged to the old process: the
-    // key stays unreadable until the TTL offboarding erases it.
+    EXPECT_FALSE(Readable(master, "fresh-disk"));
     ASSERT_TRUE(
         Register(master, restarted.client_id, "disk-only-1", "disk-0b"));
     EXPECT_FALSE(HasDisk(master, "disk-only-1", restarted.client_id));

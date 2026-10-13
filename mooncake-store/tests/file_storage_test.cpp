@@ -422,8 +422,69 @@ class FileStorageTest : public ::testing::Test {
         fenced = fileStorage.disk_fenced_.load();
     }
 
+    // The master registers a LOCAL_DISK replica only as the completion of
+    // an offload task the store drained. Sets that up the way production
+    // does: each key gets a memory replica on a placeholder segment owned by
+    // the store's client (PutEnd queues the offload), then the store's
+    // offload heartbeat drains the tasks. Returns the placeholder segment,
+    // for DropMemoryCopies once the offload is complete.
+    static Segment PrepareDrainedOffloads(
+        testing::InProcMaster& master, Client& client,
+        const std::vector<std::string>& keys, uint64_t size,
+        const std::string& tenant_id = "default") {
+        static std::atomic<uint64_t> next_base{0x7e0000000000ULL};
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.base = next_base.fetch_add(0x10000000ULL);
+        segment.size = 64 * 1024 * 1024;
+        segment.name = "offload-source-" + std::to_string(segment.base);
+        segment.te_endpoint = segment.name;
+        EXPECT_TRUE(master.service()
+                        ->MountSegment(segment, client.getClientId())
+                        .has_value());
+        for (const auto& key : keys) {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = segment.name;
+            EXPECT_TRUE(master.service()
+                            ->PutStart(client.getClientId(), key, size, config,
+                                       tenant_id)
+                            .has_value());
+            EXPECT_TRUE(master.service()
+                            ->PutEnd(client.getClientId(),
+                                     ObjectMeta{key, std::nullopt},
+                                     ReplicaType::MEMORY, tenant_id)
+                            .has_value());
+            // These masters also allocate a DISK (root_fs_dir) replica that
+            // nobody writes here; drop it.
+            (void)master.service()->PutRevoke(client.getClientId(), key,
+                                              ReplicaType::DISK, tenant_id);
+        }
+        std::vector<OffloadTaskItem> drained;
+        EXPECT_TRUE(client.OffloadObjectHeartbeat(true, drained).has_value());
+        EXPECT_EQ(drained.size(), keys.size());
+        return segment;
+    }
+
+    // Drops the memory copies made by PrepareDrainedOffloads, leaving
+    // LOCAL_DISK-only objects, and unmounts the placeholder segment so that
+    // no later put is placed on it. Default tenant only: this fork's RPC
+    // wrapper of BatchReplicaClear takes no tenant.
+    static void DropMemoryCopies(testing::InProcMaster& master, Client& client,
+                                 const std::vector<std::string>& keys,
+                                 const Segment& segment) {
+        auto cleared = master.service()->BatchReplicaClear(
+            keys, client.getClientId(), segment.name);
+        ASSERT_TRUE(cleared.has_value());
+        EXPECT_EQ(cleared->size(), keys.size());
+        EXPECT_TRUE(master.service()
+                        ->UnmountSegment(segment.id, client.getClientId())
+                        .has_value());
+    }
+
     void AssertHeartbeatEvictsAllKeys(
-        FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
+        testing::InProcMaster& master, FileStorage& fileStorage,
+        const std::vector<std::string>& expected_keys,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_object) {
         ASSERT_TRUE(fileStorage.storage_backend_->Init());
@@ -431,6 +492,8 @@ class FileStorageTest : public ::testing::Test {
             MutexLocker locker(&fileStorage.offloading_mutex_);
             fileStorage.enable_offloading_ = true;
         }
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *fileStorage.client_, expected_keys, 512);
 
         auto offload_result = fileStorage.storage_backend_->BatchOffload(
             batch_object,
@@ -449,6 +512,8 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(offload_result.has_value());
         ASSERT_EQ(offload_result.value(),
                   static_cast<int64_t>(expected_keys.size()));
+        DropMemoryCopies(master, *fileStorage.client_, expected_keys,
+                         source_segment);
 
         for (const auto& key : expected_keys) {
             auto query_result = fileStorage.client_->Query(key);
@@ -534,6 +599,8 @@ class FileStorageTest : public ::testing::Test {
         // Offload one key so master tracks a LOCAL_DISK replica backed by a
         // real file on the client SSD.
         const std::string key = "heal_key" + suffix;
+        const auto source_segment =
+            PrepareDrainedOffloads(master, *client.value(), {key}, 512);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         batch_object.emplace(key,
@@ -550,6 +617,7 @@ class FileStorageTest : public ::testing::Test {
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
+        DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
         // Wire the probe the way RealClient does in production: existence
         // against this process's offload files.
@@ -656,6 +724,8 @@ class FileStorageTest : public ::testing::Test {
         // divergence on both.
         const std::vector<std::string> wiped_keys = {"heal_batch_a",
                                                      "heal_batch_b"};
+        const auto source_segment =
+            PrepareDrainedOffloads(master, *client.value(), wiped_keys, 512);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         for (const auto& key : wiped_keys) {
@@ -674,6 +744,7 @@ class FileStorageTest : public ::testing::Test {
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
+        DropMemoryCopies(master, *client.value(), wiped_keys, source_segment);
 
         client.value()->SetLocalDiskProbe(
             [&file_storage](const std::string& k) -> std::optional<bool> {
@@ -1315,7 +1386,8 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
         buffers.push_back(std::move(buffer));
     }
 
-    AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object);
+    AssertHeartbeatEvictsAllKeys(master, file_storage, expected_keys,
+                                 batch_object);
 }
 
 // A drain deregisters the disk tier; the heartbeat re-mounts the segment
@@ -1429,6 +1501,9 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
     FileStorage file_storage(config, client.value(), local_rpc_addr);
 
     const std::string key = "shared_key";
+    // Multi-tenancy is off here, so both tenants name the same object.
+    const auto source_segment =
+        PrepareDrainedOffloads(master, *client.value(), {key}, 128);
     std::vector<OffloadTaskItem> tasks = {
         {.tenant_id = "tenant_a", .key = key, .size = 128},
         {.tenant_id = "tenant_b", .key = key, .size = 128},
@@ -1445,6 +1520,7 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
         });
     }
     ASSERT_TRUE(client.value()->NotifyOffloadSuccess(tasks, metadatas));
+    DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
     for (const auto& task : tasks) {
         auto before = client.value()->BatchQuery({key}, task.tenant_id);

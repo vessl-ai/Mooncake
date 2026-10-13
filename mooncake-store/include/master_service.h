@@ -1123,13 +1123,10 @@ class MasterService {
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
-    // attach_to_existing=false: refuse (OBJECT_ALREADY_EXISTS) instead of
-    // adding the disk replica to an object that already exists.
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
-                                     Replica& replica,
-                                     bool attach_to_existing = true)
+                                     Replica& replica)
         -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
@@ -1183,7 +1180,9 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
+        std::unordered_map<std::string, OffloadingTask> offloading_tasks;
+        std::unordered_map<std::string, std::vector<StaleOffloadTake>>
+            stale_offload_takes;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
@@ -1201,7 +1200,8 @@ class MasterService {
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty();
+                   dynamic_replication_cooldowns.empty() &&
+                   stale_offload_takes.empty();
         }
     };
 
@@ -1687,6 +1687,24 @@ class MasterService {
     bool CancelQueuedOffloadTask(TenantState& tenant_state,
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
+
+    // Drops the offload task of `key`: releases the source refcnt (when
+    // `metadata` is given and still holds the source) and records a stale
+    // take for every taker except `reporter`, whose report has arrived.
+    void ReleaseOffloadingTask(
+        TenantState& tenant_state, ObjectMetadata* metadata,
+        std::unordered_map<std::string, OffloadingTask>::iterator task_it,
+        const std::optional<UUID>& reporter);
+    void RecordStaleOffloadTakes(TenantState& tenant_state,
+                                 const std::string& key,
+                                 const std::vector<UUID>& clients);
+    bool HasStaleOffloadTake(const TenantState& tenant_state,
+                             const std::string& key, const UUID& client_id,
+                             std::chrono::system_clock::time_point now) const;
+    // Marks `client_id` as a taker of the current offload task of each key
+    // it has just drained (OffloadObjectHeartbeat).
+    void RecordOffloadTakers(const UUID& client_id,
+                             const std::vector<OffloadTaskItem>& drained);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;

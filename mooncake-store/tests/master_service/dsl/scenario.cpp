@@ -1293,6 +1293,11 @@ MasterScenario& MasterScenario::When(CompleteOffloadAction action) {
         metadata.transport_endpoint = endpoint;
         metadatas.push_back(std::move(metadata));
     }
+    if (!action.re_registration) {
+        // Errors (e.g. no LOCAL_DISK segment) surface through the
+        // completion below.
+        (void)service_->OffloadObjectHeartbeat(ActorId(action.actor), true);
+    }
     const auto result =
         service_->NotifyOffloadSuccess(ActorId(action.actor), tasks, metadatas);
     ValidateActionResult("CompleteOffload(" + action.keys.front() + ")",

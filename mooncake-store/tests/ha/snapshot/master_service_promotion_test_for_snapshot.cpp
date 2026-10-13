@@ -70,18 +70,10 @@ class MasterServicePromotionSnapshotTest
     bool InjectLocalDiskReplica(const UUID& client_id, const std::string& key,
                                 int64_t size,
                                 const std::string& transport_endpoint) {
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = TenantId::Default().value(),
-                            .key = key,
-                            .size = size}};
-        StorageObjectMetadata sm;
-        sm.bucket_id = 0;
-        sm.offset = 0;
-        sm.key_size = static_cast<int64_t>(key.size());
-        sm.data_size = size;
-        sm.transport_endpoint = transport_endpoint;
-        std::vector<StorageObjectMetadata> metas{sm};
-        return service_->NotifyOffloadSuccess(client_id, tasks, metas)
+        Replica replica(client_id, static_cast<uint64_t>(size),
+                        transport_endpoint, ReplicaStatus::COMPLETE);
+        return service_
+            ->AddReplica(client_id, key, TenantId::Default(), replica)
             .has_value();
     }
 };

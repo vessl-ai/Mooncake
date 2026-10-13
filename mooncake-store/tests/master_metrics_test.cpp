@@ -862,19 +862,20 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
     if (!put_start) return "";
     svc.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY);
 
+    // The store completes what its heartbeat drained.
+    auto tasks = svc.OffloadObjectHeartbeat(client_id, true);
+    if (!tasks || tasks->size() != 1) return "";
+
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
     meta.transport_endpoint = "127.0.0.1:9999";
-    std::vector<OffloadTaskItem> tasks{
-        OffloadTaskItem{.tenant_id = "default",
-                        .key = key,
-                        .size = static_cast<int64_t>(value_size)}};
-    svc.NotifyOffloadSuccess(client_id, tasks, {meta});
+    svc.NotifyOffloadSuccess(client_id, *tasks, {meta});
     return key;
 }
 
-// Verify that creating a LocalDiskReplica (via NotifyOffloadSuccess) increments
-// file_allocated_size, and that removing the key decrements it back to zero.
+// Verify that creating a LocalDiskReplica (via an offload completion)
+// increments file_allocated_size, and that removing the key decrements it back
+// to zero.
 TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     auto& metrics = MasterMetricManager::instance();
     MasterServiceConfig config;
@@ -898,7 +899,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
 
     const int64_t baseline = metrics.get_allocated_file_size();
 
-    // After NotifyOffloadSuccess, a LocalDiskReplica is created.
+    // After the offload completion, a LocalDiskReplica is created.
     std::string key = PutKeyAndOffload(svc, client_id, seg.name, kValueSize,
                                        "ssd_alloc_test_key");
     ASSERT_FALSE(key.empty());
@@ -1102,11 +1103,12 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums + 1);
     ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
 
-    // Step 2: Add the LOCAL_DISK replica via NotifyOffloadSuccess.
-
-    OffloadTaskItem task{.tenant_id = "default",
-                         .key = key,
-                         .size = static_cast<int64_t>(value_length)};
+    // Step 2: Add the LOCAL_DISK replica via NotifyOffloadSuccess for the
+    // offload task the store drained.
+    auto drained = service_.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
+    OffloadTaskItem task = drained->front();
     StorageObjectMetadata obj_meta{
         .bucket_id = 0,
         .offset = 0,
@@ -1141,13 +1143,19 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums);
     ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
 
-    // Step 4: Test SSD hit path by creating an object with only a LOCAL_DISK
-    // replica. Use NotifyOffloadSuccess with a key that has no existing
-    // metadata — AddReplica will create the metadata and add LOCAL_DISK.
+    // Step 4: Test SSD hit path with an object that has only a LOCAL_DISK
+    // replica: put it, offload it, then clear its memory replica.
     std::string ssd_only_key = "ssd_only_key";
-    OffloadTaskItem task2{.tenant_id = "default",
-                          .key = ssd_only_key,
-                          .size = static_cast<int64_t>(value_length)};
+    ASSERT_TRUE(service_.PutStart(client_id, ssd_only_key, value_length, config)
+                    .has_value());
+    ASSERT_TRUE(service_
+                    .PutEnd(client_id, ObjectMeta{ssd_only_key, std::nullopt},
+                            ReplicaType::MEMORY)
+                    .has_value());
+    auto drained2 = service_.OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained2.has_value());
+    ASSERT_EQ(drained2->size(), 1u);
+    OffloadTaskItem task2 = drained2->front();
     StorageObjectMetadata obj_meta2{
         .bucket_id = 0,
         .offset = 0,
@@ -1157,6 +1165,11 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     auto offload_result2 =
         service_.NotifyOffloadSuccess(client_id, {task2}, {obj_meta2});
     ASSERT_TRUE(offload_result2.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    auto cleared =
+        service_.BatchReplicaClear({ssd_only_key}, client_id, segment_name);
+    ASSERT_TRUE(cleared.has_value());
+    ASSERT_EQ(cleared->size(), 1u);
 
     // Verify SSD_TOTAL incremented for the new key.
     stats = metrics.calculate_cache_stats();
