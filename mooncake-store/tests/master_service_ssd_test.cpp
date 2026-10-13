@@ -571,6 +571,88 @@ TEST_F(MasterServiceSSDTest, PushOffloadingQueueReportsNoopAsFailure) {
     EXPECT_EQ(ErrorCode::UNABLE_OFFLOADING, r1.error());
 }
 
+// A re-registration (a completion without an offload task, as sent by the
+// store's rescan) may create a missing object but never attaches a disk
+// replica to an existing one: the store's file can predate the current
+// object under that key, because Remove does not delete it.
+TEST_F(MasterServiceSSDTest, ReRegistrationNeverAttachesToAnExistingObject) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "rereg_segment", 0x320000000);
+    PutAndOffload(*service, client_id, "rereg_key", 4096, "disk_endpoint");
+    ASSERT_TRUE(
+        service->Remove("rereg_key", TenantId::Default(), true).has_value());
+    // Re-put with new bytes of the same size. The store skips offloading it
+    // (it still holds the old file) and NACKs the task.
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "rereg_key", TenantId::Default(),
+                               4096, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "rereg_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    OffloadTaskItem task{.tenant_id = TenantId::Default().value(),
+                         .key = "rereg_key",
+                         .size = 4096};
+    StorageObjectMetadata nack;
+    nack.data_size = -1;
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {task}, {nack}).has_value());
+
+    // Rescan: the old file of rereg_key and a file whose key the master no
+    // longer knows.
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    OffloadTaskItem orphan{.tenant_id = TenantId::Default().value(),
+                           .key = "rereg_unknown",
+                           .size = 4096};
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {task, orphan}, {file, file})
+            .has_value());
+    auto existing = service->GetReplicaList("rereg_key", TenantId::Default());
+    ASSERT_TRUE(existing.has_value());
+    ASSERT_EQ(existing->replicas.size(), 1u);
+    EXPECT_TRUE(existing->replicas[0].is_memory_replica());
+    auto created =
+        service->GetReplicaList("rereg_unknown", TenantId::Default());
+    ASSERT_TRUE(created.has_value());
+    ASSERT_EQ(created->replicas.size(), 1u);
+    EXPECT_TRUE(created->replicas[0].is_local_disk_replica());
+}
+
+// An offload completion whose size differs from the object is refused.
+TEST_F(MasterServiceSSDTest, OffloadCompletionWithAnotherSizeIsRefused) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "size_segment", 0x330000000);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(
+        service
+            ->PutStart(client_id, "size_key", TenantId::Default(), 4096, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(client_id, "size_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    auto tasks = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    StorageObjectMetadata file;
+    file.data_size = 2048;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *tasks, {file}).has_value());
+    auto replicas = service->GetReplicaList("size_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_TRUE(replicas->replicas[0].is_memory_replica());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

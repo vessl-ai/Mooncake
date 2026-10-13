@@ -691,10 +691,13 @@ TEST_F(HandoffRestoreTest, L4OfStoreRestartedDuringTheRollIsNeverTrusted) {
     EnableL4(master, restarted);
     ASSERT_TRUE(Register(master, restarted.client_id, "fresh-disk", "disk-0b"));
     EXPECT_TRUE(HasDisk(master, "fresh-disk", restarted.client_id));
+    // A re-registration never attaches to an existing object (S1), here
+    // the restored one whose disk replica belonged to the old process: the
+    // key stays unreadable until the TTL offboarding erases it.
     ASSERT_TRUE(
         Register(master, restarted.client_id, "disk-only-1", "disk-0b"));
-    EXPECT_FALSE(HasDisk(master, "disk-only-1", stores_[0].client_id));
-    EXPECT_TRUE(HasDisk(master, "disk-only-1", restarted.client_id));
+    EXPECT_FALSE(HasDisk(master, "disk-only-1", restarted.client_id));
+    EXPECT_FALSE(Readable(master, "disk-only-1"));
     EXPECT_FALSE(Readable(master, "disk-only-2"));
 }
 

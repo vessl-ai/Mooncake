@@ -5454,7 +5454,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
                                                 const std::string& key,
                                                 const TenantId& tenant_id,
-                                                Replica& replica)
+                                                Replica& replica,
+                                                bool attach_to_existing)
     -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
     TenantId normalized_tenant;
@@ -5484,6 +5485,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     }
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
+    if (accessor.Exists() && !attach_to_existing) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
     if (!accessor.Exists()) {
         accessor.Create(
             client_id,
@@ -8446,6 +8450,10 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    // Registrations refused because they could serve bytes of another
+    // object: a re-registration (no offload task) onto an existing object,
+    // or a size that differs from the object.
+    size_t refused_stale = 0;
 
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
@@ -8539,6 +8547,12 @@ auto MasterService::NotifyOffloadSuccess(
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
+                    } else if (metadata.data_size !=
+                               static_cast<int64_t>(obj_metadata.size)) {
+                        // The file does not describe this object (e.g. the
+                        // key was re-put with another size meanwhile);
+                        // never let a read reach it.
+                        ++refused_stale;
                     } else if (!obj_metadata.HasReplica(
                                    &Replica::fn_is_local_disk_replica)) {
                         std::vector<Replica> replicas;
@@ -8591,10 +8605,20 @@ auto MasterService::NotifyOffloadSuccess(
                 std::move(normalized_tenant_result.value()),
                 request_object_id.user_key};
 
+            // No offload task: this is a re-registration of a file the
+            // store already had (rescan after SEGMENT_NOT_FOUND or at
+            // start). Its bytes may predate the current object under this
+            // key (Remove does not delete the file), so it may only create
+            // the object, never attach to an existing one.
             auto res = AddReplicaForRetainedClient(
-                client_id, object_id.user_key, object_id.tenant_id, replica);
+                client_id, object_id.user_key, object_id.tenant_id, replica,
+                /*attach_to_existing=*/false);
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    continue;
+                }
+                if (res.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                    ++refused_stale;
                     continue;
                 }
                 if (res.error() == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -8617,6 +8641,11 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
+    if (refused_stale > 0) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", action=notify_offload_success_refused"
+                     << ", reason=stale_disk_replica, count=" << refused_stale;
+    }
     if (refused_unmounted) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", action=notify_offload_success_refused"

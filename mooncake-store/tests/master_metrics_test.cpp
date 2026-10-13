@@ -1078,9 +1078,14 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     const int64_t base_mem_cache_nums = metrics.get_mem_cache_nums();
     const int64_t base_file_cache_nums = metrics.get_file_cache_nums();
 
-    // Step 1: Mount segment and create a completed MEMORY replica.
+    // Step 1: Mount segment and create a completed MEMORY replica. The local
+    // disk segment is mounted first, so PutEnd queues an offload task: only
+    // a task-backed completion may add a disk replica to an existing object.
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
+    auto mount_disk_result =
+        service_.MountLocalDiskSegment(client_id, /*enable_offloading=*/true);
+    ASSERT_TRUE(mount_disk_result.has_value());
     auto put_start_result =
         service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
@@ -1097,11 +1102,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums + 1);
     ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
 
-    // Step 2: Mount local disk segment and add LOCAL_DISK replica via
-    // NotifyOffloadSuccess.
-    auto mount_disk_result =
-        service_.MountLocalDiskSegment(client_id, /*enable_offloading=*/true);
-    ASSERT_TRUE(mount_disk_result.has_value());
+    // Step 2: Add the LOCAL_DISK replica via NotifyOffloadSuccess.
 
     OffloadTaskItem task{.tenant_id = "default",
                          .key = key,

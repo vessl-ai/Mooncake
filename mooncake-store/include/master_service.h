@@ -1101,10 +1101,13 @@ class MasterService {
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
+    // attach_to_existing=false: refuse (OBJECT_ALREADY_EXISTS) instead of
+    // adding the disk replica to an object that already exists.
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
-                                     Replica& replica)
+                                     Replica& replica,
+                                     bool attach_to_existing = true)
         -> tl::expected<bool, ErrorCode>;
     // Caller must hold client_mutex_.
     std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
