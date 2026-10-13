@@ -44,12 +44,14 @@ inline constexpr char kHandoffFormat[] = "mooncake-handoff";
 // per-client registrations. Schema 3 adds the remaining hold time of every
 // quarantine range, the ranges of the old master's discarded replicas, and
 // DRAINING / DRAINED segments with their status. Schema 4 replaces the
-// offload pins of schema 2/3 with the offload takes (OffloadTake). Older
-// snapshots lack ranges that may still be written or takes whose report may
-// still arrive, so the reader accepts schema 4 only (an older snapshot means
-// one cold start).
-inline constexpr uint32_t kHandoffSchemaVersion = 4;
-inline constexpr uint32_t kHandoffMinSchemaVersion = 4;
+// offload pins of schema 2/3 with the offload takes (OffloadTake). Schema 5
+// adds the remaining cold-start take hold (offload_take_hold_ms). Older
+// snapshots lack ranges that may still be written, takes whose report may
+// still arrive or the hold that blocks such takes, and a reader of an older
+// schema would ignore the hold, so the reader accepts schema 5 only (an older
+// snapshot means one cold start) and a schema-4 build refuses this one.
+inline constexpr uint32_t kHandoffSchemaVersion = 5;
+inline constexpr uint32_t kHandoffMinSchemaVersion = 5;
 inline constexpr char kHandoffManifestFile[] = "handoff_manifest";
 inline constexpr char kHandoffQuarantineFile[] = "handoff_quarantine.bin";
 inline constexpr char kHandoffLocalDiskFile[] = "handoff_local_disk.bin";
@@ -180,8 +182,8 @@ struct Manifest {
     uint64_t local_disk_clients{0};
     std::optional<BlobInfo> offload_takes;  // vector<OffloadTake>
     uint64_t offload_take_count{0};
-    // Remaining cold-start take hold of the old master (0: none). A master
-    // that started cold blocks every offload take for
+    // Remaining cold-start take hold of the old master (0: none; schema 5,
+    // mandatory). A master that started cold blocks every offload take for
     // put_start_release_timeout; the next master keeps blocking them for
     // what is left of it.
     uint64_t offload_take_hold_ms{0};

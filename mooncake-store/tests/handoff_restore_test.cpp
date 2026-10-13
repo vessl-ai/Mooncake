@@ -765,8 +765,9 @@ TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
     // Schema 1 and 2 snapshots lack the held-back ranges of discarded
     // replicas and DRAINING segments, so restoring them could hand out a
     // range a late writer still uses; schema 3 lacks the offload takes whose
-    // report may still arrive: they always mean a cold start.
-    for (const uint32_t schema : {1u, 2u, 3u}) {
+    // report may still arrive; schema 4 lacks the cold-start take hold: they
+    // always mean a cold start.
+    for (const uint32_t schema : {1u, 2u, 3u, 4u}) {
         TempDir dir;
         stores_.clear();
         {
