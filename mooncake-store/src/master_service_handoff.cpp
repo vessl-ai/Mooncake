@@ -138,10 +138,18 @@ std::vector<handoff::SegmentIdentity> MasterService::ExportHandoffSegments() {
     std::vector<std::pair<Segment, UUID>> all;
     segment_access.GetAllSegments(all);
     for (const auto& [segment, owner] : all) {
+        // DRAINING and DRAINED segments are exported too: their owner lists
+        // them in its next remount, so leaving them out would remount them
+        // with an empty allocator, allocatable at once, while a late write
+        // may still land in their in-flight ranges. GRACEFULLY_UNMOUNTING
+        // segments are left out on purpose: their owner has already removed
+        // them from its own list, so it never remounts them. UNMOUNTING ones
+        // are on their way out.
         SegmentStatus status = SegmentStatus::UNDEFINED;
         if (segment_access.GetSegmentStatusById(segment.id, status) !=
                 ErrorCode::OK ||
-            status != SegmentStatus::OK) {
+            (status != SegmentStatus::OK && status != SegmentStatus::DRAINING &&
+             status != SegmentStatus::DRAINED)) {
             continue;
         }
         if (owner == UUID{0, 0} || segment.protocol == "cxl" ||
@@ -149,7 +157,9 @@ std::vector<handoff::SegmentIdentity> MasterService::ExportHandoffSegments() {
             !segment_access.GetAllocator(segment.id)) {
             continue;
         }
-        out.push_back(handoff::SegmentIdentity::FromSegment(segment, owner));
+        auto identity = handoff::SegmentIdentity::FromSegment(segment, owner);
+        identity.status = status;
+        out.push_back(std::move(identity));
     }
     return out;
 }
@@ -241,8 +251,11 @@ void MasterService::ExportHandoffShard(
                 }
                 if (processing || !replica.is_completed() ||
                     buffer.size_ != metadata.size) {
-                    quarantine.push_back(
-                        {*segment_index, buffer.buffer_address_, buffer.size_});
+                    // The remaining time of an in-flight write is unknown:
+                    // hold the range for the full release timeout.
+                    quarantine.push_back({*segment_index,
+                                          buffer.buffer_address_, buffer.size_,
+                                          HandoffFullHoldMs()});
                     ++stats.dropped_incomplete_replicas;
                     ++stats.quarantine_ranges;
                     stats.quarantine_bytes += buffer.size_;
@@ -293,18 +306,71 @@ void MasterService::ExportHandoffPendingQuarantine(
     for (uint32_t i = 0; i < segments.size(); ++i) {
         index_by_id.emplace(segments[i].segment_id, i);
     }
+    const auto now = SteadyClock::now();
     std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
-    for (const auto& [segment_id, buffer] : handoff_quarantine_.buffers) {
-        const auto it = index_by_id.find(segment_id);
+    for (const auto& held : handoff_quarantine_.buffers) {
+        const auto it = index_by_id.find(held.segment_id);
         // A dropped segment's ranges may belong to a newer mount already.
-        if (it == index_by_id.end() || !buffer || !buffer->isAllocatorValid()) {
+        if (it == index_by_id.end() || !held.buffer ||
+            !held.buffer->isAllocatorValid() || held.deadline <= now) {
             continue;
         }
-        quarantine.push_back({it->second,
-                              reinterpret_cast<uint64_t>(buffer->data()),
-                              buffer->size()});
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                held.deadline - now)
+                .count();
+        quarantine.push_back(
+            {it->second, reinterpret_cast<uint64_t>(held.buffer->data()),
+             held.buffer->size(), static_cast<uint64_t>(remaining) + 1});
         ++stats.quarantine_ranges;
-        stats.quarantine_bytes += buffer->size();
+        stats.quarantine_bytes += held.buffer->size();
+    }
+}
+
+void MasterService::ExportHandoffDiscardedQuarantine(
+    const handoff::SegmentLocator& locator,
+    std::vector<handoff::QuarantineRange>& quarantine,
+    handoff::WriterStats& stats) {
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(discarded_replicas_mutex_);
+    for (const auto& item : discarded_replicas_) {
+        if (item.isExpired(now)) {
+            continue;  // this master would release it at its next sweep
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(item.ttl() -
+                                                                  now)
+                .count();
+        for (const auto& replica : item.replicas()) {
+            if (!replica.is_memory_replica()) {
+                continue;
+            }
+            if (replica.has_invalid_mem_handle()) {
+                // Its segment was unmounted; the range may already belong to
+                // a newer mount (same rule as for live replicas).
+                ++stats.dropped_discarded_ranges;
+                continue;
+            }
+            const auto descriptor = replica.get_descriptor();
+            const auto& buffer =
+                descriptor.get_memory_descriptor().buffer_descriptor;
+            const auto segment_index =
+                locator.Find(buffer.transport_endpoint_, buffer.buffer_address_,
+                             buffer.size_);
+            if (!segment_index) {
+                // On a segment that is not exported (e.g. gracefully
+                // unmounting): its owner never remounts it, so the range is
+                // never allocated by the next master.
+                ++stats.dropped_discarded_ranges;
+                continue;
+            }
+            quarantine.push_back({*segment_index, buffer.buffer_address_,
+                                  buffer.size_,
+                                  static_cast<uint64_t>(remaining) + 1});
+            ++stats.discarded_ranges;
+            ++stats.quarantine_ranges;
+            stats.quarantine_bytes += buffer.size_;
+        }
     }
 }
 
@@ -355,7 +421,7 @@ MasterService::RestoreFromHandoff(const std::string& dir,
 }
 
 void MasterService::ResetHandoffState() {
-    std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>> released;
+    std::vector<HandoffQuarantinedBuffer> released;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -427,8 +493,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             "handoff restore supports only the offset "
             "allocator");
     }
-    auto manifest_bytes =
-        handoff::ReadFileBytes(dir + "/" + handoff::kHandoffManifestFile);
+    auto manifest_bytes = handoff::ReadFileBytes(
+        dir + "/" + handoff::kHandoffManifestFile, handoff::kMaxManifestBytes);
     if (!manifest_bytes) {
         return tl::make_unexpected(manifest_bytes.error());
     }
@@ -560,7 +626,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                 identity.te_endpoint, ReplicaType::MEMORY);
             const Segment segment = identity.ToSegment();
             const auto mounted = segment_access.MountRestoredSegment(
-                segment, identity.owner_client_id, record, allocators[i]);
+                segment, identity.owner_client_id, record, allocators[i],
+                identity.status);
             if (mounted != ErrorCode::OK) {
                 return tl::make_unexpected("mount of restored segment " +
                                            identity.name +
@@ -614,6 +681,15 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     }
     std::atomic<bool> failed{false};
     const auto now = std::chrono::system_clock::now();
+    // Read leases: the old master granted none after the export started,
+    // so a lease it handed out ends by export + kv_lease_ttl (assuming both
+    // masters run with the same --default_kv_lease_ttl). Restored objects
+    // keep that floor, so a reader still inside its lease is not undercut
+    // by an eviction, remove or upsert right after a short roll.
+    const auto lease_floor =
+        std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(manifest->created_at_ms)) +
+        std::chrono::milliseconds(default_kv_lease_ttl_);
     struct Prepared {
         size_t shard;
         TenantId tenant_id;
@@ -786,6 +862,7 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                         metadata.lease_ = RegisterGroupMember(
                             object.tenant_id, object.user_key, meta.group_id);
                     }
+                    metadata.lease_->ExtendTo(lease_floor);
                     // Every restored replica is complete.
                     metadata.memory_cache_total_accounted = object.has_memory;
                     metadata.disk_cache_total_accounted = object.has_disk;
@@ -849,7 +926,9 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         quarantine_by_segment[range.segment_index].push_back(range);
     }
     std::vector<std::string> segment_errors(nseg);
-    std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
+    // Per segment: (hold_ms, buffer) of every quarantined range.
+    std::vector<
+        std::vector<std::pair<uint64_t, std::unique_ptr<AllocatedBuffer>>>>
         quarantined_buffers(nseg);
     std::vector<uint64_t> sort_ns(nseg, 0), import_ns(nseg, 0);
     std::vector<uint64_t> swapped(nseg, 0);
@@ -863,7 +942,13 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             refs.insert(refs.end(), st.refs[si].begin(), st.refs[si].end());
             std::vector<RestoredRef>().swap(st.refs[si]);
         }
-        for (const auto& range : quarantine_by_segment[si]) {
+        auto& segment_quarantine = quarantine_by_segment[si];
+        std::sort(segment_quarantine.begin(), segment_quarantine.end(),
+                  [](const handoff::QuarantineRange& a,
+                     const handoff::QuarantineRange& b) {
+                      return a.address < b.address;
+                  });
+        for (const auto& range : segment_quarantine) {
             refs.push_back({range.address, range.size, nullptr});
         }
         std::sort(refs.begin(), refs.end(),
@@ -893,7 +978,21 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             [&](size_t index, std::unique_ptr<AllocatedBuffer> buffer) {
                 Replica* replica = refs[index].replica;
                 if (replica == nullptr) {
-                    quarantined.push_back(std::move(buffer));
+                    // Ranges are disjoint (checked above), so the address
+                    // identifies the quarantine entry.
+                    const auto q = std::lower_bound(
+                        segment_quarantine.begin(), segment_quarantine.end(),
+                        refs[index].address,
+                        [](const handoff::QuarantineRange& range,
+                           uint64_t address) {
+                            return range.address < address;
+                        });
+                    const uint64_t hold_ms =
+                        q != segment_quarantine.end() &&
+                                q->address == refs[index].address
+                            ? q->hold_ms
+                            : HandoffFullHoldMs();
+                    quarantined.emplace_back(hold_ms, std::move(buffer));
                     return;
                 }
                 bind(*buffer);
@@ -982,13 +1081,18 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     MasterMetricManager::instance().inc_file_cache_nums(
         static_cast<int64_t>(stats.local_disk_replicas));
     {
+        // Each range is held for the rest of the time the old master would
+        // have held it, counted from now (the gap only adds to it).
+        const auto quarantine_now = SteadyClock::now();
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
         handoff_quarantine_.deadline =
-            SteadyClock::now() + put_start_release_timeout_sec_;
+            quarantine_now + put_start_release_timeout_sec_;
         for (size_t si = 0; si < nseg; ++si) {
-            for (auto& buffer : quarantined_buffers[si]) {
-                handoff_quarantine_.buffers.emplace_back(
-                    segments[si].segment_id, std::move(buffer));
+            for (auto& [hold_ms, buffer] : quarantined_buffers[si]) {
+                handoff_quarantine_.buffers.push_back(
+                    {segments[si].segment_id,
+                     quarantine_now + std::chrono::milliseconds(hold_ms),
+                     std::move(buffer)});
             }
         }
         handoff_offload_pins_ = std::move(pins);
@@ -1057,7 +1161,6 @@ void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
         return;
     }
     const PendingRestoredSegment pending = it->second;
-    pending_restored_segments_.erase(it);
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
@@ -1071,34 +1174,7 @@ void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
                                                       capacity);
         }
     }
-    bool alias_still_pending = false;
-    for (const auto& [other_id, other] : pending_restored_segments_) {
-        (void)other_id;
-        if (other.segment.te_endpoint == pending.segment.te_endpoint ||
-            other.segment.name == pending.segment.name ||
-            other.segment.te_endpoint == pending.segment.name ||
-            other.segment.name == pending.segment.te_endpoint) {
-            alias_still_pending = true;
-            break;
-        }
-    }
-    if (!alias_still_pending) {
-        invalid_replica_endpoints_.erase(pending.segment.te_endpoint);
-        invalid_replica_endpoints_.erase(pending.segment.name);
-    }
-    std::vector<std::unique_ptr<AllocatedBuffer>> released;
-    {
-        std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
-        auto& buffers = handoff_quarantine_.buffers;
-        for (auto b = buffers.begin(); b != buffers.end();) {
-            if (b->first == segment_id) {
-                released.push_back(std::move(b->second));
-                b = buffers.erase(b);
-            } else {
-                ++b;
-            }
-        }
-    }
+    ForgetPendingRestoredSegmentLocked(it);
     if (requester != pending.owner && HandoffDiskGated(pending.owner)) {
         // Another store process took over the owner's endpoint: the owner
         // restarted during the roll. Drop its restored L4 registration so
@@ -1120,6 +1196,76 @@ void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
                  << ", owner=" << pending.owner << ", reason=" << reason;
 }
 
+void MasterService::ForgetPendingRestoredSegmentLocked(
+    std::unordered_map<UUID, PendingRestoredSegment,
+                       boost::hash<UUID>>::iterator it) {
+    const UUID segment_id = it->first;
+    const PendingRestoredSegment pending = it->second;
+    pending_restored_segments_.erase(it);
+    bool alias_still_pending = false;
+    for (const auto& [other_id, other] : pending_restored_segments_) {
+        (void)other_id;
+        if (other.segment.te_endpoint == pending.segment.te_endpoint ||
+            other.segment.name == pending.segment.name ||
+            other.segment.te_endpoint == pending.segment.name ||
+            other.segment.name == pending.segment.te_endpoint) {
+            alias_still_pending = true;
+            break;
+        }
+    }
+    if (!alias_still_pending) {
+        invalid_replica_endpoints_.erase(pending.segment.te_endpoint);
+        invalid_replica_endpoints_.erase(pending.segment.name);
+    }
+    std::vector<HandoffQuarantinedBuffer> released;
+    {
+        std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
+        auto& buffers = handoff_quarantine_.buffers;
+        for (auto b = buffers.begin(); b != buffers.end();) {
+            if (b->segment_id == segment_id) {
+                released.push_back(std::move(*b));
+                b = buffers.erase(b);
+            } else {
+                ++b;
+            }
+        }
+    }
+}
+
+size_t MasterService::ReconcileHandoffPendingSegments() {
+    {
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (pending_restored_segments_.empty()) return 0;
+    }
+    std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+    std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::vector<UUID> gone;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (const auto& [segment_id, pending] : pending_restored_segments_) {
+            (void)pending;
+            // Unmounted (e.g. by the TTL offboarding), or unmounted and
+            // mounted again as a fresh, empty segment.
+            if (!segment_access.IsRestoredSegmentPending(segment_id)) {
+                gone.push_back(segment_id);
+            }
+        }
+    }
+    for (const auto& segment_id : gone) {
+        const auto it = pending_restored_segments_.find(segment_id);
+        if (it == pending_restored_segments_.end()) continue;
+        LOG(WARNING) << "handoff_segment=forgotten, segment_name="
+                     << it->second.segment.name
+                     << ", endpoint=" << it->second.segment.te_endpoint
+                     << ", owner=" << it->second.owner
+                     << ", reason=unmounted_or_remounted_fresh";
+        ForgetPendingRestoredSegmentLocked(it);
+        handoff_segments_dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return gone.size();
+}
+
 void MasterService::ConfirmPendingRestoredSegmentsLocked(
     const std::vector<Segment>& segments, const UUID& client_id) {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -1129,7 +1275,10 @@ void MasterService::ConfirmPendingRestoredSegmentsLocked(
             it->second.owner != client_id || !(it->second.segment == segment)) {
             continue;
         }
-        (void)segment_access.SetSegmentAllocatable(segment.id, true);
+        // An OK segment becomes allocatable; a DRAINING / DRAINED one keeps
+        // its status (its drain job did not survive the roll; an operator
+        // starts a new one or sets it back to OK).
+        (void)segment_access.ConfirmRestoredSegment(segment.id);
         pending_restored_segments_.erase(it);
         handoff_segments_confirmed_.fetch_add(1, std::memory_order_relaxed);
         LOG(INFO) << "handoff_segment=confirmed, segment_name=" << segment.name
@@ -1139,17 +1288,25 @@ void MasterService::ConfirmPendingRestoredSegmentsLocked(
 
 void MasterService::ReleaseExpiredHandoffQuarantine(
     std::chrono::steady_clock::time_point now) {
-    std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>> released;
+    std::vector<HandoffQuarantinedBuffer> released;
     std::vector<HandoffOffloadPin> pins;
     {
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
-        if ((handoff_quarantine_.buffers.empty() &&
-             handoff_offload_pins_.empty()) ||
-            now < handoff_quarantine_.deadline) {
+        std::vector<HandoffQuarantinedBuffer> kept;
+        for (auto& held : handoff_quarantine_.buffers) {
+            if (held.deadline <= now) {
+                released.push_back(std::move(held));
+            } else {
+                kept.push_back(std::move(held));
+            }
+        }
+        handoff_quarantine_.buffers.swap(kept);
+        if (now >= handoff_quarantine_.deadline) {
+            pins.swap(handoff_offload_pins_);
+        }
+        if (released.empty() && pins.empty()) {
             return;
         }
-        released.swap(handoff_quarantine_.buffers);
-        pins.swap(handoff_offload_pins_);
     }
     size_t unpinned = 0;
     if (!pins.empty()) {

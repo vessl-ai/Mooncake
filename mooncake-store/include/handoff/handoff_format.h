@@ -9,8 +9,11 @@
 //   handoff_manifest        versioned header: segment identities, chunk
 //                           index with CRCs, next replica id, config and
 //                           codec fingerprints. Written last.
-//   handoff_quarantine.bin  memory ranges of replicas that were left out
-//                           (in-flight puts and other incomplete replicas).
+//   handoff_quarantine.bin  memory ranges that a writer or reader of the old
+//                           master may still use (in-flight puts, other
+//                           incomplete replicas, discarded replicas still
+//                           held back, ranges still quarantined by a previous
+//                           restore), each with its remaining hold time.
 //
 // Segment identity (segment id, base, owner client id, ...) lives here rather
 // than in upstream StandbySegmentInfo, so upstream struct changes cannot
@@ -18,6 +21,7 @@
 // upstream "segment incarnation" change would add to StandbySegmentInfo.
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -29,6 +33,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "local_ssd/manager.h"
+#include "segment/status.h"
 #include "types.h"
 
 namespace mooncake::handoff {
@@ -36,10 +41,13 @@ namespace mooncake::handoff {
 inline constexpr char kHandoffFormat[] = "mooncake-handoff";
 // Schema 1: memory replicas only (stage 1/2). Schema 2 adds the LocalSSD
 // (L4) state: LOCAL_DISK replicas in the chunks (same chunk codec), the
-// per-client registrations and the in-flight offload pins. The reader accepts
-// both; a schema-1 snapshot restores no L4 state.
-inline constexpr uint32_t kHandoffSchemaVersion = 2;
-inline constexpr uint32_t kHandoffMinSchemaVersion = 1;
+// per-client registrations and the in-flight offload pins. Schema 3 adds the
+// remaining hold time of every quarantine range, the ranges of the old
+// master's discarded replicas, and DRAINING / DRAINED segments with their
+// status. Older snapshots lack ranges that may still be written, so the
+// reader accepts schema 3 only (an older snapshot means one cold start).
+inline constexpr uint32_t kHandoffSchemaVersion = 3;
+inline constexpr uint32_t kHandoffMinSchemaVersion = 3;
 inline constexpr char kHandoffManifestFile[] = "handoff_manifest";
 inline constexpr char kHandoffQuarantineFile[] = "handoff_quarantine.bin";
 inline constexpr char kHandoffLocalDiskFile[] = "handoff_local_disk.bin";
@@ -55,6 +63,9 @@ struct SegmentIdentity {
     std::string protocol;
     std::string host_id;
     UUID owner_client_id{0, 0};
+    // OK, DRAINING or DRAINED (schema 3). A restored DRAINING / DRAINED
+    // segment keeps that status and never becomes allocatable on its own.
+    SegmentStatus status{SegmentStatus::OK};
 
     Segment ToSegment() const;
     static SegmentIdentity FromSegment(const Segment& segment,
@@ -80,7 +91,11 @@ struct QuarantineRange {
     uint32_t segment_index{0};
     uint64_t address{0};
     uint64_t size{0};
-    YLT_REFL(QuarantineRange, segment_index, address, size);
+    // How long the old master would still have held the range back, counted
+    // from the export. The restore holds it this long after the restore ends
+    // (the gap between export and restore only adds to it).
+    uint64_t hold_ms{0};
+    YLT_REFL(QuarantineRange, segment_index, address, size, hold_ms);
 };
 
 // An object that had an offload task when the snapshot was taken. A store
@@ -118,6 +133,10 @@ struct WriterStats {
     uint64_t dropped_unknown_segment_replicas{0};
     uint64_t quarantine_ranges{0};
     uint64_t quarantine_bytes{0};
+    // Schema 3: ranges of the old master's discarded replicas that are still
+    // held back, and those that could not be carried (segment not exported).
+    uint64_t discarded_ranges{0};
+    uint64_t dropped_discarded_ranges{0};
     // L4 (schema 2).
     uint64_t local_disk_replicas{0};
     uint64_t disk_only_objects{0};
@@ -173,8 +192,9 @@ class SegmentLocator {
 };
 
 // Checks a segment list from a manifest: non-empty names, non-zero ranges,
-// unique ids, no CXL, and no overlapping ranges among segments sharing an
-// alias. Returns an error string on the first violation.
+// unique ids, no CXL, a status of OK / DRAINING / DRAINED, and no overlapping
+// ranges among segments sharing an alias. Returns an error string on the
+// first violation.
 std::optional<std::string> ValidateSegments(
     const std::vector<SegmentIdentity>& segments);
 
@@ -195,9 +215,13 @@ std::vector<uint8_t> EncodeOffloadPins(const std::vector<OffloadPin>& pins);
 tl::expected<std::vector<OffloadPin>, std::string> DecodeOffloadPins(
     const std::vector<uint8_t>& bytes);
 
-// Reads a whole file. Error string on I/O failure.
+// Reads a whole file. Error string on I/O failure, or if the file is larger
+// than `max_bytes` (checked before anything is allocated).
 tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
-    const std::string& path);
+    const std::string& path,
+    uint64_t max_bytes = std::numeric_limits<uint64_t>::max());
+// Upper bound for the handoff manifest file.
+inline constexpr uint64_t kMaxManifestBytes = 64ULL << 20;
 // Reads a blob and checks its size and CRC32C.
 tl::expected<std::vector<uint8_t>, std::string> ReadVerifiedBlob(
     const std::string& dir, const std::string& key, uint64_t bytes,

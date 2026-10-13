@@ -927,11 +927,27 @@ class MasterService {
     bool HandoffEnableOffload() const { return enable_offload_; }
     // Ranges still quarantined by a previous handoff restore (a roll that
     // follows a roll within put_start_release_timeout). They must stay
-    // quarantined in the next master as well.
+    // quarantined in the next master as well, for their remaining time.
     void ExportHandoffPendingQuarantine(
         const std::vector<handoff::SegmentIdentity>& segments,
         std::vector<handoff::QuarantineRange>& quarantine,
         handoff::WriterStats& stats) const;
+    // Memory ranges of discarded replicas (preempted or stale puts, expired
+    // replication tasks, replaced upsert / move sources) that this master
+    // still holds back because a writer or reader may still use them. They
+    // are quarantined in the next master for their remaining time.
+    void ExportHandoffDiscardedQuarantine(
+        const handoff::SegmentLocator& locator,
+        std::vector<handoff::QuarantineRange>& quarantine,
+        handoff::WriterStats& stats);
+    // Hold time of a quarantined range whose remaining time is unknown (an
+    // incomplete replica that is still in the metadata).
+    uint64_t HandoffFullHoldMs() const {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                put_start_release_timeout_sec_)
+                .count());
+    }
     static size_t HandoffShardCount() { return kNumShards; }
     static uint64_t HandoffNextReplicaId() { return Replica::next_id_.load(); }
     bool HandoffMultiTenant() const { return enable_multi_tenants_; }
@@ -996,6 +1012,13 @@ class MasterService {
     // task cleanup thread; public for tests.
     void ReleaseExpiredHandoffQuarantine(
         std::chrono::steady_clock::time_point now);
+    // Forgets restored segments that are still pending although they are no
+    // longer mounted (e.g. unmounted by the TTL offboarding of an owner that
+    // never came back) or were mounted again as fresh segments: lifts their
+    // read gate and releases their quarantine.
+    // Called by the task cleanup thread; public for tests. Returns how many
+    // were forgotten.
+    size_t ReconcileHandoffPendingSegments();
 
     /**
      * @brief Query the status of a task
@@ -2398,6 +2421,10 @@ class MasterService {
             return ttl_ <= now;
         }
 
+        // Handoff export (INF-600): the ranges and release time.
+        const std::vector<Replica>& replicas() const { return replicas_; }
+        std::chrono::system_clock::time_point ttl() const { return ttl_; }
+
        private:
         friend class MetadataSerializer;
         std::vector<Replica> replicas_;
@@ -2624,13 +2651,20 @@ class MasterService {
     };
     std::unordered_map<UUID, PendingRestoredSegment, boost::hash<UUID>>
         pending_restored_segments_;
-    // Ranges of replicas left out of the snapshot (in-flight puts and other
-    // incomplete replicas), held as allocations until the deadline so that a
-    // late write cannot land in reused memory.
+    // Ranges the old master still held back (in-flight puts, other
+    // incomplete replicas, discarded replicas), held as allocations until
+    // each one's deadline so that a late write or read cannot touch reused
+    // memory.
+    struct HandoffQuarantinedBuffer {
+        UUID segment_id{0, 0};
+        std::chrono::steady_clock::time_point deadline{};
+        std::unique_ptr<AllocatedBuffer> buffer;
+    };
     struct HandoffQuarantine {
         mutable std::mutex mutex;
+        // Deadline of the offload pins (handoff_offload_pins_).
         std::chrono::steady_clock::time_point deadline{};
-        std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>> buffers;
+        std::vector<HandoffQuarantinedBuffer> buffers;
     };
     HandoffQuarantine handoff_quarantine_;
     std::atomic<uint64_t> last_remount_lock_hold_ns_{0};
@@ -2680,6 +2714,13 @@ class MasterService {
     void DropPendingRestoredSegmentLocked(const UUID& segment_id,
                                           const char* reason,
                                           const UUID& requester);
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively. Removes
+    // the pending entry, lifts its read gate unless another pending segment
+    // shares an alias, and releases its quarantined ranges (their
+    // registration is invalid once the segment is unmounted).
+    void ForgetPendingRestoredSegmentLocked(
+        std::unordered_map<UUID, PendingRestoredSegment,
+                           boost::hash<UUID>>::iterator it);
     // Restored L4 gate. Any RPC carrying `client_id` proves the owner process
     // is alive; its restored LOCAL_DISK replicas become readable.
     void OpenHandoffDiskGate(const UUID& client_id);

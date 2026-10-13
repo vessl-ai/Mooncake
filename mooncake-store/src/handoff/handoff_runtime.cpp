@@ -415,7 +415,8 @@ std::string HandoffMetrics::Serialize() const {
               "Restored segments confirmed by an identical remount",
               static_cast<double>(confirmed));
         gauge("master_handoff_segments_dropped",
-              "Restored segments dropped on an identity mismatch",
+              "Restored segments dropped on an identity mismatch or "
+              "unmounted before their owner confirmed them",
               static_cast<double>(dropped));
     }
     Json::Value last;

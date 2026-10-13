@@ -17,6 +17,7 @@
 #include "handoff/handoff_format.h"
 #include "handoff/handoff_writer.h"
 #include "master_service.h"
+#include "tenant_quota_policy_store.h"
 
 namespace mooncake::test {
 namespace {
@@ -587,7 +588,7 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     MasterService master(MakeL4Config());
     auto restored = master.RestoreFromHandoff(dir.path(), {3});
     ASSERT_TRUE(restored.has_value()) << restored.error();
-    EXPECT_EQ(restored->schema, 2u);
+    EXPECT_EQ(restored->schema, handoff::kHandoffSchemaVersion);
     EXPECT_EQ(restored->local_disk_clients, 1u);
     EXPECT_EQ(restored->local_disk_replicas, 25u);
     EXPECT_EQ(restored->disk_only_objects, 5u);
@@ -751,30 +752,36 @@ TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
     ExpectEmpty(master);
 }
 
-TEST_F(HandoffRestoreTest, Schema1SnapshotRestoresWithoutL4) {
-    TempDir dir;
-    {
-        MasterService old_master(MakeConfig());
-        Populate(old_master, 1, 20);
-        Write(old_master, dir.path());
+TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
+    // Schema 1 and 2 snapshots lack the held-back ranges of discarded
+    // replicas and DRAINING segments, so restoring them could hand out a
+    // range a late writer still uses: they always mean a cold start.
+    for (const uint32_t schema : {1u, 2u}) {
+        TempDir dir;
+        stores_.clear();
+        {
+            MasterService old_master(MakeConfig());
+            Populate(old_master, 1, 20);
+            Write(old_master, dir.path());
+        }
+        const std::string path =
+            dir.path() + "/" + handoff::kHandoffManifestFile;
+        auto bytes = handoff::ReadFileBytes(path);
+        ASSERT_TRUE(bytes.has_value());
+        auto manifest = handoff::DecodeManifest(std::string_view(
+            reinterpret_cast<const char*>(bytes->data()), bytes->size()));
+        ASSERT_TRUE(manifest.has_value());
+        manifest->schema_version = schema;
+        std::ofstream(path, std::ios::trunc)
+            << handoff::EncodeManifest(*manifest);
+        MasterService master(MakeL4Config());
+        auto restored = master.RestoreFromHandoff(dir.path(), {1});
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_NE(restored.error().find("unsupported handoff schema"),
+                  std::string::npos)
+            << restored.error();
+        ExpectEmpty(master);
     }
-    const std::string path = dir.path() + "/" + handoff::kHandoffManifestFile;
-    auto bytes = handoff::ReadFileBytes(path);
-    ASSERT_TRUE(bytes.has_value());
-    auto manifest = handoff::DecodeManifest(std::string_view(
-        reinterpret_cast<const char*>(bytes->data()), bytes->size()));
-    ASSERT_TRUE(manifest.has_value());
-    manifest->schema_version = 1;
-    manifest->codec.local_disk = 0;
-    manifest->codec.offload_pins = 0;
-    std::ofstream(path, std::ios::trunc) << handoff::EncodeManifest(*manifest);
-    MasterService master(MakeL4Config());
-    auto restored = master.RestoreFromHandoff(dir.path(), {1});
-    ASSERT_TRUE(restored.has_value()) << restored.error();
-    EXPECT_EQ(restored->schema, 1u);
-    EXPECT_EQ(restored->objects, 20u);
-    EXPECT_FALSE(
-        master.OffloadObjectHeartbeat(stores_[0].client_id, true).has_value());
 }
 
 TEST_F(HandoffRestoreTest, L4ColdStartOnBadL4State) {
@@ -926,7 +933,7 @@ TEST_F(HandoffColdStartTest, CorruptManifestBody) {
 
 TEST_F(HandoffColdStartTest, UnknownSchemaVersion) {
     std::string text = handoff::EncodeManifest(manifest_);
-    text.replace(text.find(" 2 "), 3, " 9 ");
+    text.replace(text.find(" 3 "), 3, " 9 ");
     std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc) << text;
     ExpectColdStart();
 }
@@ -1007,6 +1014,532 @@ TEST_F(HandoffColdStartTest, MasterNotEmpty) {
     Segment segment = MakeSegment(9);
     ASSERT_TRUE(master.MountSegment(segment, generate_uuid()).has_value());
     EXPECT_FALSE(master.RestoreFromHandoff(dir_.path(), {1}).has_value());
+}
+
+// ---- Review 1 (INF-600): held-back ranges, DRAINING segments, pending
+// segments that are unmounted, roll during a roll, identity rules.
+
+MasterServiceConfig MakePutTimeoutConfig(uint64_t discard_sec,
+                                         uint64_t release_sec) {
+    return MasterServiceConfig::builder()
+        .set_memory_allocator(BufferAllocatorType::OFFSET)
+        .set_eviction_ratio(0.0)
+        .set_eviction_high_watermark_ratio(1.0)
+        .set_client_live_ttl_sec(3600)
+        .set_client_suspicion_ttl_sec(3600)
+        .set_put_start_discard_timeout_sec(discard_sec)
+        .set_put_start_release_timeout_sec(release_sec)
+        .build();
+}
+
+std::vector<handoff::QuarantineRange> ReadQuarantine(const std::string& dir) {
+    auto bytes =
+        handoff::ReadFileBytes(dir + "/" + handoff::kHandoffQuarantineFile);
+    EXPECT_TRUE(bytes.has_value());
+    if (!bytes) return {};
+    auto ranges = handoff::DecodeQuarantine(*bytes);
+    EXPECT_TRUE(ranges.has_value());
+    return ranges ? *ranges : std::vector<handoff::QuarantineRange>{};
+}
+
+const AllocatedBuffer::Descriptor& Buf(const Replica::Descriptor& d) {
+    return d.get_memory_descriptor().buffer_descriptor;
+}
+
+bool Disjoint(const AllocatedBuffer::Descriptor& a,
+              const AllocatedBuffer::Descriptor& b) {
+    return a.buffer_address_ + a.size_ <= b.buffer_address_ ||
+           b.buffer_address_ + b.size_ <= a.buffer_address_;
+}
+
+// Puts on `store`'s first segment until it is full; every new range must be
+// disjoint from all of `held`.
+void FillAvoiding(MasterService& master, const Store& store,
+                  const std::vector<AllocatedBuffer::Descriptor>& held,
+                  const std::string& prefix) {
+    for (int i = 0; i < 5000; ++i) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = store.segments[0].name;
+        auto r = master.PutStart(store.client_id, prefix + std::to_string(i),
+                                 TenantId::Default(), kObjectSize, config);
+        if (!r) break;
+        const auto& b = Buf(r->front());
+        if (b.transport_endpoint_ != store.segments[0].te_endpoint) continue;
+        for (const auto& h : held) {
+            ASSERT_TRUE(Disjoint(b, h)) << prefix << i;
+        }
+    }
+}
+
+TEST_F(HandoffRestoreTest,
+       DiscardedRangesAreQuarantinedWithTheirRemainingTime) {
+    TempDir dir;
+    std::vector<AllocatedBuffer::Descriptor> discarded, in_flight;
+    uint64_t used = 0;
+    {
+        // 1 s discard / 30 s release timeouts in the old master.
+        MasterService old_master(MakePutTimeoutConfig(1, 30));
+        Populate(old_master, 1, 10);
+        const Store& store = stores_[0];
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = store.segments[0].name;
+        // Writer W1 is still writing "upserted" when W2's upsert preempts
+        // it: W1's range goes to the discarded list, held 30 s.
+        discarded.push_back(Buf(Put(old_master, store, "upserted", false)));
+        auto upsert =
+            old_master.UpsertStart(store.client_id, "upserted",
+                                   TenantId::Default(), kObjectSize, config);
+        ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+        in_flight.push_back(Buf(upsert->front()));
+        // A put that never ended is replaced after the discard timeout: its
+        // range is held until put start + 30 s.
+        discarded.push_back(Buf(Put(old_master, store, "stale", false)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        in_flight.push_back(Buf(Put(old_master, store, "stale", false)));
+        used = Used(old_master, store.segments[0]);
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.stats.discarded_ranges, 2u);
+        EXPECT_EQ(written.stats.quarantine_ranges, 4u);
+        EXPECT_EQ(written.stats.objects, 10u);
+    }
+    // In-flight ranges carry the full timeout, discarded ones what was left.
+    const auto ranges = ReadQuarantine(dir.path());
+    ASSERT_EQ(ranges.size(), 4u);
+    for (const auto& range : ranges) {
+        bool is_discarded = false;
+        for (const auto& d : discarded) {
+            if (d.buffer_address_ == range.address) is_discarded = true;
+        }
+        if (is_discarded) {
+            EXPECT_LT(range.hold_ms, 29500u);
+            EXPECT_GT(range.hold_ms, 20000u);
+        } else {
+            EXPECT_EQ(range.hold_ms, 30000u);
+        }
+    }
+
+    MasterService master(MakeConfig());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 4u);
+    EXPECT_EQ(Used(master, stores_[0].segments[0]), used);
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    std::vector<AllocatedBuffer::Descriptor> held = discarded;
+    held.insert(held.end(), in_flight.begin(), in_flight.end());
+    FillAvoiding(master, stores_[0], held, "fill-");
+
+    const auto now = std::chrono::steady_clock::now();
+    master.ReleaseExpiredHandoffQuarantine(now + std::chrono::seconds(20));
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 4u);
+    // The discarded ranges end with the old master's deadline, the in-flight
+    // ones 30 s after the restore.
+    master.ReleaseExpiredHandoffQuarantine(now +
+                                           std::chrono::milliseconds(29500));
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 2u);
+    master.ReleaseExpiredHandoffQuarantine(now + std::chrono::seconds(31));
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 0u);
+}
+
+TEST_F(HandoffRestoreTest, DrainingSegmentIsRestoredDrainingWithItsQuarantine) {
+    TempDir dir;
+    AllocatedBuffer::Descriptor in_flight;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 10);
+        // A put granted before an admin set the segment to DRAINING.
+        in_flight = Buf(Put(old_master, stores_[0], "in-flight", false));
+        ASSERT_TRUE(old_master
+                        .SetSegmentStatus(stores_[0].segments[0].name,
+                                          SegmentStatus::DRAINING)
+                        .has_value());
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.stats.objects, 20u);
+        EXPECT_EQ(written.stats.quarantine_ranges, 1u);
+        EXPECT_EQ(written.stats.dropped_unknown_segment_replicas, 0u);
+    }
+    MasterService master(MakeConfig());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 2u);
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 1u);
+    const auto& seg0 = stores_[0].segments[0].name;
+    const auto& seg1 = stores_[1].segments[0].name;
+    EXPECT_EQ(master.QuerySegmentStatus(seg0).value_or(SegmentStatus::OK),
+              SegmentStatus::DRAINING);
+
+    // Nothing opens a pending segment: neither the admin status change nor
+    // a drain job (which would set DRAINING and later OK).
+    auto set = master.SetSegmentStatus(seg0, SegmentStatus::OK);
+    ASSERT_FALSE(set.has_value());
+    EXPECT_EQ(set.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    set = master.SetSegmentStatus(seg1, SegmentStatus::DRAINING);
+    ASSERT_FALSE(set.has_value());
+    EXPECT_EQ(set.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    CreateDrainJobRequest drain;
+    drain.segments = {seg1};
+    EXPECT_FALSE(master.CreateDrainJob(drain).has_value());
+    EXPECT_EQ(
+        master.QuerySegmentStatus(seg1).value_or(SegmentStatus::UNDEFINED),
+        SegmentStatus::OK);
+
+    // The owner confirms: objects readable, the segment stays DRAINING and
+    // is not allocatable (store 1 is still pending, so no put succeeds).
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 1u);
+    EXPECT_TRUE(Readable(master, Key(0, 9)));
+    EXPECT_EQ(master.QuerySegmentStatus(seg0).value_or(SegmentStatus::OK),
+              SegmentStatus::DRAINING);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = seg0;
+    EXPECT_FALSE(master
+                     .PutStart(stores_[0].client_id, "nowhere",
+                               TenantId::Default(), kObjectSize, config)
+                     .has_value());
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    auto elsewhere = master.PutStart(stores_[0].client_id, "elsewhere",
+                                     TenantId::Default(), kObjectSize, config);
+    ASSERT_TRUE(elsewhere.has_value());
+    EXPECT_EQ(Buf(elsewhere->front()).transport_endpoint_,
+              stores_[1].segments[0].te_endpoint);
+
+    // Confirmed: the admin may open it again; the in-flight range stays held.
+    ASSERT_TRUE(master.SetSegmentStatus(seg0, SegmentStatus::OK).has_value());
+    FillAvoiding(master, stores_[0], {in_flight}, "fill-");
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 1u);
+}
+
+TEST_F(HandoffRestoreTest, GracefullyUnmountingSegmentIsNotExported) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 5);
+        ASSERT_TRUE(old_master
+                        .GracefulUnmountSegment(stores_[0].segments[0].id,
+                                                stores_[0].client_id, 60000)
+                        .has_value());
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.stats.objects, 5u);
+    }
+    MasterService master(MakeConfig());
+    auto restored = master.RestoreFromHandoff(dir.path(), {1});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->segments, 1u);
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 1u);
+}
+
+TEST_F(HandoffRestoreTest, PendingSegmentOfOffboardedOwnerIsForgotten) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 40);
+        Put(old_master, stores_[0], "in-flight", false);
+        Write(old_master, dir.path());
+    }
+    MasterService master(MakeConfig(/*live=*/1, /*suspicion=*/1));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 1u);
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    for (int i = 0; i < 80 && master.GetKeyCount() != 40; ++i) {
+        (void)master.Ping(stores_[1].client_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_EQ(master.GetKeyCount(), 40u);
+    // The TTL offboarding unmounted the segment; the pending entry, its read
+    // gate and its quarantine go with it.
+    EXPECT_EQ(master.ReconcileHandoffPendingSegments(), 1u);
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 0u);
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 0u);
+    EXPECT_EQ(master.ReconcileHandoffPendingSegments(), 0u);
+
+    // A new store at the old endpoint (different range, so no identity rule
+    // applies) is readable at once.
+    Store next{generate_uuid(), {MakeSegment(7)}};
+    next.segments[0].name = stores_[0].segments[0].name;
+    next.segments[0].te_endpoint = stores_[0].segments[0].te_endpoint;
+    ASSERT_TRUE(
+        master.MountSegment(next.segments[0], next.client_id).has_value());
+    Put(master, next, "next");
+    EXPECT_TRUE(Readable(master, "next"));
+    (void)master.Ping(next.client_id);
+    EXPECT_FALSE(Readable(master, Key(0, 0)));
+}
+
+TEST_F(HandoffRestoreTest, OwnerReturningAfterOffboardingMountsFresh) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 20);
+        Write(old_master, dir.path());
+    }
+    MasterService master(MakeConfig(/*live=*/1, /*suspicion=*/1));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    for (int i = 0; i < 80 && master.GetKeyCount() != 20; ++i) {
+        (void)master.Ping(stores_[1].client_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_EQ(master.GetKeyCount(), 20u);
+    (void)master.ReconcileHandoffPendingSegments();
+    // The owner comes back with exactly the restored identity: it gets an
+    // empty segment, never its old objects.
+    bool remounted = false;
+    for (int i = 0; i < 50 && !remounted; ++i) {
+        remounted = Remount(master, stores_[0]);
+        if (!remounted) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    ASSERT_TRUE(remounted);
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 0u);
+    EXPECT_FALSE(Readable(master, Key(0, 0)));
+    Put(master, stores_[0], "back");
+    EXPECT_TRUE(Readable(master, "back"));
+}
+
+TEST_F(HandoffRestoreTest, RestoredOwnerIsNotOffboardedBeforeItsTtl) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 1, 20);
+        Write(old_master, dir.path());
+    }
+    // Liveness clocks start when the restore ends, not when the old master
+    // last heard from the store.
+    MasterService master(MakeConfig(/*live=*/2, /*suspicion=*/2));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_EQ(master.HandoffSegmentsConfirmed(), 1u);
+    EXPECT_EQ(master.GetKeyCount(), 20u);
+    EXPECT_TRUE(Readable(master, Key(0, 19)));
+}
+
+TEST_F(HandoffRestoreTest, RollDuringRollKeepsPendingSegmentsAndQuarantine) {
+    TempDir first, second;
+    AllocatedBuffer::Descriptor in_flight;
+    uint64_t used0 = 0;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 30);
+        in_flight = Buf(Put(old_master, stores_[0], "in-flight", false));
+        used0 = Used(old_master, stores_[0].segments[0]);
+        Write(old_master, first.path());
+    }
+    {
+        // Restored master: store 1 confirmed, store 0 still pending when the
+        // next SIGTERM arrives.
+        MasterService middle(MakeConfig());
+        ASSERT_TRUE(middle.RestoreFromHandoff(first.path(), {2}).has_value());
+        ASSERT_TRUE(Remount(middle, stores_[1]));
+        Put(middle, stores_[1], "between");
+        auto written = Write(middle, second.path());
+        EXPECT_EQ(written.stats.objects, 61u);
+        EXPECT_EQ(written.stats.quarantine_ranges, 1u);
+    }
+    const auto ranges = ReadQuarantine(second.path());
+    ASSERT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].address, in_flight.buffer_address_);
+    // What was left of the first restore's hold, not a new full timeout.
+    EXPECT_LE(ranges[0].hold_ms, 600000u);
+    EXPECT_GT(ranges[0].hold_ms, 590000u);
+
+    MasterService master(MakeConfig());
+    ASSERT_TRUE(master.RestoreFromHandoff(second.path(), {2}).has_value());
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 2u);
+    EXPECT_EQ(master.HandoffQuarantineBufferCount(), 1u);
+    EXPECT_EQ(Used(master, stores_[0].segments[0]), used0);
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    EXPECT_TRUE(Readable(master, Key(0, 29)));
+    EXPECT_TRUE(Readable(master, "between"));
+    FillAvoiding(master, stores_[0], {in_flight}, "fill-");
+}
+
+TEST_F(HandoffRestoreTest, OwnerReRegisteringOverlappingMemoryDrops) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 2, 10);
+        Write(old_master, dir.path());
+    }
+    // Rule 3 via MountSegment: the owner mounts a new segment id over the
+    // restored range.
+    {
+        MasterService master(MakeConfig());
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+        Segment again = stores_[0].segments[0];
+        again.id = generate_uuid();
+        again.base += kObjectSize;
+        again.size -= kObjectSize;
+        ASSERT_TRUE(
+            master.MountSegment(again, stores_[0].client_id).has_value());
+        EXPECT_EQ(master.HandoffSegmentsDropped(), 1u);
+        EXPECT_FALSE(Readable(master, Key(0, 0)));
+        ASSERT_TRUE(Remount(master, stores_[1]));
+        EXPECT_TRUE(Readable(master, Key(1, 0)));
+    }
+    // Rule 3 via ReMountSegment (with rule 4: the old id is not listed).
+    {
+        MasterService master(MakeConfig());
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+        Store changed = stores_[0];
+        changed.segments[0].id = generate_uuid();
+        ASSERT_TRUE(Remount(master, changed));
+        EXPECT_EQ(master.HandoffSegmentsDropped(), 1u);
+        EXPECT_FALSE(Readable(master, Key(0, 0)));
+    }
+    // Rule 1 via ReMountSegment: another process remounts at the endpoint.
+    {
+        MasterService master(MakeConfig());
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+        Store restarted{generate_uuid(), {stores_[0].segments[0]}};
+        restarted.segments[0].id = generate_uuid();
+        ASSERT_TRUE(Remount(master, restarted));
+        EXPECT_EQ(master.HandoffSegmentsDropped(), 1u);
+        EXPECT_FALSE(Readable(master, Key(0, 0)));
+        Put(master, restarted, "fresh");
+        EXPECT_TRUE(Readable(master, "fresh"));
+    }
+}
+
+TEST_F(HandoffRestoreTest, ReadLeasesOfTheOldMasterAreHonoured) {
+    auto config = [] {
+        return MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_eviction_ratio(0.0)
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_client_live_ttl_sec(3600)
+            .set_client_suspicion_ttl_sec(3600)
+            .set_default_kv_lease_ttl(1500)
+            .build();
+    };
+    TempDir dir;
+    {
+        MasterService old_master(config());
+        Populate(old_master, 1, 5);
+        Write(old_master, dir.path());
+    }
+    MasterService master(config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    // A reader may still hold a lease from the old master (export + ttl).
+    auto removed = master.Remove(Key(0, 0), TenantId::Default(), false);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_HAS_LEASE);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1700));
+    EXPECT_TRUE(
+        master.Remove(Key(0, 0), TenantId::Default(), false).has_value());
+}
+
+TEST_F(HandoffRestoreTest, MultiTenantSnapshotRestoresTenantsAndQuota) {
+    TempDir dir;
+    const std::string policy = dir.path() + "-quota.yaml";
+    {
+        TenantQuotaPolicySnapshot snapshot;
+        snapshot.tenant_quotas.emplace("tenant-a", 64 * kObjectSize);
+        snapshot.tenant_quotas.emplace("tenant-b", 64 * kObjectSize);
+        std::ofstream(policy) << FormatTenantQuotaPolicyYaml(snapshot);
+    }
+    auto config = [&policy](bool multi_tenant) {
+        auto builder = MasterServiceConfig::builder();
+        builder.set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_eviction_ratio(0.0)
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_client_live_ttl_sec(3600)
+            .set_client_suspicion_ttl_sec(3600)
+            .set_enable_multi_tenants(multi_tenant);
+        if (multi_tenant) {
+            builder.set_tenant_quota_connector_type("file")
+                .set_tenant_quota_connector_uri(policy);
+        }
+        return builder.build();
+    };
+    const TenantId tenant_a("tenant-a");
+    const TenantId tenant_b("tenant-b");
+    {
+        MasterService old_master(config(true));
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        ReplicateConfig rc;
+        rc.replica_num = 1;
+        for (const auto* tenant : {&tenant_a, &tenant_b}) {
+            for (int i = 0; i < 3; ++i) {
+                ASSERT_TRUE(old_master
+                                .PutStart(store.client_id, Key(0, i), *tenant,
+                                          kObjectSize, rc)
+                                .has_value());
+                ASSERT_TRUE(old_master
+                                .PutEnd(store.client_id, Key(0, i), *tenant,
+                                        ReplicaType::MEMORY)
+                                .has_value());
+            }
+        }
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.stats.objects, 6u);
+    }
+    {
+        // A master in the other tenancy mode starts cold.
+        MasterService master(config(false));
+        auto restored = master.RestoreFromHandoff(dir.path(), {1});
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_NE(restored.error().find("multi-tenant mode mismatch"),
+                  std::string::npos);
+        ExpectEmpty(master);
+    }
+    MasterService master(config(true));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_EQ(master.GetKeyCount(), 6u);
+    for (const auto* tenant : {&tenant_a, &tenant_b}) {
+        for (int i = 0; i < 3; ++i) {
+            EXPECT_TRUE(master.GetReplicaList(Key(0, i), *tenant).has_value())
+                << tenant->value() << " " << i;
+        }
+    }
+    // Same user key, other tenant: still distinct objects.
+    EXPECT_FALSE(
+        master.GetReplicaList(Key(0, 0), TenantId::Default()).has_value());
+    // The quota usage was rebuilt from the restored objects.
+    for (const auto* tenant : {&tenant_a, &tenant_b}) {
+        auto quota = master.GetTenantQuotaSnapshot(*tenant);
+        ASSERT_TRUE(quota.has_value()) << tenant->value();
+        EXPECT_EQ(quota->charged_bytes, 3 * kObjectSize) << tenant->value();
+    }
+    std::filesystem::remove(policy);
+}
+
+TEST_F(HandoffRestoreTest, PendingEntryOfSegmentMountedFreshIsForgotten) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 1, 10);
+        Write(old_master, dir.path());
+    }
+    MasterService master(MakeConfig(/*live=*/1, /*suspicion=*/1));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    for (int i = 0; i < 80 && master.GetKeyCount() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    ASSERT_EQ(master.GetKeyCount(), 0u);
+    // The owner mounts its old identity again (fresh, empty) before the
+    // cleanup thread looked at the pending entry.
+    bool mounted = false;
+    for (int i = 0; i < 50 && !mounted; ++i) {
+        mounted =
+            master.MountSegment(stores_[0].segments[0], stores_[0].client_id)
+                .has_value();
+        if (!mounted) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    ASSERT_TRUE(mounted);
+    EXPECT_EQ(master.ReconcileHandoffPendingSegments(), 1u);
+    EXPECT_EQ(master.HandoffPendingSegmentCount(), 0u);
+    Put(master, stores_[0], "fresh");
+    EXPECT_TRUE(Readable(master, "fresh"));
 }
 
 }  // namespace

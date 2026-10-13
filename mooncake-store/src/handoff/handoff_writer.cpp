@@ -134,6 +134,8 @@ std::string HandoffWriteResult::ToJson() const {
       << stats.dropped_unknown_segment_replicas
       << ",\"quarantine_ranges\":" << stats.quarantine_ranges
       << ",\"quarantine_bytes\":" << stats.quarantine_bytes
+      << ",\"discarded_ranges\":" << stats.discarded_ranges
+      << ",\"dropped_discarded_ranges\":" << stats.dropped_discarded_ranges
       << ",\"local_disk_clients\":" << local_disk_clients
       << ",\"local_disk_replicas\":" << stats.local_disk_replicas
       << ",\"disk_only_objects\":" << stats.disk_only_objects
@@ -308,6 +310,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     }
     service.ExportHandoffPendingQuarantine(manifest.segments, quarantine,
                                            manifest.writer);
+    service.ExportHandoffDiscardedQuarantine(locator, quarantine,
+                                             manifest.writer);
     manifest.chunks = std::move(chunks);
     manifest.object_count = manifest.writer.objects;
     manifest.replica_count = manifest.writer.replicas;

@@ -30,6 +30,11 @@ struct MountedSegment {
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
     std::shared_ptr<SegmentAllocatorRegistration> allocator_registration;
+    // Restored from a shutdown handoff snapshot and not yet confirmed by its
+    // owner (INF-600, fork-only). While set, the segment never becomes
+    // allocatable and its status cannot be changed (see
+    // ConfirmRestoredSegment).
+    bool handoff_pending{false};
 };
 
 struct MountedNoFSegment {
@@ -101,17 +106,27 @@ class ScopedSegmentAccess {
 
     /**
      * @brief Mount a segment restored from a handoff snapshot with its
-     * original identity and owner, adopting an allocator built by the restore.
-     * The segment starts non-allocatable; SetSegmentAllocatable(true) opens it
-     * once the owner has confirmed the segment. Only valid before the master
-     * serves requests.
+     * original identity, owner and status (OK, DRAINING or DRAINED), adopting
+     * an allocator built by the restore. The segment starts non-allocatable
+     * and pending; ConfirmRestoredSegment opens it once the owner has
+     * confirmed it. Only valid before the master serves requests.
      */
     ErrorCode MountRestoredSegment(
         const Segment& segment, const UUID& client_id,
         std::shared_ptr<ClientLivenessRecord> client_liveness,
-        std::shared_ptr<BufferAllocatorBase> allocator);
+        std::shared_ptr<BufferAllocatorBase> allocator,
+        SegmentStatus status = SegmentStatus::OK);
 
-    ErrorCode SetSegmentAllocatable(const UUID& segment_id, bool allocatable);
+    /**
+     * @brief Ends the pending state of a restored segment: an OK segment
+     * becomes allocatable, a DRAINING / DRAINED one keeps its status and
+     * stays non-allocatable. No-op for a segment that is not pending.
+     */
+    ErrorCode ConfirmRestoredSegment(const UUID& segment_id);
+
+    // True if `segment_id` is mounted and still the pending restored
+    // incarnation (not unmounted and mounted again since).
+    bool IsRestoredSegmentPending(const UUID& segment_id) const;
 
     /**
      * @brief Returns a function that binds a buffer to the segment's

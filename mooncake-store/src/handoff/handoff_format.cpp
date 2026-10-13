@@ -72,6 +72,31 @@ bool GetStr(const Json::Value& root, const char* field, std::string& out) {
     return true;
 }
 
+// Segment statuses a snapshot may carry.
+const char* RestorableStatusName(SegmentStatus status) {
+    switch (status) {
+        case SegmentStatus::OK:
+            return "OK";
+        case SegmentStatus::DRAINING:
+            return "DRAINING";
+        case SegmentStatus::DRAINED:
+            return "DRAINED";
+        default:
+            return nullptr;
+    }
+}
+
+bool ParseRestorableStatus(const std::string& name, SegmentStatus& status) {
+    for (const auto candidate :
+         {SegmentStatus::OK, SegmentStatus::DRAINING, SegmentStatus::DRAINED}) {
+        if (name == RestorableStatusName(candidate)) {
+            status = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 Segment SegmentIdentity::ToSegment() const {
@@ -167,6 +192,9 @@ std::optional<std::string> ValidateSegments(
         if (!ids.insert(s.segment_id).second) {
             return "duplicate segment id for " + s.name;
         }
+        if (RestorableStatusName(s.status) == nullptr) {
+            return "segment status not restorable: " + s.name;
+        }
     }
     for (size_t i = 0; i < segments.size(); ++i) {
         for (size_t j = i + 1; j < segments.size(); ++j) {
@@ -213,6 +241,8 @@ std::string EncodeManifest(const Manifest& m) {
         v["protocol"] = s.protocol;
         v["host_id"] = s.host_id;
         v["owner_client_id"] = EncodeUuid(s.owner_client_id);
+        const char* status = RestorableStatusName(s.status);
+        v["status"] = status != nullptr ? status : "INVALID";
         segments.append(v);
     }
     root["segments"] = segments;
@@ -253,6 +283,9 @@ std::string EncodeManifest(const Manifest& m) {
         Json::UInt64(m.writer.dropped_unknown_segment_replicas);
     w["quarantine_ranges"] = Json::UInt64(m.writer.quarantine_ranges);
     w["quarantine_bytes"] = Json::UInt64(m.writer.quarantine_bytes);
+    w["discarded_ranges"] = Json::UInt64(m.writer.discarded_ranges);
+    w["dropped_discarded_ranges"] =
+        Json::UInt64(m.writer.dropped_discarded_ranges);
     w["local_disk_replicas"] = Json::UInt64(m.writer.local_disk_replicas);
     w["disk_only_objects"] = Json::UInt64(m.writer.disk_only_objects);
     w["dropped_local_disk_replicas"] =
@@ -389,6 +422,11 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
             !DecodeUuid(v["owner_client_id"], s.owner_client_id)) {
             return tl::make_unexpected("manifest segment entry invalid");
         }
+        std::string status;
+        if (!GetStr(v, "status", status) ||
+            !ParseRestorableStatus(status, s.status)) {
+            return tl::make_unexpected("manifest segment status invalid");
+        }
         m.segments.push_back(std::move(s));
     }
     for (const auto& v : root["chunks"]) {
@@ -423,6 +461,9 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
                m.writer.dropped_unknown_segment_replicas);
         GetU64(w, "quarantine_ranges", m.writer.quarantine_ranges);
         GetU64(w, "quarantine_bytes", m.writer.quarantine_bytes);
+        GetU64(w, "discarded_ranges", m.writer.discarded_ranges);
+        GetU64(w, "dropped_discarded_ranges",
+               m.writer.dropped_discarded_ranges);
         GetU64(w, "local_disk_replicas", m.writer.local_disk_replicas);
         GetU64(w, "disk_only_objects", m.writer.disk_only_objects);
         GetU64(w, "dropped_local_disk_replicas",
@@ -485,7 +526,7 @@ tl::expected<std::vector<OffloadPin>, std::string> DecodeOffloadPins(
 }
 
 tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
-    const std::string& path) {
+    const std::string& path, uint64_t max_bytes) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return tl::make_unexpected("open " + path + ": " +
@@ -496,6 +537,15 @@ tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
         const std::string err = std::strerror(errno);
         ::close(fd);
         return tl::make_unexpected("fstat " + path + ": " + err);
+    }
+    // Checked before allocating: a damaged or replaced file must not make
+    // the restore allocate its whole size.
+    if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) > max_bytes) {
+        ::close(fd);
+        return tl::make_unexpected("size mismatch for " + path + ": file has " +
+                                   std::to_string(st.st_size) +
+                                   " bytes, at most " +
+                                   std::to_string(max_bytes) + " expected");
     }
     std::vector<uint8_t> data(static_cast<size_t>(st.st_size));
     size_t done = 0;
@@ -517,7 +567,7 @@ tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
 tl::expected<std::vector<uint8_t>, std::string> ReadVerifiedBlob(
     const std::string& dir, const std::string& key, uint64_t bytes,
     uint32_t crc32c) {
-    auto data = ReadFileBytes(dir + "/" + key);
+    auto data = ReadFileBytes(dir + "/" + key, bytes);
     if (!data) return data;
     if (data->size() != bytes) {
         return tl::make_unexpected("size mismatch for " + key);

@@ -3174,7 +3174,11 @@ void MasterService::TaskCleanupThreadFunc() {
         }
         CleanupExpiredSoftPins(std::chrono::system_clock::now());
         CleanupExpiredDynamicReplicationState();
+        shared_lock.unlock();
+        // Handoff (INF-600): both take their own locks (the reconcile step
+        // needs client_mutex_ and snapshot_mutex_ exclusively).
         ReleaseExpiredHandoffQuarantine(std::chrono::steady_clock::now());
+        (void)ReconcileHandoffPendingSegments();
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }
