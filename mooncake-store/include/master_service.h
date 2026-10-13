@@ -905,15 +905,26 @@ class MasterService {
     bool BackgroundWorkQuiesced() const;
     // Number of objects in the metadata shards (one shard lock at a time).
     uint64_t HandoffObjectCount() const;
+    // Number of objects with a completed LOCAL_DISK replica (at most one per
+    // object), from the per-shard counters; used by the admission control.
+    uint64_t HandoffLocalDiskObjectCount() const;
     // Export side. Callers must have stopped the RPC server and quiesced the
     // background work first, so that nothing allocates or frees store memory
     // while the export runs.
     std::vector<handoff::SegmentIdentity> ExportHandoffSegments();
+    // LocalSSD clients whose L4 state is exported: registered and owner of
+    // at least one exported memory segment (L4 is all-or-nothing per store).
+    std::vector<LocalSsdHandoffClient> ExportHandoffLocalDiskClients(
+        const std::vector<handoff::SegmentIdentity>& segments) const;
+    using HandoffClientSet = std::unordered_set<UUID, boost::hash<UUID>>;
     void ExportHandoffShard(size_t shard_idx,
                             const handoff::SegmentLocator& locator,
+                            const HandoffClientSet& disk_clients,
                             std::vector<StandbyObjectEntry>& objects,
                             std::vector<handoff::QuarantineRange>& quarantine,
+                            std::vector<handoff::OffloadPin>& pins,
                             handoff::WriterStats& stats) const;
+    bool HandoffEnableOffload() const { return enable_offload_; }
     WeightMetadataSnapshot ExportHandoffWeightMetadata() const;
     // Ranges still quarantined by a previous handoff restore (a roll that
     // follows a roll within put_start_release_timeout). They must stay
@@ -935,6 +946,11 @@ class MasterService {
         uint64_t segments{0};
         uint64_t chunks{0};
         uint64_t quarantine_ranges{0};
+        uint64_t schema{0};
+        uint64_t local_disk_clients{0};
+        uint64_t local_disk_replicas{0};
+        uint64_t disk_only_objects{0};
+        uint64_t offload_pins{0};
         uint64_t workers{0};
         uint64_t manifest_ns{0};
         uint64_t mount_ns{0};
@@ -973,6 +989,10 @@ class MasterService {
     }
     size_t HandoffPendingSegmentCount() const;
     size_t HandoffQuarantineBufferCount() const;
+    // Restored L4 owners whose disk replicas are still unreadable (no RPC
+    // from them yet), and pinned in-flight offload sources.
+    size_t HandoffDiskClientsPending() const;
+    size_t HandoffOffloadPinCount() const;
     // Releases quarantined ranges whose deadline has passed. Called by the
     // task cleanup thread; public for tests.
     void ReleaseExpiredHandoffQuarantine(
@@ -2621,6 +2641,26 @@ class MasterService {
                            const std::atomic<bool>& running);
     std::atomic<uint64_t> handoff_segments_confirmed_{0};
     std::atomic<uint64_t> handoff_segments_dropped_{0};
+    // Restored L4 owners: client id -> opened. Keys are fixed by the restore
+    // (before serving) and only cleared by ResetHandoffState; values flip
+    // once, so readers need no lock beyond what they already hold.
+    struct HandoffDiskGate {
+        std::atomic<bool> active{false};
+        std::unordered_map<UUID, std::unique_ptr<std::atomic<bool>>,
+                           boost::hash<UUID>>
+            opened;
+    };
+    HandoffDiskGate handoff_disk_gate_;
+    // Memory replicas of objects that had an offload task in the old master,
+    // pinned (refcount) until the quarantine deadline. Guarded by
+    // handoff_quarantine_.mutex.
+    struct HandoffOffloadPin {
+        TenantId tenant_id;
+        std::string key;
+        std::vector<ReplicaID> replica_ids;
+    };
+    std::vector<HandoffOffloadPin> handoff_offload_pins_;
+    int64_t handoff_restored_file_capacity_{0};
 
     tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoffLocked(
         const std::string& dir, const HandoffRestoreOptions& options);
@@ -2632,8 +2672,23 @@ class MasterService {
         const std::vector<Segment>& segments, const UUID& client_id,
         bool is_remount) const;
     // Requires client_mutex_ and snapshot_mutex_ held exclusively.
+    // `requester` is the client whose mount or remount proved the segment
+    // stale; if it is not the owner, the owner restarted, so its restored
+    // L4 registration is dropped too.
     void DropPendingRestoredSegmentLocked(const UUID& segment_id,
-                                          const char* reason);
+                                          const char* reason,
+                                          const UUID& requester);
+    // Restored L4 gate. Any RPC carrying `client_id` proves the owner process
+    // is alive; its restored LOCAL_DISK replicas become readable.
+    void OpenHandoffDiskGate(const UUID& client_id);
+    bool HandoffDiskGated(const UUID& client_id) const;
+    // Erases from `metadata` a LOCAL_DISK replica owned by another client
+    // that has no LocalSSD registration any more (e.g. a store that
+    // restarted during a handoff roll), so `client_id` can register its own.
+    // Requires the object's shard lock. Returns true if one was erased.
+    bool EraseUnregisteredOwnerDiskReplica(MetadataShardAccessorRW& shard,
+                                           ObjectMetadata& metadata,
+                                           const UUID& client_id);
     // Requires client_mutex_ and snapshot_mutex_ held exclusively.
     void ConfirmPendingRestoredSegmentsLocked(
         const std::vector<Segment>& segments, const UUID& client_id);

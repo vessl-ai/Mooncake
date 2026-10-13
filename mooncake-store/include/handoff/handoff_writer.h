@@ -35,6 +35,7 @@ struct HandoffWriteResult {
     uint64_t tail_ns{0};  // weight, quarantine, upstream files, manifest
     uint64_t total_ns{0};
     uint64_t chunks{0};
+    uint64_t local_disk_clients{0};
     std::string ToJson() const;
 };
 

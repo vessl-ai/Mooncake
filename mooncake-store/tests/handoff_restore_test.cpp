@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -25,16 +26,27 @@ namespace fs = std::filesystem;
 constexpr uint64_t kSegmentSize = 256ULL * 1024 * 1024;
 constexpr uint64_t kObjectSize = 64 * 1024;
 
-MasterServiceConfig MakeConfig(int64_t live_ttl_sec = 3600,
-                               int64_t suspicion_ttl_sec = 3600,
-                               BufferAllocatorType allocator =
-                                   BufferAllocatorType::OFFSET) {
+MasterServiceConfig MakeConfig(
+    int64_t live_ttl_sec = 3600, int64_t suspicion_ttl_sec = 3600,
+    BufferAllocatorType allocator = BufferAllocatorType::OFFSET) {
     return MasterServiceConfig::builder()
         .set_memory_allocator(allocator)
         .set_eviction_ratio(0.0)
         .set_eviction_high_watermark_ratio(1.0)
         .set_client_live_ttl_sec(live_ttl_sec)
         .set_client_suspicion_ttl_sec(suspicion_ttl_sec)
+        .build();
+}
+
+MasterServiceConfig MakeL4Config(int64_t live_ttl_sec = 3600,
+                                 int64_t suspicion_ttl_sec = 3600) {
+    return MasterServiceConfig::builder()
+        .set_memory_allocator(BufferAllocatorType::OFFSET)
+        .set_eviction_ratio(0.0)
+        .set_eviction_high_watermark_ratio(1.0)
+        .set_client_live_ttl_sec(live_ttl_sec)
+        .set_client_suspicion_ttl_sec(suspicion_ttl_sec)
+        .set_enable_offload(true)
         .build();
 }
 
@@ -85,9 +97,8 @@ class HandoffRestoreTest : public ::testing::Test {
                   int objects_per_store) {
         for (int s = 0; s < num_stores; ++s) {
             Store store{generate_uuid(), {MakeSegment(s)}};
-            ASSERT_TRUE(
-                service.MountSegment(store.segments[0], store.client_id)
-                    .has_value());
+            ASSERT_TRUE(service.MountSegment(store.segments[0], store.client_id)
+                            .has_value());
             stores_.push_back(store);
             for (int i = 0; i < objects_per_store; ++i) {
                 Put(service, store, Key(s, i));
@@ -100,9 +111,8 @@ class HandoffRestoreTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segment = store.segments[0].name;
-        auto started = service.PutStart(store.client_id, key,
-                                        TenantId::Default(), kObjectSize,
-                                        config);
+        auto started = service.PutStart(
+            store.client_id, key, TenantId::Default(), kObjectSize, config);
         EXPECT_TRUE(started.has_value()) << toString(started.error());
         if (!started) return {};
         if (end) {
@@ -138,6 +148,97 @@ class HandoffRestoreTest : public ::testing::Test {
             .has_value();
     }
 
+    // Registers the store's LocalSSD (L4) tier with the master.
+    static void EnableL4(MasterService& service, const Store& store,
+                         int64_t capacity = 1LL << 30) {
+        ASSERT_TRUE(
+            service.MountLocalDiskSegment(store.client_id, true).has_value());
+        ASSERT_TRUE(
+            service.ReportSsdCapacity(store.client_id, capacity).has_value());
+    }
+
+    static StorageObjectMetadata DiskMeta(const std::string& endpoint,
+                                          int64_t size = kObjectSize) {
+        StorageObjectMetadata meta;
+        meta.data_size = size;
+        meta.transport_endpoint = endpoint;
+        return meta;
+    }
+
+    // Takes up to `count` queued offload tasks of the store and reports them
+    // done (task-backed completions), as FileStorage::Heartbeat does.
+    static std::vector<std::string> Offload(MasterService& service,
+                                            const Store& store,
+                                            const std::string& endpoint,
+                                            size_t count) {
+        auto tasks = service.OffloadObjectHeartbeat(store.client_id, true);
+        EXPECT_TRUE(tasks.has_value());
+        if (!tasks) return {};
+        std::vector<OffloadTaskItem> done(
+            tasks->begin(), tasks->begin() + std::min(count, tasks->size()));
+        std::vector<StorageObjectMetadata> metas(done.size(),
+                                                 DiskMeta(endpoint));
+        EXPECT_TRUE(service.NotifyOffloadSuccess(store.client_id, done, metas)
+                        .has_value());
+        std::vector<std::string> keys;
+        for (const auto& task : done) keys.push_back(task.key);
+        return keys;
+    }
+
+    // A registration without an offload task (FileStorage rescan path).
+    static bool Register(MasterService& service, const UUID& client_id,
+                         const std::string& key, const std::string& endpoint,
+                         int64_t size = kObjectSize) {
+        std::vector<OffloadTaskItem> tasks{
+            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+        return service
+            .NotifyOffloadSuccess(client_id, tasks, {DiskMeta(endpoint, size)})
+            .has_value();
+    }
+
+    static std::vector<Replica::Descriptor> Replicas(MasterService& service,
+                                                     const std::string& key) {
+        auto r = service.GetReplicaList(key, TenantId::Default());
+        return r ? r->replicas : std::vector<Replica::Descriptor>{};
+    }
+
+    static bool HasDisk(MasterService& service, const std::string& key,
+                        const UUID& owner) {
+        for (const auto& d : Replicas(service, key)) {
+            if (d.is_local_disk_replica() &&
+                d.get_local_disk_descriptor().client_id == owner) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Old master with two stores: store 0 has L4 (20 offloaded objects, 10
+    // with a queued offload, 5 disk-only), store 1 is memory only (10).
+    void WriteL4Snapshot(const std::string& dir,
+                         HandoffWriteResult* out = nullptr) {
+        MasterService old_master(MakeL4Config());
+        for (int s = 0; s < 2; ++s) {
+            Store store{generate_uuid(), {MakeSegment(s)}};
+            ASSERT_TRUE(
+                old_master.MountSegment(store.segments[0], store.client_id)
+                    .has_value());
+            stores_.push_back(store);
+        }
+        EnableL4(old_master, stores_[0]);
+        for (int i = 0; i < 30; ++i) Put(old_master, stores_[0], Key(0, i));
+        for (int i = 0; i < 10; ++i) Put(old_master, stores_[1], Key(1, i));
+        // The heartbeat takes all 30 tasks; 20 complete, 10 are in flight.
+        offloaded_ = Offload(old_master, stores_[0], "disk-0", 20);
+        ASSERT_EQ(offloaded_.size(), 20u);
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_TRUE(Register(old_master, stores_[0].client_id,
+                                 "disk-only-" + std::to_string(i), "disk-0"));
+        }
+        auto written = Write(old_master, dir);
+        if (out) *out = written;
+    }
+
     static void ExpectEmpty(MasterService& service) {
         EXPECT_EQ(service.GetKeyCount(), 0u);
         EXPECT_EQ(service.HandoffPendingSegmentCount(), 0u);
@@ -154,6 +255,7 @@ class HandoffRestoreTest : public ::testing::Test {
     }
 
     std::vector<Store> stores_;
+    std::vector<std::string> offloaded_;
 };
 
 TEST_F(HandoffRestoreTest, RestoredObjectsAreGatedUntilOwnerRemounts) {
@@ -166,8 +268,8 @@ TEST_F(HandoffRestoreTest, RestoredObjectsAreGatedUntilOwnerRemounts) {
         for (int s = 0; s < 3; ++s) {
             used_before.push_back(Used(old_master, stores_[s].segments[0]));
             for (int i = 0; i < 200; ++i) {
-                auto r = old_master.GetReplicaList(Key(s, i),
-                                                   TenantId::Default());
+                auto r =
+                    old_master.GetReplicaList(Key(s, i), TenantId::Default());
                 ASSERT_TRUE(r.has_value());
                 before[Key(s, i)] = r->replicas.front();
             }
@@ -256,8 +358,8 @@ TEST_F(HandoffRestoreTest, InFlightPutIsExcludedAndItsRangeQuarantined) {
     }
     MasterService master(MakeConfig());
     ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
-    EXPECT_FALSE(master.GetReplicaList("in-flight", TenantId::Default())
-                     .has_value());
+    EXPECT_FALSE(
+        master.GetReplicaList("in-flight", TenantId::Default()).has_value());
     EXPECT_EQ(master.GetKeyCount(), 50u);
     EXPECT_EQ(master.HandoffQuarantineBufferCount(), 1u);
     // The quarantined range is still allocated.
@@ -269,9 +371,9 @@ TEST_F(HandoffRestoreTest, InFlightPutIsExcludedAndItsRangeQuarantined) {
     for (int i = 0; i < 1000; ++i) {
         ReplicateConfig config;
         config.replica_num = 1;
-        auto r = master.PutStart(stores_[0].client_id,
-                                 "fill-" + std::to_string(i),
-                                 TenantId::Default(), kObjectSize, config);
+        auto r =
+            master.PutStart(stores_[0].client_id, "fill-" + std::to_string(i),
+                            TenantId::Default(), kObjectSize, config);
         if (!r) break;
         const auto& b = r->front().get_memory_descriptor().buffer_descriptor;
         ASSERT_TRUE(b.buffer_address_ + b.size_ <= q.buffer_address_ ||
@@ -343,10 +445,10 @@ TEST_F(HandoffRestoreTest, OwnerRemountWithChangedIdentityDrops) {
         stores_[0].segments.push_back(MakeSegment(1));
         stores_[0].segments[1].name = stores_[0].segments[0].name;
         stores_[0].segments[1].te_endpoint = stores_[0].segments[0].te_endpoint;
-        ASSERT_TRUE(old_master
-                        .MountSegment(stores_[0].segments[1],
-                                      stores_[0].client_id)
-                        .has_value());
+        ASSERT_TRUE(
+            old_master
+                .MountSegment(stores_[0].segments[1], stores_[0].client_id)
+                .has_value());
         Write(old_master, dir.path());
     }
     {
@@ -403,14 +505,14 @@ TEST_F(HandoffRestoreTest, RemoveWhileGatedFreesTheRange) {
     MasterService master(MakeConfig());
     ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
     const uint64_t used = Used(master, stores_[0].segments[0]);
-    ASSERT_TRUE(master.Remove(Key(0, 0), TenantId::Default(), true)
-                    .has_value());
+    ASSERT_TRUE(
+        master.Remove(Key(0, 0), TenantId::Default(), true).has_value());
     EXPECT_LT(Used(master, stores_[0].segments[0]), used);
     ASSERT_TRUE(Remount(master, stores_[0]));
     EXPECT_EQ(master.GetKeyCount(), 9u);
 }
 
-TEST_F(HandoffRestoreTest, NonMemoryReplicasAreDropped) {
+TEST_F(HandoffRestoreTest, DiskReplicasOfUnregisteredOwnersAreDropped) {
     TempDir dir;
     {
         MasterService old_master(MakeConfig());
@@ -426,13 +528,16 @@ TEST_F(HandoffRestoreTest, NonMemoryReplicasAreDropped) {
             OffloadTaskItem{.tenant_id = "default",
                             .key = "disk-only",
                             .size = static_cast<int64_t>(kObjectSize)}};
-        ASSERT_TRUE(old_master
-                        .NotifyOffloadSuccess(stores_[0].client_id, tasks,
-                                              {disk, disk})
-                        .has_value());
+        ASSERT_TRUE(
+            old_master
+                .NotifyOffloadSuccess(stores_[0].client_id, tasks, {disk, disk})
+                .has_value());
         auto written = Write(old_master, dir.path());
+        // Offload is off, so the owner has no LocalSSD registration: its L4
+        // state is not exported (it would re-register on the new master).
         EXPECT_EQ(written.stats.objects, 2u);
-        EXPECT_EQ(written.stats.dropped_non_memory_replicas, 2u);
+        EXPECT_EQ(written.stats.dropped_local_disk_replicas, 2u);
+        EXPECT_EQ(written.stats.local_disk_replicas, 0u);
         EXPECT_EQ(written.stats.skipped_no_exportable_replica, 1u);
     }
     MasterService master(MakeConfig());
@@ -442,8 +547,8 @@ TEST_F(HandoffRestoreTest, NonMemoryReplicasAreDropped) {
     ASSERT_TRUE(r.has_value());
     ASSERT_EQ(r->replicas.size(), 1u);
     EXPECT_TRUE(r->replicas.front().is_memory_replica());
-    EXPECT_FALSE(master.GetReplicaList("disk-only", TenantId::Default())
-                     .has_value());
+    EXPECT_FALSE(
+        master.GetReplicaList("disk-only", TenantId::Default()).has_value());
 }
 
 TEST_F(HandoffRestoreTest, UnmountedSegmentIsNotExported) {
@@ -451,10 +556,10 @@ TEST_F(HandoffRestoreTest, UnmountedSegmentIsNotExported) {
     {
         MasterService old_master(MakeConfig());
         Populate(old_master, 2, 10);
-        ASSERT_TRUE(old_master
-                        .UnmountSegment(stores_[0].segments[0].id,
-                                        stores_[0].client_id)
-                        .has_value());
+        ASSERT_TRUE(
+            old_master
+                .UnmountSegment(stores_[0].segments[0].id, stores_[0].client_id)
+                .has_value());
         auto written = Write(old_master, dir.path());
         EXPECT_EQ(written.stats.quarantine_ranges, 0u);
     }
@@ -465,6 +570,300 @@ TEST_F(HandoffRestoreTest, UnmountedSegmentIsNotExported) {
     EXPECT_EQ(master.GetKeyCount(), 10u);
 }
 
+// ---- L4 (LOCAL_DISK) state.
+
+TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
+    TempDir dir;
+    HandoffWriteResult written;
+    WriteL4Snapshot(dir.path(), &written);
+    EXPECT_EQ(written.stats.objects, 45u);
+    EXPECT_EQ(written.stats.local_disk_replicas, 25u);
+    EXPECT_EQ(written.stats.disk_only_objects, 5u);
+    EXPECT_EQ(written.stats.offload_pins, 10u);
+    EXPECT_EQ(written.local_disk_clients, 1u);
+
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {3});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->schema, 2u);
+    EXPECT_EQ(restored->local_disk_clients, 1u);
+    EXPECT_EQ(restored->local_disk_replicas, 25u);
+    EXPECT_EQ(restored->disk_only_objects, 5u);
+    EXPECT_EQ(restored->offload_pins, 10u);
+    EXPECT_EQ(master.GetKeyCount(), 45u);
+    EXPECT_EQ(master.HandoffLocalDiskObjectCount(), 25u);
+    EXPECT_EQ(master.HandoffDiskClientsPending(), 1u);
+
+    // Gated: neither the disk-only object nor the disk copy is readable.
+    auto gated = master.GetReplicaList("disk-only-0", TenantId::Default());
+    ASSERT_FALSE(gated.has_value());
+    EXPECT_EQ(gated.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    // Another store's RPCs do not open store 0's gate. Store 1 had no L4
+    // registration: its heartbeat gets SEGMENT_NOT_FOUND (re-register as
+    // after a cold start).
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    auto other = master.OffloadObjectHeartbeat(stores_[1].client_id, true);
+    ASSERT_FALSE(other.has_value());
+    EXPECT_EQ(other.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_FALSE(Readable(master, "disk-only-0"));
+
+    // Store 0's next offload heartbeat succeeds (so FileStorage does not
+    // rescan) and returns no task: the old queue is not carried over.
+    auto heartbeat = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_TRUE(heartbeat.has_value()) << toString(heartbeat.error());
+    EXPECT_TRUE(heartbeat->empty());
+    EXPECT_EQ(master.HandoffDiskClientsPending(), 0u);
+    auto pending_remove_all = master.PollRemoveAll(stores_[0].client_id);
+    ASSERT_TRUE(pending_remove_all.has_value());
+    EXPECT_FALSE(*pending_remove_all);
+
+    // Disk-only objects are readable from the owner's disk.
+    auto disk_only = Replicas(master, "disk-only-0");
+    ASSERT_EQ(disk_only.size(), 1u);
+    ASSERT_TRUE(disk_only[0].is_local_disk_replica());
+    const auto& disk = disk_only[0].get_local_disk_descriptor();
+    EXPECT_EQ(disk.client_id, stores_[0].client_id);
+    EXPECT_EQ(disk.object_size, kObjectSize);
+    EXPECT_EQ(disk.transport_endpoint, "disk-0");
+    // An offloaded object: only its disk copy until the memory segment is
+    // confirmed, then both.
+    const std::string offloaded = offloaded_.front();
+    std::string in_flight;
+    for (int i = 0; i < 30 && in_flight.empty(); ++i) {
+        if (std::find(offloaded_.begin(), offloaded_.end(), Key(0, i)) ==
+            offloaded_.end()) {
+            in_flight = Key(0, i);
+        }
+    }
+    auto before_remount = Replicas(master, offloaded);
+    ASSERT_EQ(before_remount.size(), 1u);
+    EXPECT_TRUE(before_remount[0].is_local_disk_replica());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_EQ(Replicas(master, offloaded).size(), 2u);
+    // Objects whose offload was in flight: memory only, pinned.
+    EXPECT_EQ(Replicas(master, in_flight).size(), 1u);
+    EXPECT_EQ(master.HandoffOffloadPinCount(), 10u);
+    master.ReleaseExpiredHandoffQuarantine(std::chrono::steady_clock::now() +
+                                           std::chrono::hours(1));
+    EXPECT_EQ(master.HandoffOffloadPinCount(), 0u);
+
+    // New offload work flows normally after the restore.
+    Put(master, stores_[0], "after");
+    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 1u);
+    EXPECT_TRUE(HasDisk(master, "after", stores_[0].client_id));
+}
+
+TEST_F(HandoffRestoreTest, L4GateOpensOnPing) {
+    TempDir dir;
+    WriteL4Snapshot(dir.path());
+    MasterService master(MakeL4Config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    EXPECT_FALSE(Readable(master, "disk-only-1"));
+    ASSERT_TRUE(master.Ping(stores_[0].client_id).has_value());
+    EXPECT_TRUE(Readable(master, "disk-only-1"));
+}
+
+TEST_F(HandoffRestoreTest, L4OfStoreRestartedDuringTheRollIsNeverTrusted) {
+    TempDir dir;
+    WriteL4Snapshot(dir.path());
+    MasterService master(MakeL4Config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+
+    // New process at the same endpoint: the restored segment is dropped and
+    // so is the old process's L4 registration.
+    Store restarted{generate_uuid(), {stores_[0].segments[0]}};
+    restarted.segments[0].id = generate_uuid();
+    ASSERT_TRUE(master.MountSegment(restarted.segments[0], restarted.client_id)
+                    .has_value());
+    auto old_heartbeat =
+        master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_FALSE(old_heartbeat.has_value());
+    EXPECT_EQ(old_heartbeat.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    // The old entries stay unreadable, whatever the new process does.
+    EXPECT_FALSE(Readable(master, "disk-only-0"));
+    EXPECT_FALSE(HasDisk(master, offloaded_.front(), stores_[0].client_id));
+
+    // The new process registers its LocalSSD tier and re-registers its disk
+    // keys as after a cold start; nothing of the old process opens.
+    EnableL4(master, restarted);
+    ASSERT_TRUE(Register(master, restarted.client_id, "fresh-disk", "disk-0b"));
+    EXPECT_TRUE(HasDisk(master, "fresh-disk", restarted.client_id));
+    ASSERT_TRUE(
+        Register(master, restarted.client_id, "disk-only-1", "disk-0b"));
+    EXPECT_FALSE(HasDisk(master, "disk-only-1", stores_[0].client_id));
+    EXPECT_TRUE(HasDisk(master, "disk-only-1", restarted.client_id));
+    EXPECT_FALSE(Readable(master, "disk-only-2"));
+}
+
+TEST_F(HandoffRestoreTest, L4OfOwnerThatNeverReturnsExpires) {
+    TempDir dir;
+    WriteL4Snapshot(dir.path());
+    MasterService master(MakeL4Config(/*live=*/1, /*suspicion=*/1));
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+    ASSERT_TRUE(Remount(master, stores_[1]));
+    for (int i = 0; i < 80 && master.GetKeyCount() != 10; ++i) {
+        (void)master.Ping(stores_[1].client_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    EXPECT_EQ(master.GetKeyCount(), 10u);
+    EXPECT_EQ(master.HandoffLocalDiskObjectCount(), 0u);
+    EXPECT_FALSE(
+        master.OffloadObjectHeartbeat(stores_[0].client_id, true).has_value());
+}
+
+TEST_F(HandoffRestoreTest, PendingRemoveAllIsCarried) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeL4Config());
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        EnableL4(old_master, store);
+        Put(old_master, store, Key(0, 0));
+        ASSERT_EQ(Offload(old_master, store, "disk-0", 1).size(), 1u);
+        Put(old_master, store, Key(0, 1));
+        EXPECT_GT(old_master.RemoveAll(/*force=*/true), 0);
+        Put(old_master, store, Key(0, 2));
+        Write(old_master, dir.path());
+    }
+    MasterService master(MakeL4Config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    auto poll = master.PollRemoveAll(stores_[0].client_id);
+    ASSERT_TRUE(poll.has_value());
+    EXPECT_TRUE(*poll);
+}
+
+TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
+    TempDir dir;
+    WriteL4Snapshot(dir.path());
+    MasterService master(MakeConfig());  // --enable_offload=false
+    auto restored = master.RestoreFromHandoff(dir.path(), {2});
+    ASSERT_FALSE(restored.has_value());
+    EXPECT_NE(restored.error().find("offload is disabled"), std::string::npos)
+        << restored.error();
+    ExpectEmpty(master);
+}
+
+TEST_F(HandoffRestoreTest, Schema1SnapshotRestoresWithoutL4) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeConfig());
+        Populate(old_master, 1, 20);
+        Write(old_master, dir.path());
+    }
+    const std::string path = dir.path() + "/" + handoff::kHandoffManifestFile;
+    auto bytes = handoff::ReadFileBytes(path);
+    ASSERT_TRUE(bytes.has_value());
+    auto manifest = handoff::DecodeManifest(std::string_view(
+        reinterpret_cast<const char*>(bytes->data()), bytes->size()));
+    ASSERT_TRUE(manifest.has_value());
+    manifest->schema_version = 1;
+    manifest->codec.local_disk = 0;
+    manifest->codec.offload_pins = 0;
+    std::ofstream(path, std::ios::trunc) << handoff::EncodeManifest(*manifest);
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {1});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->schema, 1u);
+    EXPECT_EQ(restored->objects, 20u);
+    EXPECT_FALSE(
+        master.OffloadObjectHeartbeat(stores_[0].client_id, true).has_value());
+}
+
+TEST_F(HandoffRestoreTest, L4ColdStartOnBadL4State) {
+    auto expect_cold = [this](auto&& corrupt, const std::string& reason) {
+        TempDir dir;
+        stores_.clear();
+        WriteL4Snapshot(dir.path());
+        const std::string path =
+            dir.path() + "/" + handoff::kHandoffManifestFile;
+        auto bytes = handoff::ReadFileBytes(path);
+        ASSERT_TRUE(bytes.has_value());
+        auto manifest = handoff::DecodeManifest(std::string_view(
+            reinterpret_cast<const char*>(bytes->data()), bytes->size()));
+        ASSERT_TRUE(manifest.has_value());
+        corrupt(dir.path(), *manifest);
+        std::ofstream(path, std::ios::trunc)
+            << handoff::EncodeManifest(*manifest);
+        MasterService master(MakeL4Config());
+        auto restored = master.RestoreFromHandoff(dir.path(), {2});
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_NE(restored.error().find(reason), std::string::npos)
+            << restored.error();
+        ExpectEmpty(master);
+    };
+    // Local disk blob corrupted.
+    expect_cold(
+        [](const std::string& dir, handoff::Manifest& m) {
+            std::fstream f(dir + "/" + m.local_disk->key,
+                           std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp(static_cast<std::streamoff>(m.local_disk->bytes - 1));
+            f.put('\x7f');
+        },
+        "crc mismatch");
+    // An L4 client that owns no restored memory segment.
+    expect_cold(
+        [](const std::string& dir, handoff::Manifest& m) {
+            std::vector<LocalSsdHandoffClient> clients{
+                {generate_uuid(), true, 1, false}};
+            auto blob = handoff::EncodeLocalDiskClients(clients);
+            std::ofstream(dir + "/" + m.local_disk->key,
+                          std::ios::trunc | std::ios::binary)
+                .write(reinterpret_cast<const char*>(blob.data()),
+                       static_cast<std::streamsize>(blob.size()));
+            m.local_disk->bytes = blob.size();
+            m.local_disk->crc32c = Crc32cValue(blob.data(), blob.size());
+        },
+        "invalid L4 client entry");
+    // LOCAL_DISK replicas without any L4 owner.
+    expect_cold(
+        [](const std::string& dir, handoff::Manifest& m) {
+            auto blob = handoff::EncodeLocalDiskClients({});
+            std::ofstream(dir + "/" + m.local_disk->key,
+                          std::ios::trunc | std::ios::binary)
+                .write(reinterpret_cast<const char*>(blob.data()),
+                       static_cast<std::streamsize>(blob.size()));
+            m.local_disk->bytes = blob.size();
+            m.local_disk->crc32c = Crc32cValue(blob.data(), blob.size());
+            m.local_disk_clients = 0;
+        },
+        "without owners");
+    // Disk replica count in the manifest does not match the chunks.
+    expect_cold([](const std::string&,
+                   handoff::Manifest& m) { m.local_disk_replica_count += 1; },
+                "count mismatch");
+}
+
+TEST_F(HandoffRestoreTest, SizeMismatchedDiskReplicaIsNotExported) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeL4Config());
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        Put(old_master, store, Key(0, 0));
+        EnableL4(old_master, store);
+        // A disk replica whose size does not match the object (e.g. a stale
+        // file attached by an older master).
+        Replica stale(store.client_id, kObjectSize / 2, "disk-0",
+                      ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(old_master
+                        .AddReplica(store.client_id, Key(0, 0),
+                                    TenantId::Default(), stale)
+                        .has_value());
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.stats.dropped_local_disk_size_mismatch, 1u);
+        EXPECT_EQ(written.stats.local_disk_replicas, 0u);
+    }
+    MasterService master(MakeL4Config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_FALSE(HasDisk(master, Key(0, 0), stores_[0].client_id));
+}
+
 // ---- Corrupt or incompatible snapshots: cold start, never a crash.
 
 class HandoffColdStartTest : public HandoffRestoreTest {
@@ -473,11 +872,11 @@ class HandoffColdStartTest : public HandoffRestoreTest {
         MasterService old_master(MakeConfig());
         Populate(old_master, 2, 50);
         Write(old_master, dir_.path());
-        auto bytes = handoff::ReadFileBytes(Path(handoff::kHandoffManifestFile));
+        auto bytes =
+            handoff::ReadFileBytes(Path(handoff::kHandoffManifestFile));
         ASSERT_TRUE(bytes.has_value());
-        auto manifest = handoff::DecodeManifest(
-            std::string_view(reinterpret_cast<const char*>(bytes->data()),
-                             bytes->size()));
+        auto manifest = handoff::DecodeManifest(std::string_view(
+            reinterpret_cast<const char*>(bytes->data()), bytes->size()));
         ASSERT_TRUE(manifest.has_value()) << manifest.error();
         manifest_ = *manifest;
     }
@@ -488,9 +887,9 @@ class HandoffColdStartTest : public HandoffRestoreTest {
         std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc)
             << handoff::EncodeManifest(m);
     }
-    void ExpectColdStart(BufferAllocatorType allocator =
-                             BufferAllocatorType::OFFSET,
-                         const std::string& reason = "") {
+    void ExpectColdStart(
+        BufferAllocatorType allocator = BufferAllocatorType::OFFSET,
+        const std::string& reason = "") {
         MasterService master(MakeConfig(3600, 3600, allocator));
         auto restored = master.RestoreFromHandoff(dir_.path(), {2});
         ASSERT_FALSE(restored.has_value());
@@ -522,9 +921,8 @@ TEST_F(HandoffColdStartTest, CorruptManifestBody) {
 
 TEST_F(HandoffColdStartTest, UnknownSchemaVersion) {
     std::string text = handoff::EncodeManifest(manifest_);
-    text.replace(text.find(" 1 "), 3, " 9 ");
-    std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc)
-        << text;
+    text.replace(text.find(" 2 "), 3, " 9 ");
+    std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc) << text;
     ExpectColdStart();
 }
 
@@ -537,8 +935,8 @@ TEST_F(HandoffColdStartTest, CodecFingerprintMismatch) {
 TEST_F(HandoffColdStartTest, ChunkCrcMismatch) {
     for (const auto& chunk : manifest_.chunks) {
         if (chunk.objects == 0) continue;
-        std::fstream f(Path(chunk.key), std::ios::in | std::ios::out |
-                                            std::ios::binary);
+        std::fstream f(Path(chunk.key),
+                       std::ios::in | std::ios::out | std::ios::binary);
         f.seekp(static_cast<std::streamoff>(chunk.bytes / 2));
         f.put('\x5a');
         break;
@@ -575,7 +973,8 @@ TEST_F(HandoffColdStartTest, QuarantineOverlappingALiveRange) {
     ASSERT_TRUE(Remount(probe, stores_[0]));
     auto r = probe.GetReplicaList(Key(0, 7), TenantId::Default());
     ASSERT_TRUE(r.has_value());
-    const auto& b = r->replicas.front().get_memory_descriptor().buffer_descriptor;
+    const auto& b =
+        r->replicas.front().get_memory_descriptor().buffer_descriptor;
     uint32_t segment_index = 0;
     while (manifest_.segments[segment_index].te_endpoint !=
            b.transport_endpoint_) {

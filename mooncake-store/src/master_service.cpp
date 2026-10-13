@@ -962,8 +962,8 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
                 std::unique_lock<std::shared_mutex> snapshot_lock(
                     snapshot_mutex_);
                 for (const auto& segment_id : mismatched) {
-                    DropPendingRestoredSegmentLocked(segment_id,
-                                                     "conflicting_mount");
+                    DropPendingRestoredSegmentLocked(
+                        segment_id, "conflicting_mount", client_id);
                 }
             }
         }
@@ -1126,10 +1126,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             // stale before the normal validation sees them.
             for (const auto& segment_id :
                  FindHandoffMismatchesLocked(segments, client_id, true)) {
-                DropPendingRestoredSegmentLocked(segment_id,
-                                                 "remount_identity_mismatch");
+                DropPendingRestoredSegmentLocked(
+                    segment_id, "remount_identity_mismatch", client_id);
             }
         }
+        // Handoff restore: the owner process is alive, so its restored L4
+        // (LOCAL_DISK) replicas describe its own disk index.
+        OpenHandoffDiskGate(client_id);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -4343,7 +4346,12 @@ bool MasterService::TryGetReadableReplicaDescriptor(
         endpoint = descriptor.get_nof_descriptor()
                        .buffer_descriptor.transport_endpoint_;
     } else if (descriptor.is_local_disk_replica()) {
-        endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
+        const auto& disk = descriptor.get_local_disk_descriptor();
+        // Handoff restore: unreadable until the owner process shows up.
+        if (HandoffDiskGated(disk.client_id)) {
+            return false;
+        }
+        endpoint = disk.transport_endpoint;
     }
     if (endpoint && invalid_replica_endpoints_.contains(*endpoint)) {
         return false;
@@ -5489,6 +5497,9 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // A disk replica of an owner that is no longer registered (e.g. a store
+    // that restarted during a handoff roll) must not block this client's.
+    EraseUnregisteredOwnerDiskReplica(accessor.GetShard(), metadata, client_id);
 
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
@@ -8191,6 +8202,9 @@ auto MasterService::Ping(const UUID& client_id)
             LOG(INFO) << "client_id=" << client_id
                       << ", action=client_liveness_recovered, signal=ping";
         }
+        if (observation_accepted) {
+            OpenHandoffDiskGate(client_id);
+        }
     }
     const ClientStatus client_status =
         observation_accepted && ok_client_.contains(client_id)
@@ -8263,6 +8277,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
                   << ", action=client_liveness_recovered, "
                      "signal=local_disk_mount";
     }
+    OpenHandoffDiskGate(client_id);
 
     return {};
 }
@@ -8341,6 +8356,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                    << client_id;
         return tl::make_unexpected(pending.error());
     }
+    OpenHandoffDiskGate(client_id);
     if (enable_offloading) {
         return std::move(*pending);
     }
@@ -8512,6 +8528,13 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
 
+                    if (segment_mounted) {
+                        // A disk replica of an owner that is no longer
+                        // registered (e.g. restarted during a handoff roll)
+                        // must not block this client's copy.
+                        EraseUnregisteredOwnerDiskReplica(
+                            accessor.GetShard(), obj_metadata, client_id);
+                    }
                     if (!segment_mounted) {
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.

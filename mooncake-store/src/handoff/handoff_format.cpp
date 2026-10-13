@@ -34,8 +34,7 @@ Json::Value EncodeUuid(const UUID& id) {
 }
 
 bool DecodeUuid(const Json::Value& v, UUID& id) {
-    if (!v.isArray() || v.size() != 2 || !v[0].isUInt64() ||
-        !v[1].isUInt64()) {
+    if (!v.isArray() || v.size() != 2 || !v[0].isUInt64() || !v[1].isUInt64()) {
         return false;
     }
     id = {v[0].asUInt64(), v[1].asUInt64()};
@@ -104,11 +103,24 @@ SegmentIdentity SegmentIdentity::FromSegment(const Segment& segment,
 CodecFingerprint CurrentCodecFingerprint() {
     CodecFingerprint fp;
     fp.object_entry = struct_pack::get_type_code<StandbyObjectEntry>();
-    fp.segments =
-        struct_pack::get_type_code<std::vector<StandbySegmentInfo>>();
-    fp.quarantine =
-        struct_pack::get_type_code<std::vector<QuarantineRange>>();
+    fp.segments = struct_pack::get_type_code<std::vector<StandbySegmentInfo>>();
+    fp.quarantine = struct_pack::get_type_code<std::vector<QuarantineRange>>();
+    fp.local_disk =
+        struct_pack::get_type_code<std::vector<LocalSsdHandoffClient>>();
+    fp.offload_pins = struct_pack::get_type_code<std::vector<OffloadPin>>();
     return fp;
+}
+
+bool CodecMatches(const CodecFingerprint& fp, uint32_t schema) {
+    const CodecFingerprint current = CurrentCodecFingerprint();
+    if (fp.object_entry != current.object_entry ||
+        fp.segments != current.segments ||
+        fp.quarantine != current.quarantine) {
+        return false;
+    }
+    if (schema < 2) return true;
+    return fp.local_disk == current.local_disk &&
+           fp.offload_pins == current.offload_pins;
 }
 
 SegmentLocator::SegmentLocator(const std::vector<SegmentIdentity>& segments)
@@ -182,6 +194,8 @@ std::string EncodeManifest(const Manifest& m) {
     codec["object_entry"] = Json::UInt(m.codec.object_entry);
     codec["segments"] = Json::UInt(m.codec.segments);
     codec["quarantine"] = Json::UInt(m.codec.quarantine);
+    codec["local_disk"] = Json::UInt(m.codec.local_disk);
+    codec["offload_pins"] = Json::UInt(m.codec.offload_pins);
     root["codec"] = codec;
     root["memory_allocator"] = m.memory_allocator;
     root["multi_tenant"] = m.multi_tenant;
@@ -218,6 +232,13 @@ std::string EncodeManifest(const Manifest& m) {
     }
     root["quarantine"] = EncodeBlob(m.quarantine);
     root["quarantine_ranges"] = Json::UInt64(m.quarantine_ranges);
+    root["enable_offload"] = m.enable_offload;
+    root["local_disk_replica_count"] = Json::UInt64(m.local_disk_replica_count);
+    root["disk_only_object_count"] = Json::UInt64(m.disk_only_object_count);
+    if (m.local_disk) root["local_disk"] = EncodeBlob(*m.local_disk);
+    root["local_disk_clients"] = Json::UInt64(m.local_disk_clients);
+    if (m.offload_pins) root["offload_pins"] = EncodeBlob(*m.offload_pins);
+    root["offload_pin_count"] = Json::UInt64(m.offload_pin_count);
     Json::Value w(Json::objectValue);
     w["objects"] = Json::UInt64(m.writer.objects);
     w["replicas"] = Json::UInt64(m.writer.replicas);
@@ -232,6 +253,13 @@ std::string EncodeManifest(const Manifest& m) {
         Json::UInt64(m.writer.dropped_unknown_segment_replicas);
     w["quarantine_ranges"] = Json::UInt64(m.writer.quarantine_ranges);
     w["quarantine_bytes"] = Json::UInt64(m.writer.quarantine_bytes);
+    w["local_disk_replicas"] = Json::UInt64(m.writer.local_disk_replicas);
+    w["disk_only_objects"] = Json::UInt64(m.writer.disk_only_objects);
+    w["dropped_local_disk_replicas"] =
+        Json::UInt64(m.writer.dropped_local_disk_replicas);
+    w["dropped_local_disk_size_mismatch"] =
+        Json::UInt64(m.writer.dropped_local_disk_size_mismatch);
+    w["offload_pins"] = Json::UInt64(m.writer.offload_pins);
     w["total_bytes"] = Json::UInt64(m.writer.total_bytes);
     w["workers"] = Json::UInt64(m.writer.workers);
     w["duration_ms"] = Json::UInt64(m.writer.duration_ms);
@@ -242,9 +270,9 @@ std::string EncodeManifest(const Manifest& m) {
     builder["indentation"] = " ";
     const std::string body = Json::writeString(builder, root);
     const uint32_t crc = Crc32cValue(body.data(), body.size());
-    return std::string(kMagic) + " " + std::to_string(kHandoffSchemaVersion) +
-           " " + std::to_string(crc) + " " + std::to_string(body.size()) +
-           "\n" + body;
+    return std::string(kMagic) + " " + std::to_string(m.schema_version) + " " +
+           std::to_string(crc) + " " + std::to_string(body.size()) + "\n" +
+           body;
 }
 
 tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
@@ -259,8 +287,8 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
     size_t pos = 0;
     while (pos <= header.size()) {
         const size_t space = header.find(' ', pos);
-        const size_t end = space == std::string_view::npos ? header.size()
-                                                           : space;
+        const size_t end =
+            space == std::string_view::npos ? header.size() : space;
         parts.push_back(header.substr(pos, end - pos));
         pos = end + 1;
     }
@@ -276,7 +304,7 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
         !parse(parts[3], size)) {
         return tl::make_unexpected("manifest header malformed");
     }
-    if (schema != kHandoffSchemaVersion) {
+    if (schema < kHandoffMinSchemaVersion || schema > kHandoffSchemaVersion) {
         return tl::make_unexpected("unsupported handoff schema " +
                                    std::to_string(schema));
     }
@@ -305,7 +333,7 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
     if (!GetStr(root, "format", m.format) || m.format != kHandoffFormat) {
         return tl::make_unexpected("manifest format mismatch");
     }
-    if (!GetU64(root, "schema_version", u) || u != kHandoffSchemaVersion) {
+    if (!GetU64(root, "schema_version", u) || u != schema) {
         return tl::make_unexpected("manifest schema mismatch");
     }
     m.schema_version = static_cast<uint32_t>(u);
@@ -328,6 +356,27 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
     m.codec.object_entry = codec["object_entry"].asUInt();
     m.codec.segments = codec["segments"].asUInt();
     m.codec.quarantine = codec["quarantine"].asUInt();
+    if (m.schema_version >= 2) {
+        if (!codec["local_disk"].isUInt() || !codec["offload_pins"].isUInt() ||
+            !root["enable_offload"].isBool() ||
+            !GetU64(root, "local_disk_replica_count",
+                    m.local_disk_replica_count) ||
+            !GetU64(root, "disk_only_object_count", m.disk_only_object_count) ||
+            !GetU64(root, "local_disk_clients", m.local_disk_clients) ||
+            !GetU64(root, "offload_pin_count", m.offload_pin_count)) {
+            return tl::make_unexpected("manifest L4 field missing or mistyped");
+        }
+        m.codec.local_disk = codec["local_disk"].asUInt();
+        m.codec.offload_pins = codec["offload_pins"].asUInt();
+        m.enable_offload = root["enable_offload"].asBool();
+        BlobInfo local_disk, pins;
+        if (!DecodeBlob(root["local_disk"], local_disk) ||
+            !DecodeBlob(root["offload_pins"], pins)) {
+            return tl::make_unexpected("manifest L4 blob entry invalid");
+        }
+        m.local_disk = std::move(local_disk);
+        m.offload_pins = std::move(pins);
+    }
     m.multi_tenant = root["multi_tenant"].asBool();
     for (const auto& v : root["segments"]) {
         SegmentIdentity s;
@@ -374,6 +423,13 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
                m.writer.dropped_unknown_segment_replicas);
         GetU64(w, "quarantine_ranges", m.writer.quarantine_ranges);
         GetU64(w, "quarantine_bytes", m.writer.quarantine_bytes);
+        GetU64(w, "local_disk_replicas", m.writer.local_disk_replicas);
+        GetU64(w, "disk_only_objects", m.writer.disk_only_objects);
+        GetU64(w, "dropped_local_disk_replicas",
+               m.writer.dropped_local_disk_replicas);
+        GetU64(w, "dropped_local_disk_size_mismatch",
+               m.writer.dropped_local_disk_size_mismatch);
+        GetU64(w, "offload_pins", m.writer.offload_pins);
         GetU64(w, "total_bytes", m.writer.total_bytes);
         GetU64(w, "workers", m.writer.workers);
         GetU64(w, "duration_ms", m.writer.duration_ms);
@@ -401,6 +457,33 @@ tl::expected<std::vector<QuarantineRange>, std::string> DecodeQuarantine(
     return ranges;
 }
 
+std::vector<uint8_t> EncodeLocalDiskClients(
+    const std::vector<LocalSsdHandoffClient>& clients) {
+    return struct_pack::serialize<std::vector<uint8_t>>(clients);
+}
+
+tl::expected<std::vector<LocalSsdHandoffClient>, std::string>
+DecodeLocalDiskClients(const std::vector<uint8_t>& bytes) {
+    std::vector<LocalSsdHandoffClient> clients;
+    if (struct_pack::deserialize_to(clients, bytes) != struct_pack::errc::ok) {
+        return tl::make_unexpected("local disk clients decode failed");
+    }
+    return clients;
+}
+
+std::vector<uint8_t> EncodeOffloadPins(const std::vector<OffloadPin>& pins) {
+    return struct_pack::serialize<std::vector<uint8_t>>(pins);
+}
+
+tl::expected<std::vector<OffloadPin>, std::string> DecodeOffloadPins(
+    const std::vector<uint8_t>& bytes) {
+    std::vector<OffloadPin> pins;
+    if (struct_pack::deserialize_to(pins, bytes) != struct_pack::errc::ok) {
+        return tl::make_unexpected("offload pins decode failed");
+    }
+    return pins;
+}
+
 tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
     const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -408,7 +491,7 @@ tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
         return tl::make_unexpected("open " + path + ": " +
                                    std::strerror(errno));
     }
-    struct stat st {};
+    struct stat st{};
     if (::fstat(fd, &st) != 0) {
         const std::string err = std::strerror(errno);
         ::close(fd);
@@ -420,7 +503,8 @@ tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
         const ssize_t n = ::read(fd, data.data() + done, data.size() - done);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
-            const std::string err = n == 0 ? "short read" : std::strerror(errno);
+            const std::string err =
+                n == 0 ? "short read" : std::strerror(errno);
             ::close(fd);
             return tl::make_unexpected("read " + path + ": " + err);
         }
