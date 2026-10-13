@@ -8460,7 +8460,7 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
 
 void MasterService::HoldOffloadTakesAfterColdStart() {
     const auto until =
-        std::chrono::system_clock::now() + put_start_release_timeout_sec_;
+        std::chrono::steady_clock::now() + put_start_release_timeout_sec_;
     offload_take_hold_until_.store(until.time_since_epoch().count(),
                                    std::memory_order_relaxed);
     LOG(INFO) << "offload_take_hold=cold_start, seconds="
@@ -8468,10 +8468,10 @@ void MasterService::HoldOffloadTakesAfterColdStart() {
 }
 
 uint64_t MasterService::HandoffOffloadTakeHoldMs() const {
-    const auto until = std::chrono::system_clock::time_point(
-        std::chrono::system_clock::duration(
+    const auto until = std::chrono::steady_clock::time_point(
+        std::chrono::steady_clock::duration(
             offload_take_hold_until_.load(std::memory_order_relaxed)));
-    const auto now = std::chrono::system_clock::now();
+    const auto now = std::chrono::steady_clock::now();
     if (until <= now) {
         return 0;
     }

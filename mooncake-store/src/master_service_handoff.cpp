@@ -1130,8 +1130,9 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         // The old master was still in its cold-start hold: no take of any
         // key for what is left of it (counted from now, the gap only adds).
         if (manifest->offload_take_hold_ms > 0) {
-            const auto until = takes_now + std::chrono::milliseconds(
-                                               manifest->offload_take_hold_ms);
+            const auto until =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(manifest->offload_take_hold_ms);
             offload_take_hold_until_.store(until.time_since_epoch().count(),
                                            std::memory_order_relaxed);
             LOG(INFO) << "offload_take_hold=restored, ms="

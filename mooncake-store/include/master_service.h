@@ -1021,7 +1021,7 @@ class MasterService {
     // What is left of the cold-start hold, for the handoff (0: none).
     uint64_t HandoffOffloadTakeHoldMs() const;
     bool OffloadTakesHeld() const {
-        return std::chrono::system_clock::now().time_since_epoch().count() <
+        return std::chrono::steady_clock::now().time_since_epoch().count() <
                offload_take_hold_until_.load(std::memory_order_relaxed);
     }
     // Releases quarantined ranges whose deadline has passed. Called by the
@@ -2726,8 +2726,11 @@ class MasterService {
             opened;
     };
     HandoffDiskGate handoff_disk_gate_;
-    // system_clock ticks until which no store may take an offload task
-    // (HoldOffloadTakesAfterColdStart); 0 = no hold.
+    // steady_clock ticks until which no store may take an offload task
+    // (HoldOffloadTakesAfterColdStart); 0 = no hold. steady_clock, so a wall
+    // clock step (e.g. NTP right after a node reboot, when cold starts
+    // happen) cannot shorten the hold; it leaves the process only as a
+    // relative duration (HandoffOffloadTakeHoldMs).
     std::atomic<int64_t> offload_take_hold_until_{0};
     std::atomic<uint64_t> handoff_restored_offload_takes_{0};
     int64_t handoff_restored_file_capacity_{0};
