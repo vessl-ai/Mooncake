@@ -213,7 +213,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     report.restore_needed = RestoreNeedBytes(
         {report.objects, report.local_disk_objects, report.disk_only_objects},
         options.restore_cost);
-    if (report.restore_needed > in.memory.limit) {
+    if (report.restore_needed > RestoreBudgetBytes(in.memory.limit)) {
         if (auto reset = ResetHandoffDir(options.root); !reset) {
             LOG(ERROR) << "handoff: cannot remove the unpublished snapshot: "
                        << reset.error();
@@ -221,7 +221,8 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
         return finish("skipped_restore_memory",
                       "exact restore need " +
                           std::to_string(report.restore_needed) +
-                          " > memory limit " + std::to_string(in.memory.limit));
+                          " > restore budget " +
+                          std::to_string(RestoreBudgetBytes(in.memory.limit)));
     }
 
     // 7. Publish unless another master started serving meanwhile.
@@ -256,20 +257,20 @@ std::string StartupReport::ToJson() const {
       << ",\"segments\":" << segments
       << ",\"local_disk_replicas\":" << local_disk_replicas
       << ",\"age_ms\":" << age_ms << ",\"claim_ns\":" << claim_ns
-      << ",\"restore_ns\":" << restore_ns << ",\"total_ns\":" << total_ns
       << ",\"attempts\":" << attempts
       << ",\"serve\":" << (serve ? "true" : "false")
+      << ",\"restore_ns\":" << restore_ns << ",\"total_ns\":" << total_ns
       << ",\"restore\":" << RawOrNull(restore) << "}";
     return o.str();
 }
 
-StartupReport RunHandoffStartup(const StartupSteps& steps,
 std::chrono::milliseconds RetryBackoff(int attempt) {
     int64_t ms = 1000;
     for (int i = 1; i < attempt && ms < 10000; ++i) ms *= 2;
     return std::chrono::milliseconds(std::min<int64_t>(ms, 10000));
 }
 
+StartupReport RunHandoffStartup(const StartupSteps& steps,
                                 const StartupOptions& options) {
     const auto start = SteadyClock::now();
     StartupReport report;
@@ -281,12 +282,12 @@ std::chrono::milliseconds RetryBackoff(int attempt) {
                   << ", report=" << report.ToJson();
         return report;
     };
-    if (!options.owner) {
     const auto wait_retry = [&steps](int attempt) {
         if (steps.wait_retry) return steps.wait_retry(attempt);
         std::this_thread::sleep_for(RetryBackoff(attempt));
         return true;
     };
+    if (!options.owner) {
         // Make sure a snapshot written by the lock owner after we started
         // serving is never restored: do not serve before POISON is durable.
         for (int attempt = 1;; ++attempt) {

@@ -110,8 +110,15 @@ tl::expected<MemorySnapshot, std::string> ReadMemorySnapshot(
     bool found = false;
     const uint64_t mem_total =
         ReadKeyedValue(paths.meminfo, "MemTotal", 1024, &found);
+    bool available_found = false;
     const uint64_t mem_available =
-        ReadKeyedValue(paths.meminfo, "MemAvailable", 1024, &found);
+        ReadKeyedValue(paths.meminfo, "MemAvailable", 1024, &available_found);
+    // Without a container limit the node's free memory is the real bound,
+    // not MemTotal: other processes on the node use the rest.
+    const auto unlimited_limit = [&](uint64_t current) {
+        if (!available_found || mem_total == 0) return mem_total;
+        return std::min(mem_total, current + mem_available);
+    };
 
     uint64_t max_value = 0;
     bool max_unlimited = false;
@@ -132,7 +139,7 @@ tl::expected<MemorySnapshot, std::string> ReadMemorySnapshot(
             return tl::make_unexpected("unreadable " + paths.memory_current);
         }
         snap.limited = limit != std::numeric_limits<uint64_t>::max();
-        snap.limit = snap.limited ? limit : mem_total;
+        snap.limit = snap.limited ? limit : unlimited_limit(snap.current);
         snap.anon = ReadKeyedValue(paths.memory_stat, "anon", 1, &found);
         snap.file = ReadKeyedValue(paths.memory_stat, "file", 1, &found);
         snap.file_dirty =
@@ -149,7 +156,7 @@ tl::expected<MemorySnapshot, std::string> ReadMemorySnapshot(
         }
         // v1 reports a huge page-aligned number when unlimited.
         snap.limited = !max_unlimited && mem_total > 0 && max_value < mem_total;
-        snap.limit = snap.limited ? max_value : mem_total;
+        snap.limit = snap.limited ? max_value : unlimited_limit(snap.current);
     } else if (mem_total > 0) {
         snap.source = "meminfo";
         snap.limit = mem_total;
@@ -202,6 +209,10 @@ uint64_t AdmissionSafetyBytes(uint64_t limit) {
         static_cast<uint64_t>(static_cast<double>(limit) * kSafetyFraction));
 }
 
+uint64_t RestoreBudgetBytes(uint64_t limit) {
+    return SaturatingSub(limit, AdmissionSafetyBytes(limit));
+}
+
 std::string ShutdownAdmission::ToJson() const {
     std::ostringstream o;
     o << "{\"admit\":" << (admit ? "true" : "false")
@@ -245,7 +256,7 @@ ShutdownAdmission DecideShutdownAdmission(const ShutdownAdmissionInput& in) {
         out.reason = "disk_space";
         return out;
     }
-    if (out.restore_needed > in.memory.limit) {
+    if (out.restore_needed > RestoreBudgetBytes(in.memory.limit)) {
         // The next master could not restore it (with its L4 state) even in
         // the cheapest case; do not spend the shutdown on a snapshot that
         // would be discarded.

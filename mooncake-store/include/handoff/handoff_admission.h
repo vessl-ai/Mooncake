@@ -86,6 +86,12 @@ size_t AvailableCpus(const CgroupPaths& paths);
 uint64_t FreeDiskBytes(const std::string& path);
 
 uint64_t AdmissionSafetyBytes(uint64_t limit);
+// What the next master can spend on a restore: the limit minus the startup
+// admission's view of a fresh process (memory.current of an empty master),
+// approximated by the safety term. The shutdown admission compares the
+// predicted restore need against this, so a snapshot it writes is not
+// refused at startup for lack of headroom.
+uint64_t RestoreBudgetBytes(uint64_t limit);
 
 // Restore memory model. Defaults: measured VmHWM per item (incl. the empty
 // master) at 25M / 32M memory objects, case O (24M extra disk replicas) and
