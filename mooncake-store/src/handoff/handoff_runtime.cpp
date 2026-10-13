@@ -126,10 +126,14 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     auto t = SteadyClock::now();
     steps.stop_serving();
     report.stop_ns = NsSince(t);
+    LOG(INFO) << "handoff_shutdown=serving_stopped, stop_ms="
+              << report.stop_ns / 1000000;
     // 2. No background thread mutates metadata or allocators from here on.
     t = SteadyClock::now();
     steps.quiesce();
     report.quiesce_ns = NsSince(t);
+    LOG(INFO) << "handoff_shutdown=quiesced, quiesce_ms="
+              << report.quiesce_ns / 1000000;
 
     if (!options.owner) {
         return finish("skipped_not_owner", "handoff dir lock not held");

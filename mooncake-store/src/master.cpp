@@ -2044,6 +2044,15 @@ int main(int argc, char* argv[]) {
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
+        const bool handoff_on_shutdown =
+            handoff.enabled && FLAGS_handoff_snapshot;
+        if (shutdown_requested.load() && handoff_on_shutdown) {
+            // SIGTERM arrived during the restore: never start serving.
+            RunHandoffShutdownAndExit(
+                handoff, [&]() { admin_server.Stop(); },
+                *wrapped_master_service);
+        }
+
         std::unique_ptr<coro_rpc::coro_rpc_server> heartbeat_server;
         if (master_config.heartbeat_rpc_port != 0) {
             heartbeat_server = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -2076,8 +2085,7 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        if (shutdown_requested.load() && handoff.enabled &&
-            FLAGS_handoff_snapshot) {
+        if (shutdown_requested.load() && handoff_on_shutdown) {
             // Does not return. coro_rpc_server::stop() closes the acceptor
             // and connections and joins the io threads that run the
             // (synchronous) handlers; MasterAdminServer::Stop() does the
@@ -2086,7 +2094,21 @@ int main(int argc, char* argv[]) {
                 handoff,
                 [&]() {
                     server.stop();
-                    server_thread.join();
+                    LOG(INFO) << "handoff: RPC server stopped";
+                    // If stop() raced with the start-up of the accept loop,
+                    // start() may never return although no io thread is
+                    // left to run a handler. Do not wait for it forever.
+                    for (int i = 0; i < 200 && !server_done.load(); ++i) {
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(10));
+                    }
+                    if (server_done.load()) {
+                        server_thread.join();
+                    } else {
+                        LOG(WARNING) << "handoff: RPC server start() did not "
+                                        "return after stop(); detaching it";
+                        server_thread.detach();
+                    }
                     // The heartbeat server (upstream #4183 carry) runs Ping
                     // handlers that touch liveness records; stop it too.
                     if (heartbeat_server) {
