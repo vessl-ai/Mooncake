@@ -8370,8 +8370,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
     OpenHandoffDiskGate(client_id);
     if (enable_offloading) {
-        RecordOffloadTakers(client_id, *pending);
-        return std::move(*pending);
+        return RecordOffloadTakers(client_id, *pending);
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
     // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
@@ -8387,16 +8386,26 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             auto task_it =
                 tenant_state.offloading_tasks.find(object_id.user_key);
             if (task_it != tenant_state.offloading_tasks.end()) {
+                // No reporter: this client may also have taken the task in
+                // an earlier drain and still report it.
                 ReleaseOffloadingTask(tenant_state, &accessor.Get(), task_it,
-                                      client_id);
+                                      std::nullopt);
             }
         }
     }
     return std::vector<OffloadTaskItem>{};
 }
 
-void MasterService::RecordOffloadTakers(
+std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
     const UUID& client_id, const std::vector<OffloadTaskItem>& drained) {
+    // A store copies and reports every item it gets, and a report carries
+    // only the key. An item is therefore handed out only if this drain makes
+    // the client a taker of the key's current task: the master then tracks
+    // the copy until its report (or a stale take) ends it. Any other item
+    // (no object, no task, not a mirror, a stale take, or a task this client
+    // already took) is dropped here, so no copy exists that the master does
+    // not track.
+    std::vector<OffloadTaskItem> taken;
     const auto now = std::chrono::system_clock::now();
     for (const auto& item : drained) {
         const TenantId item_tenant = enable_multi_tenants_
@@ -8437,8 +8446,10 @@ void MasterService::RecordOffloadTakers(
         if (std::find(task.takers.begin(), task.takers.end(), client_id) ==
             task.takers.end()) {
             task.takers.push_back(client_id);
+            taken.push_back(item);
         }
     }
+    return taken;
 }
 
 void MasterService::ReleaseOffloadingTask(
@@ -11459,6 +11470,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
+        // Already queued for offload (its source replica is pinned): never
+        // push a second item, which would pin another replica that no task
+        // releases.
+        if (tenant_state.offloading_tasks.contains(key)) {
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
@@ -11779,6 +11797,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // LOCAL_DISK replica already exists — safe to delete MEMORY immediately
         if (has_local_disk_replica(metadata)) {
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
+        // Already queued for offload (its source replica is pinned): never
+        // push a second item, which would pin another replica that no task
+        // releases.
+        if (tenant_state.offloading_tasks.contains(key)) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 

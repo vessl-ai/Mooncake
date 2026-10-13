@@ -726,9 +726,12 @@ TEST_F(MasterServiceSSDTest, CompletionOvertakenByItsNackIsRefused) {
     ASSERT_TRUE(
         service->Remove("nack_key", TenantId::Default(), true).has_value());
     PutMemoryObject(*service, client_id, "nack_key", 4096);
+    // The NACK left a stale take: the store does not take the new task, and
+    // the item is not even handed out (an untracked copy would send a report
+    // the master could not tell apart from a later take's).
     auto second = service->OffloadObjectHeartbeat(client_id, true);
     ASSERT_TRUE(second.has_value());
-    ASSERT_EQ(second->size(), 1u);
+    EXPECT_TRUE(second->empty());
 
     StorageObjectMetadata file;
     file.data_size = 4096;

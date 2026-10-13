@@ -1711,9 +1711,10 @@ class MasterService {
                              const std::string& key, const UUID& client_id,
                              std::chrono::system_clock::time_point now) const;
     // Marks `client_id` as a taker of the current offload task of each key
-    // it has just drained (OffloadObjectHeartbeat).
-    void RecordOffloadTakers(const UUID& client_id,
-                             const std::vector<OffloadTaskItem>& drained);
+    // it has just drained (OffloadObjectHeartbeat) and returns the items it
+    // took; only those are handed to the store.
+    std::vector<OffloadTaskItem> RecordOffloadTakers(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& drained);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
