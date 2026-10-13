@@ -631,6 +631,7 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
         quarantined_buffers(nseg);
     std::vector<uint64_t> sort_ns(nseg, 0), import_ns(nseg, 0);
+    std::vector<uint64_t> swapped(nseg, 0);
     ParallelFor(nseg, std::min(workers, nseg), [&](size_t si, size_t) {
         auto t = SteadyClock::now();
         size_t total = quarantine_by_segment[si].size();
@@ -675,7 +676,9 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                     return;
                 }
                 bind(*buffer);
-                if (!replica->replace_memory_buffer(std::move(buffer))) {
+                if (replica->replace_memory_buffer(std::move(buffer))) {
+                    ++swapped[si];
+                } else {
                     swap_failed = true;
                 }
             });
@@ -696,13 +699,13 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
 
     // ---- Phase 3: finalize.
     phase_start = SteadyClock::now();
-    // All placeholders have been replaced; nothing references them anymore.
-    for (auto& placeholder : placeholders) {
-        if (placeholder.use_count() != 1) {
-            return tl::make_unexpected("placeholder buffer still referenced");
-        }
-        placeholder.reset();
+    // Every placeholder buffer must have been replaced by an imported one.
+    uint64_t total_swapped = 0;
+    for (const uint64_t n : swapped) total_swapped += n;
+    if (total_swapped != stats.replicas) {
+        return tl::make_unexpected("not every restored replica was rebound");
     }
+    placeholders.clear();
     {
         const ReplicaID desired_next_id =
             static_cast<ReplicaID>(manifest->next_replica_id);

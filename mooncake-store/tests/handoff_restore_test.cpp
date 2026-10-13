@@ -489,10 +489,15 @@ class HandoffColdStartTest : public HandoffRestoreTest {
             << handoff::EncodeManifest(m);
     }
     void ExpectColdStart(BufferAllocatorType allocator =
-                             BufferAllocatorType::OFFSET) {
+                             BufferAllocatorType::OFFSET,
+                         const std::string& reason = "") {
         MasterService master(MakeConfig(3600, 3600, allocator));
         auto restored = master.RestoreFromHandoff(dir_.path(), {2});
-        EXPECT_FALSE(restored.has_value());
+        ASSERT_FALSE(restored.has_value());
+        if (!reason.empty()) {
+            EXPECT_NE(restored.error().find(reason), std::string::npos)
+                << restored.error();
+        }
         if (allocator == BufferAllocatorType::OFFSET) {
             ExpectEmpty(master);
         }
@@ -571,8 +576,13 @@ TEST_F(HandoffColdStartTest, QuarantineOverlappingALiveRange) {
     auto r = probe.GetReplicaList(Key(0, 7), TenantId::Default());
     ASSERT_TRUE(r.has_value());
     const auto& b = r->replicas.front().get_memory_descriptor().buffer_descriptor;
+    uint32_t segment_index = 0;
+    while (manifest_.segments[segment_index].te_endpoint !=
+           b.transport_endpoint_) {
+        ++segment_index;
+    }
     std::vector<handoff::QuarantineRange> ranges{
-        {0, b.buffer_address_, b.size_}};
+        {segment_index, b.buffer_address_, b.size_}};
     const auto bytes = handoff::EncodeQuarantine(ranges);
     std::ofstream(Path(handoff::kHandoffQuarantineFile),
                   std::ios::trunc | std::ios::binary)
@@ -581,7 +591,7 @@ TEST_F(HandoffColdStartTest, QuarantineOverlappingALiveRange) {
     manifest_.quarantine.crc32c = Crc32cValue(bytes.data(), bytes.size());
     manifest_.quarantine_ranges = 1;
     WriteManifest(manifest_);
-    ExpectColdStart();
+    ExpectColdStart(BufferAllocatorType::OFFSET, "overlapping ranges");
 }
 
 TEST_F(HandoffColdStartTest, AllocatorTypeMismatch) {
