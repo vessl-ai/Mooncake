@@ -1647,7 +1647,9 @@ TEST_F(HandoffRestoreTest, OffloadTakesOfTheOldMasterBlockReTakes) {
     };
     for (int i = 1; i < 4; ++i) re_put(i);
     Put(master, stores_[0], Key(0, 4));
-    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 4u);
+    // Only key 4's item is handed out; the others are dropped on the master.
+    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10),
+              std::vector<std::string>{Key(0, 4)});
     for (int i = 1; i < 4; ++i) {
         EXPECT_FALSE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
     }
