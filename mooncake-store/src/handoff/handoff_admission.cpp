@@ -229,9 +229,8 @@ ShutdownAdmission DecideShutdownAdmission(const ShutdownAdmissionInput& in) {
         static_cast<double>(in.objects * kDiskBytesPerObject +
                             in.local_disk_objects * kDiskBytesPerDiskReplica +
                             kDiskFixedBytes));
-    out.restore_needed = RestoreNeedBytes(
-        in.memory.limit, in.objects, in.restore_bytes_per_object,
-        in.local_disk_objects, in.restore_bytes_per_disk_replica);
+    out.restore_needed = RestoreNeedLowerBound(
+        in.objects, in.local_disk_objects, in.restore_cost);
 
     const uint64_t budget = SaturatingSub(out.headroom, out.safety + out.base);
     const uint64_t fit = budget / out.per_worker;
@@ -247,8 +246,9 @@ ShutdownAdmission DecideShutdownAdmission(const ShutdownAdmissionInput& in) {
         return out;
     }
     if (out.restore_needed > in.memory.limit) {
-        // The next master could not restore it (with its L4 state); do not
-        // spend the shutdown on a snapshot that would be discarded.
+        // The next master could not restore it (with its L4 state) even in
+        // the cheapest case; do not spend the shutdown on a snapshot that
+        // would be discarded.
         out.workers = 0;
         out.reason = "restore_memory";
         return out;
@@ -264,22 +264,43 @@ std::string RestoreAdmission::ToJson() const {
     return o.str();
 }
 
-uint64_t RestoreNeedBytes(uint64_t limit, uint64_t objects,
-                          uint64_t bytes_per_object, uint64_t disk_replicas,
-                          uint64_t bytes_per_disk_replica) {
-    return objects * bytes_per_object + disk_replicas * bytes_per_disk_replica +
-           AdmissionSafetyBytes(limit);
+uint64_t RestoreNeedBytes(const RestoreCounts& counts,
+                          const RestoreCostModel& model) {
+    const uint64_t disk_only =
+        std::min(counts.disk_only_objects,
+                 std::min(counts.objects, counts.disk_replicas));
+    const uint64_t memory_objects = counts.objects - disk_only;
+    const uint64_t extra_disk = counts.disk_replicas - disk_only;
+    const unsigned __int128 raw =
+        static_cast<unsigned __int128>(memory_objects) *
+            model.bytes_per_memory_object +
+        static_cast<unsigned __int128>(extra_disk) *
+            model.bytes_per_extra_disk_replica +
+        static_cast<unsigned __int128>(disk_only) *
+            model.bytes_per_disk_only_object;
+    const unsigned __int128 need =
+        (raw * (100 + model.margin_percent) + 99) / 100;
+    return need > std::numeric_limits<uint64_t>::max()
+               ? std::numeric_limits<uint64_t>::max()
+               : static_cast<uint64_t>(need);
+}
+
+uint64_t RestoreNeedLowerBound(uint64_t objects, uint64_t disk_replicas,
+                               const RestoreCostModel& model) {
+    // The need is linear in the number of disk-only objects, so the minimum
+    // is at one end of the possible range.
+    const uint64_t max_disk_only = std::min(objects, disk_replicas);
+    return std::min(
+        RestoreNeedBytes({objects, disk_replicas, 0}, model),
+        RestoreNeedBytes({objects, disk_replicas, max_disk_only}, model));
 }
 
 RestoreAdmission DecideRestoreAdmission(const MemorySnapshot& memory,
-                                        uint64_t objects,
-                                        uint64_t bytes_per_object,
-                                        uint64_t disk_replicas,
-                                        uint64_t bytes_per_disk_replica) {
+                                        const RestoreCounts& counts,
+                                        const RestoreCostModel& model) {
     RestoreAdmission out;
     out.headroom = memory.Headroom();
-    out.needed = RestoreNeedBytes(memory.limit, objects, bytes_per_object,
-                                  disk_replicas, bytes_per_disk_replica);
+    out.needed = RestoreNeedBytes(counts, model);
     out.admit = out.needed <= out.headroom;
     return out;
 }

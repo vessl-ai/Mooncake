@@ -96,10 +96,12 @@ std::string ShutdownReport::ToJson() const {
       << ",\"detail\":" << JsonString(detail)
       << ",\"snapshot\":" << JsonString(snapshot) << ",\"objects\":" << objects
       << ",\"local_disk_objects\":" << local_disk_objects
-      << ",\"bytes\":" << bytes << ",\"workers\":" << workers
-      << ",\"stop_ns\":" << stop_ns << ",\"quiesce_ns\":" << quiesce_ns
-      << ",\"trim_ns\":" << trim_ns << ",\"write_ns\":" << write_ns
-      << ",\"publish_ns\":" << publish_ns << ",\"total_ns\":" << total_ns
+      << ",\"disk_only_objects\":" << disk_only_objects
+      << ",\"restore_needed\":" << restore_needed << ",\"bytes\":" << bytes
+      << ",\"workers\":" << workers << ",\"stop_ns\":" << stop_ns
+      << ",\"quiesce_ns\":" << quiesce_ns << ",\"trim_ns\":" << trim_ns
+      << ",\"write_ns\":" << write_ns << ",\"publish_ns\":" << publish_ns
+      << ",\"total_ns\":" << total_ns
       << ",\"finished_at_ms\":" << finished_at_ms
       << ",\"admission\":" << RawOrNull(admission)
       << ",\"memory\":" << RawOrNull(memory)
@@ -153,8 +155,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     in.objects = steps.object_count();
     in.local_disk_objects =
         steps.local_disk_count ? steps.local_disk_count() : 0;
-    in.restore_bytes_per_object = options.restore_bytes_per_object;
-    in.restore_bytes_per_disk_replica = options.restore_bytes_per_disk_replica;
+    in.restore_cost = options.restore_cost;
     in.disk_free_bytes = steps.disk_free(options.root);
     in.max_workers = options.max_workers;
     in.cpus = options.cpus;
@@ -201,18 +202,40 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     }
     report.objects = written->objects;
     report.local_disk_objects = written->disk_replicas;
+    report.disk_only_objects = written->disk_only_objects;
     report.bytes = written->bytes;
     report.writer = written->json;
 
-    // 6. Publish unless another master started serving meanwhile.
+    // 6. The admission above used the cheapest disk-only split; now the
+    // exact counts are known. A snapshot the next master could not restore
+    // is not published (cold start), and its files are removed.
+    report.restore_needed = RestoreNeedBytes(
+        {report.objects, report.local_disk_objects, report.disk_only_objects},
+        options.restore_cost);
+    if (report.restore_needed > in.memory.limit) {
+        if (auto reset = ResetHandoffDir(options.root); !reset) {
+            LOG(ERROR) << "handoff: cannot remove the unpublished snapshot: "
+                       << reset.error();
+        }
+        return finish("skipped_restore_memory",
+                      "exact restore need " +
+                          std::to_string(report.restore_needed) +
+                          " > memory limit " + std::to_string(in.memory.limit));
+    }
+
+    // 7. Publish unless another master started serving meanwhile.
     if (steps.before_publish) steps.before_publish();
     if (PoisonExists(options.root)) {
         return finish("skipped_poisoned",
                       "POISON appeared during the snapshot");
     }
     t = SteadyClock::now();
-    ReadyMarker marker{report.snapshot, created_at_ms, report.objects,
-                       report.bytes, report.local_disk_objects};
+    ReadyMarker marker{report.snapshot,
+                       created_at_ms,
+                       report.objects,
+                       report.bytes,
+                       report.local_disk_objects,
+                       report.disk_only_objects};
     if (auto pub = PublishSnapshot(options.root, report.snapshot, marker);
         !pub) {
         return finish("error", "publish: " + pub.error());
@@ -297,8 +320,10 @@ StartupReport RunHandoffStartup(const StartupSteps& steps,
     // The restore always includes the L4 state the snapshot carries; if that
     // does not fit, start cold (no memory-only fallback).
     const RestoreAdmission admission = DecideRestoreAdmission(
-        *memory, claim.marker.objects, options.restore_bytes_per_object,
-        claim.marker.disk_replicas, options.restore_bytes_per_disk_replica);
+        *memory,
+        {claim.marker.objects, claim.marker.disk_replicas,
+         claim.marker.disk_only_objects},
+        options.restore_cost);
     if (!admission.admit) {
         return finish("memory_headroom", admission.ToJson());
     }

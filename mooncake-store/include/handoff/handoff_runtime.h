@@ -50,6 +50,7 @@ struct ShutdownWriteResult {
     uint64_t bytes{0};
     uint64_t disk_replicas{0};
     std::string json;  // writer stats
+    uint64_t disk_only_objects{0};
 };
 
 struct ShutdownSteps {
@@ -80,8 +81,7 @@ struct ShutdownOptions {
     bool owner{false};  // holds the HandoffDirLock
     size_t max_workers{8};
     size_t cpus{1};
-    uint64_t restore_bytes_per_object{1280};
-    uint64_t restore_bytes_per_disk_replica{256};
+    RestoreCostModel restore_cost;
 };
 
 struct ShutdownReport {
@@ -92,6 +92,9 @@ struct ShutdownReport {
     std::string snapshot;
     uint64_t objects{0};
     uint64_t local_disk_objects{0};
+    uint64_t disk_only_objects{0};
+    // Exact predicted restore need of the written snapshot (0 before).
+    uint64_t restore_needed{0};
     uint64_t bytes{0};
     size_t workers{0};
     uint64_t stop_ns{0};
@@ -109,7 +112,8 @@ struct ShutdownReport {
 
 // Order: stop_serving -> quiesce -> ownership / poison checks -> reset the
 // directory -> admission (trim and re-check if short) -> write into
-// snap-<id>.tmp -> poison re-check -> publish (rename + READY). Writes
+// snap-<id>.tmp -> exact restore-need check -> poison re-check -> publish
+// (rename + READY). Writes
 // last_shutdown at the end.
 // Never throws; the caller exits the process afterwards.
 ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
@@ -139,8 +143,7 @@ struct StartupOptions {
     bool owner{false};
     bool restore_enabled{true};
     int64_t max_age_ms{600000};
-    uint64_t restore_bytes_per_object{1280};
-    uint64_t restore_bytes_per_disk_replica{256};
+    RestoreCostModel restore_cost;
     size_t workers{8};
     int64_t now_ms{0};  // 0: system clock
 };

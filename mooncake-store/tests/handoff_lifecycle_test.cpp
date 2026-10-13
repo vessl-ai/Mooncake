@@ -116,6 +116,17 @@ TEST(HandoffMarkerTest, DiskReplicaCountRoundTripsAndDefaultsToZero) {
     ASSERT_TRUE(old_decoded.has_value()) << old_decoded.error();
     EXPECT_EQ(old_decoded->objects, 5u);
     EXPECT_EQ(old_decoded->disk_replicas, 0u);
+    EXPECT_EQ(old_decoded->disk_only_objects, 0u);
+}
+
+TEST(HandoffMarkerTest, DiskOnlyObjectCountRoundTrips) {
+    ReadyMarker marker{"snap-1-3",    1,        49000000,
+                       9000000000ULL, 24000000, 24000000};
+    auto decoded = DecodeReadyMarker(EncodeReadyMarker(marker));
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
+    EXPECT_EQ(decoded->objects, 49000000u);
+    EXPECT_EQ(decoded->disk_replicas, 24000000u);
+    EXPECT_EQ(decoded->disk_only_objects, 24000000u);
 }
 
 // ----------------------------------------------------------- state machine
@@ -374,6 +385,89 @@ TEST(HandoffAdmissionTest, ShutdownWorkersFollowHeadroom) {
     EXPECT_EQ(a.reason, "disk_space");
 }
 
+// Raw model (margin 0) and the default model with its 15 % margin.
+uint64_t RawNeed(uint64_t objects, uint64_t disk, uint64_t disk_only) {
+    RestoreCostModel raw;
+    raw.margin_percent = 0;
+    return RestoreNeedBytes({objects, disk, disk_only}, raw);
+}
+
+TEST(HandoffAdmissionTest, RestoreModelNeverUnderEstimatesMeasuredRuns) {
+    // Peak RSS (VmHWM) of the real restores: stage-1 32M (handoff_bench),
+    // stage-3 base / O / D (mooncake_master, results3/scale, max of 2 reps).
+    struct Case {
+        const char* name;
+        uint64_t objects, disk, disk_only, hwm_kib;
+    };
+    const Case cases[] = {
+        {"base 25M", 25000000, 0, 0, 27582136},
+        {"stage-1 32M", 32000000, 0, 0, 35665740},
+        {"O: 25M + 24M disk", 25000000, 24000000, 0, 31781192},
+        {"D: 25M + 24M disk-only", 49000000, 24000000, 24000000, 48582448},
+    };
+    const RestoreCostModel model;  // defaults
+    for (const Case& c : cases) {
+        const uint64_t measured = c.hwm_kib * 1024;
+        const uint64_t raw = RawNeed(c.objects, c.disk, c.disk_only);
+        const uint64_t need =
+            RestoreNeedBytes({c.objects, c.disk, c.disk_only}, model);
+        // Even without the margin the per-item costs cover the measurement.
+        EXPECT_GE(raw, measured) << c.name;
+        EXPECT_EQ(need, (raw * 115 + 99) / 100) << c.name;
+        // The over-estimate is the margin plus rounding, not more.
+        EXPECT_LT(static_cast<double>(need) / static_cast<double>(measured),
+                  1.17)
+            << c.name;
+    }
+}
+
+TEST(HandoffAdmissionTest, RestoreCountsDiskOnlyObjectsSeparately) {
+    // Case D: 25M memory objects + 24M disk-only objects.
+    // raw = 25M * 1144 + 24M * 904 = 50.296e9 B; need = raw * 1.15.
+    const uint64_t need_d =
+        RestoreNeedBytes({49000000, 24000000, 24000000}, RestoreCostModel{});
+    EXPECT_EQ(need_d, (50296000000ULL * 115 + 99) / 100);
+    // 53.9 GiB fits 55 GiB of headroom (the old model asked for 67.7 GiB).
+    RestoreAdmission r = DecideRestoreAdmission(Memory(56 * kGiB, 1 * kGiB),
+                                                {49000000, 24000000, 24000000},
+                                                RestoreCostModel{});
+    EXPECT_TRUE(r.admit) << r.ToJson();
+    EXPECT_EQ(r.needed, need_d);
+    // Unknown split (marker without disk_only_objects): every disk object
+    // is charged as a memory object plus an extra disk replica.
+    r = DecideRestoreAdmission(Memory(56 * kGiB, 1 * kGiB),
+                               {49000000, 24000000, 0}, RestoreCostModel{});
+    EXPECT_FALSE(r.admit);
+    EXPECT_EQ(r.needed,
+              ((49000000ULL * 1144 + 24000000ULL * 184) * 115 + 99) / 100);
+    // Case O: extra disk replicas on memory objects.
+    EXPECT_EQ(RestoreNeedBytes({25000000, 24000000, 0}, RestoreCostModel{}),
+              ((25000000ULL * 1144 + 24000000ULL * 184) * 115 + 99) / 100);
+    // An inconsistent disk-only count is clamped to the disk replicas.
+    EXPECT_EQ(RestoreNeedBytes({100, 10, 50}, RestoreCostModel{}),
+              RestoreNeedBytes({100, 10, 10}, RestoreCostModel{}));
+}
+
+TEST(HandoffAdmissionTest, RestoreMarginAndCostsAreConfigurable) {
+    RestoreCostModel model;
+    model.margin_percent = 0;
+    EXPECT_EQ(RestoreNeedBytes({1000, 300, 100}, model),
+              900ULL * 1144 + 200 * 184 + 100 * 904);
+    model.margin_percent = 30;
+    model.bytes_per_memory_object = 1000;
+    model.bytes_per_extra_disk_replica = 100;
+    model.bytes_per_disk_only_object = 500;
+    EXPECT_EQ(RestoreNeedBytes({1000, 300, 100}, model),
+              (900ULL * 1000 + 200 * 100 + 100 * 500) * 130 / 100);
+    // 25M objects at the default model: 30.6 GiB.
+    EXPECT_TRUE(DecideRestoreAdmission(Memory(32 * kGiB, 1 * kGiB),
+                                       {25000000, 0, 0}, RestoreCostModel{})
+                    .admit);
+    EXPECT_FALSE(DecideRestoreAdmission(Memory(31 * kGiB, 1 * kGiB),
+                                        {25000000, 0, 0}, RestoreCostModel{})
+                     .admit);
+}
+
 TEST(HandoffAdmissionTest, ShutdownCountsL4AndPredictsTheRestore) {
     ShutdownAdmissionInput in;
     in.objects = 25000000;
@@ -389,20 +483,26 @@ TEST(HandoffAdmissionTest, ShutdownCountsL4AndPredictsTheRestore) {
               static_cast<uint64_t>(
                   1.3 * static_cast<double>(25000000ULL * 200 +
                                             24000000ULL * 100 + 16 * kMiB)));
-    // 25M * 1280 + 24M * 256 + safety = 36.0 GiB of the 80 GiB limit.
-    EXPECT_EQ(a.restore_needed, 25000000ULL * 1280 + 24000000ULL * 256 +
-                                    AdmissionSafetyBytes(80 * kGiB));
+    // Before the write the split is unknown: the prediction is the cheapest
+    // split (24M disk-only objects), 24.5 GiB.
+    EXPECT_EQ(a.restore_needed, RestoreNeedBytes({25000000, 24000000, 24000000},
+                                                 RestoreCostModel{}));
+    EXPECT_EQ(a.restore_needed,
+              RestoreNeedLowerBound(25000000, 24000000, RestoreCostModel{}));
 
-    // The restore including L4 (36.5 GiB) would not fit a 34 GiB pod: skip
-    // (cold start), even though the snapshot itself could be written.
-    // Without the L4 part (30.8 GiB) it would have fit -- there is no
-    // memory-only fallback.
-    in.memory = Memory(34 * kGiB, 30 * kGiB);
+    // Even the cheapest split does not fit a 20 GiB pod: skip (cold start)
+    // before writing anything; trimming cannot help.
+    in.memory = Memory(20 * kGiB, 10 * kGiB);
     a = DecideShutdownAdmission(in);
     EXPECT_FALSE(a.admit);
     EXPECT_EQ(a.reason, "restore_memory");
+    // 25M memory objects alone (30.6 GiB) do not fit 30 GiB either: no
+    // memory-only fallback exists, and without L4 it is the same answer.
     in.local_disk_objects = 0;
-    EXPECT_TRUE(DecideShutdownAdmission(in).admit);
+    in.memory = Memory(30 * kGiB, 10 * kGiB);
+    a = DecideShutdownAdmission(in);
+    EXPECT_FALSE(a.admit);
+    EXPECT_EQ(a.reason, "restore_memory");
 
     // The bigger L4 snapshot also needs more disk.
     in.local_disk_objects = 24000000;
@@ -412,27 +512,6 @@ TEST(HandoffAdmissionTest, ShutdownCountsL4AndPredictsTheRestore) {
     a = DecideShutdownAdmission(in);
     EXPECT_FALSE(a.admit);
     EXPECT_EQ(a.reason, "disk_space");
-}
-
-TEST(HandoffAdmissionTest, RestoreCountsDiskReplicas) {
-    // 25M objects alone (30.8 GiB) fit 34 GiB of headroom; with 24M disk
-    // replicas (+5.7 GiB) they do not.
-    EXPECT_TRUE(
-        DecideRestoreAdmission(Memory(35 * kGiB, 1 * kGiB), 25000000, 1280)
-            .admit);
-    RestoreAdmission r = DecideRestoreAdmission(Memory(35 * kGiB, 1 * kGiB),
-                                                25000000, 1280, 24000000, 256);
-    EXPECT_FALSE(r.admit);
-    EXPECT_EQ(r.needed, 25000000ULL * 1280 + 24000000ULL * 256 +
-                            AdmissionSafetyBytes(35 * kGiB));
-}
-
-TEST(HandoffAdmissionTest, RestoreNeedsBytesPerObject) {
-    RestoreAdmission r =
-        DecideRestoreAdmission(Memory(48 * kGiB, 1 * kGiB), 25000000, 1280);
-    EXPECT_TRUE(r.admit);
-    r = DecideRestoreAdmission(Memory(30 * kGiB, 1 * kGiB), 25000000, 1280);
-    EXPECT_FALSE(r.admit);  // 29.8 GiB + 0.9 GiB safety > 29 GiB headroom
 }
 
 // ---------------------------------------------------------------- watchdog
@@ -635,14 +714,16 @@ TEST(HandoffShutdownTest, WatchdogFiresBeforeReadyExists) {
 TEST(HandoffShutdownTest, RestoreThatWouldNotFitWithL4IsSkipped) {
     TempDir root;
     FakeShutdown fake;
-    fake.objects = 10000000;
+    // 20M objects, 10M of them on disk: even with all 10M disk-only the
+    // restore needs 21.9 GiB > 16 GiB.
+    fake.objects = 20000000;
     fake.memory = Memory(16 * kGiB, 1 * kGiB);
     ShutdownSteps steps = fake.Steps();
-    steps.local_disk_count = [] { return uint64_t{40000000}; };
+    steps.local_disk_count = [] { return uint64_t{10000000}; };
     ShutdownReport report =
         RunHandoffShutdown(steps, {root.path(), true, 4, 14});
     EXPECT_EQ(report.result, "skipped_restore_memory");
-    EXPECT_EQ(report.local_disk_objects, 40000000u);
+    EXPECT_EQ(report.local_disk_objects, 10000000u);
     // No write, no trim (trimming cannot help), nothing to claim.
     EXPECT_EQ(std::count(fake.events.begin(), fake.events.end(), "write"), 0);
     EXPECT_EQ(std::count(fake.events.begin(), fake.events.end(), "trim"), 0);
@@ -651,7 +732,7 @@ TEST(HandoffShutdownTest, RestoreThatWouldNotFitWithL4IsSkipped) {
     EXPECT_NE(last.find("\"result\":\"skipped_restore_memory\""),
               std::string::npos)
         << last;
-    EXPECT_NE(last.find("\"local_disk_objects\":40000000"), std::string::npos)
+    EXPECT_NE(last.find("\"local_disk_objects\":10000000"), std::string::npos)
         << last;
     // The marker of a written snapshot carries the disk replica count.
     TempDir root2;
@@ -661,13 +742,67 @@ TEST(HandoffShutdownTest, RestoreThatWouldNotFitWithL4IsSkipped) {
         [](const std::string& dir,
            size_t) -> tl::expected<ShutdownWriteResult, std::string> {
         WriteText(dir + "/handoff_manifest", "m");
-        return ShutdownWriteResult{1000, 4096, 600, "{}"};
+        return ShutdownWriteResult{1000, 4096, 600, "{}", 150};
     };
     ASSERT_EQ(RunHandoffShutdown(ok_steps, {root2.path(), true, 4, 14}).result,
               "ok");
     ClaimResult claim = ClaimHandoffSnapshot(root2.path());
     ASSERT_EQ(claim.state, ClaimState::kClaimed);
     EXPECT_EQ(claim.marker.disk_replicas, 600u);
+    EXPECT_EQ(claim.marker.disk_only_objects, 150u);
+}
+
+TEST(HandoffShutdownTest, ExactRestoreNeedIsCheckedAfterTheWrite) {
+    // 25M objects, 24M on disk, 34 GiB pod. Before the write only the
+    // cheapest split (24.5 GiB) is known, so the snapshot is written.
+    struct Run {
+        uint64_t disk_only;
+        std::string result;
+    };
+    for (const Run& run :
+         {Run{0, "skipped_restore_memory"},  // case O, 35.4 GiB
+          Run{24000000, "ok"}}) {            // 24.5 GiB
+        TempDir root;
+        FakeShutdown fake;
+        fake.objects = 25000000;
+        fake.memory = Memory(34 * kGiB, 1 * kGiB);
+        ShutdownSteps steps = fake.Steps();
+        steps.local_disk_count = [] { return uint64_t{24000000}; };
+        int writes = 0;
+        steps.write =
+            [&](const std::string& dir,
+                size_t) -> tl::expected<ShutdownWriteResult, std::string> {
+            ++writes;
+            WriteText(dir + "/handoff_manifest", "m");
+            return ShutdownWriteResult{25000000, 4096, 24000000, "{}",
+                                       run.disk_only};
+        };
+        ShutdownReport report =
+            RunHandoffShutdown(steps, {root.path(), true, 4, 14});
+        EXPECT_EQ(report.result, run.result) << report.ToJson();
+        EXPECT_EQ(writes, 1);
+        EXPECT_EQ(report.restore_needed,
+                  RestoreNeedBytes({25000000, 24000000, run.disk_only},
+                                   RestoreCostModel{}));
+        const std::string last = ReadLastShutdown(root.path());
+        EXPECT_NE(last.find("\"result\":\"" + run.result + "\""),
+                  std::string::npos)
+            << last;
+        ClaimResult claim = ClaimHandoffSnapshot(root.path());
+        if (run.result == "ok") {
+            ASSERT_EQ(claim.state, ClaimState::kClaimed);
+            EXPECT_EQ(claim.marker.disk_only_objects, run.disk_only);
+        } else {
+            // Not published, and the written files are gone.
+            EXPECT_EQ(claim.state, ClaimState::kNone);
+            for (const auto& entry : fs::directory_iterator(root.path())) {
+                EXPECT_EQ(
+                    entry.path().filename().string().rfind(kSnapshotPrefix, 0),
+                    std::string::npos)
+                    << "left behind: " << entry.path();
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------ startup sequencing
@@ -760,17 +895,41 @@ TEST(HandoffStartupTest, RestoreThatWouldNotFitWithL4StartsCold) {
     TempDir root;
     FakeStartup fake;
     WriteText(root / ("snap-13-1" + std::string(kTmpSuffix)) + "/data", "x");
-    ASSERT_TRUE(PublishSnapshot(root.path(), "snap-13-1",
-                                {"snap-13-1", NowMs(), 10000000, 1, 40000000})
-                    .has_value());
-    fake.memory = Memory(20 * kGiB, 1 * kGiB);  // fits without the L4 part
+    // 20M memory objects, 10M of them also on disk: 26.5 GiB; without the
+    // L4 part 24.5 GiB would fit the 25 GiB of headroom.
+    ASSERT_TRUE(
+        PublishSnapshot(root.path(), "snap-13-1",
+                        {"snap-13-1", NowMs(), 20000000, 1, 10000000, 0})
+            .has_value());
+    fake.memory = Memory(26 * kGiB, 1 * kGiB);
     StartupReport report =
         RunHandoffStartup(fake.Steps(), Options(root.path()));
     EXPECT_EQ(report.result, "memory_headroom") << report.detail;
-    EXPECT_EQ(report.local_disk_replicas, 40000000u);
+    EXPECT_EQ(report.local_disk_replicas, 10000000u);
     EXPECT_EQ(fake.restores, 0);
     EXPECT_EQ(RunHandoffStartup(fake.Steps(), Options(root.path())).result,
               "none");
+}
+
+TEST(HandoffStartupTest, DiskOnlyObjectsAreChargedTheirOwnCost) {
+    // Case D (25M memory + 24M disk-only objects) in 55 GiB of headroom:
+    // 53.9 GiB with the disk-only count, 64.8 GiB without it.
+    for (const bool with_split : {true, false}) {
+        TempDir root;
+        FakeStartup fake;
+        WriteText(root / ("snap-14-1" + std::string(kTmpSuffix)) + "/data",
+                  "x");
+        ASSERT_TRUE(PublishSnapshot(root.path(), "snap-14-1",
+                                    {"snap-14-1", NowMs(), 49000000, 1,
+                                     24000000, with_split ? 24000000u : 0u})
+                        .has_value());
+        fake.memory = Memory(56 * kGiB, 1 * kGiB);
+        StartupReport report =
+            RunHandoffStartup(fake.Steps(), Options(root.path()));
+        EXPECT_EQ(report.result, with_split ? "ok" : "memory_headroom")
+            << report.detail;
+        EXPECT_EQ(fake.restores, with_split ? 1 : 0);
+    }
 }
 
 TEST(HandoffStartupTest, MasterWithoutLockPoisonsTheDirectory) {

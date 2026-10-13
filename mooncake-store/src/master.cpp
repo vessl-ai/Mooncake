@@ -429,11 +429,19 @@ DEFINE_int32(handoff_restore_workers, 0,
              "Restore threads; 0 = available CPUs, at most 16");
 DEFINE_int32(handoff_max_age_sec, 600,
              "Do not restore snapshots older than this");
-DEFINE_uint64(handoff_restore_bytes_per_object, 1280,
-              "Restore admission: expected peak RSS per object");
-DEFINE_uint64(handoff_restore_bytes_per_disk_replica, 256,
-              "Restore admission: memory per LOCAL_DISK (L4) replica in the "
-              "snapshot, on top of handoff_restore_bytes_per_object");
+DEFINE_uint64(handoff_restore_bytes_per_object, 1144,
+              "Restore admission: peak RSS per object that has a memory "
+              "replica (measured, before the margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_replica, 184,
+              "Restore admission: peak RSS per LOCAL_DISK (L4) replica of an "
+              "object that also has a memory replica (measured, before the "
+              "margin)");
+DEFINE_uint64(handoff_restore_bytes_per_disk_only_object, 904,
+              "Restore admission: peak RSS per object whose only replica is "
+              "a LOCAL_DISK (L4) replica (measured, before the margin)");
+DEFINE_uint32(handoff_restore_margin_percent, 15,
+              "Restore admission: safety margin added to the predicted "
+              "restore memory, in percent of the prediction");
 DEFINE_bool(handoff_malloc_trim, true,
             "malloc_trim(0) and re-check when the shutdown admission check "
             "gives fewer writer threads than wanted");
@@ -1595,6 +1603,17 @@ struct HandoffContext {
     size_t cpus{1};
 };
 
+mooncake::handoff::RestoreCostModel HandoffRestoreCostModel() {
+    mooncake::handoff::RestoreCostModel model;
+    model.bytes_per_memory_object = FLAGS_handoff_restore_bytes_per_object;
+    model.bytes_per_extra_disk_replica =
+        FLAGS_handoff_restore_bytes_per_disk_replica;
+    model.bytes_per_disk_only_object =
+        FLAGS_handoff_restore_bytes_per_disk_only_object;
+    model.margin_percent = FLAGS_handoff_restore_margin_percent;
+    return model;
+}
+
 void FlushLogsForExit() {
     google::FlushLogFiles(google::GLOG_INFO);
     std::fflush(stdout);
@@ -1647,9 +1666,7 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     options.owner = owner;
     options.restore_enabled = FLAGS_handoff_restore;
     options.max_age_ms = int64_t{FLAGS_handoff_max_age_sec} * 1000;
-    options.restore_bytes_per_object = FLAGS_handoff_restore_bytes_per_object;
-    options.restore_bytes_per_disk_replica =
-        FLAGS_handoff_restore_bytes_per_disk_replica;
+    options.restore_cost = HandoffRestoreCostModel();
     options.workers = FLAGS_handoff_restore_workers > 0
                           ? static_cast<size_t>(FLAGS_handoff_restore_workers)
                           : std::min<size_t>(ctx.cpus, 16);
@@ -1738,7 +1755,8 @@ void RunHandoffAtStartup(HandoffContext& ctx,
         if (!written) return tl::make_unexpected(written.error());
         return h::ShutdownWriteResult{
             written->stats.objects, written->stats.total_bytes,
-            written->stats.local_disk_replicas, written->ToJson()};
+            written->stats.local_disk_replicas, written->ToJson(),
+            written->stats.disk_only_objects};
     };
     h::ShutdownOptions options;
     options.root = ctx.root;
@@ -1746,9 +1764,7 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     options.max_workers =
         static_cast<size_t>(std::max(1, FLAGS_handoff_max_workers));
     options.cpus = ctx.cpus;
-    options.restore_bytes_per_object = FLAGS_handoff_restore_bytes_per_object;
-    options.restore_bytes_per_disk_replica =
-        FLAGS_handoff_restore_bytes_per_disk_replica;
+    options.restore_cost = HandoffRestoreCostModel();
     const h::ShutdownReport report =
         h::RunHandoffShutdown(steps, options, &published);
     FlushLogsForExit();

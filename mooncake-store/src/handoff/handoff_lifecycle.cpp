@@ -125,7 +125,8 @@ std::string EncodeReadyMarker(const ReadyMarker& marker) {
          << "created_at_ms=" << marker.created_at_ms << "\n"
          << "objects=" << marker.objects << "\n"
          << "bytes=" << marker.bytes << "\n"
-         << "disk_replicas=" << marker.disk_replicas << "\n";
+         << "disk_replicas=" << marker.disk_replicas << "\n"
+         << "disk_only_objects=" << marker.disk_only_objects << "\n";
     const std::string b = body.str();
     std::ostringstream out;
     out << kReadyHeader << " " << kReadyVersion << " "
@@ -173,6 +174,8 @@ tl::expected<ReadyMarker, std::string> DecodeReadyMarker(
                 marker.bytes = std::stoull(value);
             } else if (key == "disk_replicas") {
                 marker.disk_replicas = std::stoull(value);
+            } else if (key == "disk_only_objects") {
+                marker.disk_only_objects = std::stoull(value);
             }
         } catch (const std::exception&) {
             return tl::make_unexpected("marker: bad value for " + key);
