@@ -95,6 +95,7 @@ std::string ShutdownReport::ToJson() const {
     o << "{\"result\":" << JsonString(result)
       << ",\"detail\":" << JsonString(detail)
       << ",\"snapshot\":" << JsonString(snapshot) << ",\"objects\":" << objects
+      << ",\"local_disk_objects\":" << local_disk_objects
       << ",\"bytes\":" << bytes << ",\"workers\":" << workers
       << ",\"stop_ns\":" << stop_ns << ",\"quiesce_ns\":" << quiesce_ns
       << ",\"trim_ns\":" << trim_ns << ",\"write_ns\":" << write_ns
@@ -150,10 +151,15 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     // runs when the first check falls short of the wanted worker count.
     ShutdownAdmissionInput in;
     in.objects = steps.object_count();
+    in.local_disk_objects =
+        steps.local_disk_count ? steps.local_disk_count() : 0;
+    in.restore_bytes_per_object = options.restore_bytes_per_object;
+    in.restore_bytes_per_disk_replica = options.restore_bytes_per_disk_replica;
     in.disk_free_bytes = steps.disk_free(options.root);
     in.max_workers = options.max_workers;
     in.cpus = options.cpus;
     report.objects = in.objects;
+    report.local_disk_objects = in.local_disk_objects;
     ShutdownAdmission admission;
     auto decide = [&]() -> bool {
         auto memory = steps.read_memory();
@@ -171,7 +177,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     const size_t wanted =
         std::min(options.max_workers, std::max<size_t>(1, options.cpus));
     if (steps.trim && admission.reason != "disk_space" &&
-        admission.workers < wanted) {
+        admission.reason != "restore_memory" && admission.workers < wanted) {
         t = SteadyClock::now();
         steps.trim();
         report.trim_ns = NsSince(t);
@@ -194,6 +200,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
         return finish("error", "write: " + written.error());
     }
     report.objects = written->objects;
+    report.local_disk_objects = written->disk_replicas;
     report.bytes = written->bytes;
     report.writer = written->json;
 
@@ -205,7 +212,7 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     }
     t = SteadyClock::now();
     ReadyMarker marker{report.snapshot, created_at_ms, report.objects,
-                       report.bytes};
+                       report.bytes, report.local_disk_objects};
     if (auto pub = PublishSnapshot(options.root, report.snapshot, marker);
         !pub) {
         return finish("error", "publish: " + pub.error());
@@ -222,10 +229,11 @@ std::string StartupReport::ToJson() const {
     o << "{\"result\":" << JsonString(result)
       << ",\"detail\":" << JsonString(detail)
       << ",\"snapshot\":" << JsonString(snapshot) << ",\"objects\":" << objects
-      << ",\"segments\":" << segments << ",\"age_ms\":" << age_ms
-      << ",\"claim_ns\":" << claim_ns << ",\"restore_ns\":" << restore_ns
-      << ",\"total_ns\":" << total_ns << ",\"restore\":" << RawOrNull(restore)
-      << "}";
+      << ",\"segments\":" << segments
+      << ",\"local_disk_replicas\":" << local_disk_replicas
+      << ",\"age_ms\":" << age_ms << ",\"claim_ns\":" << claim_ns
+      << ",\"restore_ns\":" << restore_ns << ",\"total_ns\":" << total_ns
+      << ",\"restore\":" << RawOrNull(restore) << "}";
     return o.str();
 }
 
@@ -263,6 +271,7 @@ StartupReport RunHandoffStartup(const StartupSteps& steps,
             return finish(ToString(claim.state), claim.detail);
     }
     report.objects = claim.marker.objects;
+    report.local_disk_replicas = claim.marker.disk_replicas;
     // From here on every path releases the claim (one attempt only).
     struct Release {
         const std::string& root;
@@ -285,8 +294,11 @@ StartupReport RunHandoffStartup(const StartupSteps& steps,
     if (!memory) {
         return finish("error", "memory: " + memory.error());
     }
+    // The restore always includes the L4 state the snapshot carries; if that
+    // does not fit, start cold (no memory-only fallback).
     const RestoreAdmission admission = DecideRestoreAdmission(
-        *memory, claim.marker.objects, options.restore_bytes_per_object);
+        *memory, claim.marker.objects, options.restore_bytes_per_object,
+        claim.marker.disk_replicas, options.restore_bytes_per_disk_replica);
     if (!admission.admit) {
         return finish("memory_headroom", admission.ToJson());
     }
@@ -298,6 +310,7 @@ StartupReport RunHandoffStartup(const StartupSteps& steps,
     }
     report.objects = restored->objects;
     report.segments = restored->segments;
+    report.local_disk_replicas = restored->local_disk_replicas;
     report.restore = restored->json;
     return finish("ok", "");
 }
@@ -318,6 +331,12 @@ void HandoffMetrics::SetStartup(const StartupReport& report) {
 void HandoffMetrics::SetLastShutdownJson(const std::string& json) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_shutdown_json_ = json;
+}
+
+void HandoffMetrics::SetLocalDiskCounters(
+    std::function<void(uint64_t*, uint64_t*)> provider) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    local_disk_counters_ = std::move(provider);
 }
 
 void HandoffMetrics::SetSegmentCounters(
@@ -344,6 +363,20 @@ std::string HandoffMetrics::Serialize() const {
     gauge("master_handoff_restore_duration_seconds",
           "Wall time of the handoff restore",
           static_cast<double>(startup_.restore_ns) / 1e9);
+    gauge("master_handoff_restore_local_disk_replicas",
+          "LOCAL_DISK (L4) replicas restored at startup",
+          static_cast<double>(
+              startup_.result == "ok" ? startup_.local_disk_replicas : 0));
+    if (local_disk_counters_) {
+        uint64_t pending = 0, pins = 0;
+        local_disk_counters_(&pending, &pins);
+        gauge("master_handoff_local_disk_clients_pending",
+              "Restored L4 owners whose disk replicas are still unreadable",
+              static_cast<double>(pending));
+        gauge("master_handoff_offload_pins",
+              "Memory replicas pinned for in-flight offloads of the old master",
+              static_cast<double>(pins));
+    }
     gauge("master_handoff_snapshot_age_seconds",
           "Age of the claimed snapshot at startup",
           static_cast<double>(startup_.age_ms) / 1e3);
@@ -374,6 +407,10 @@ std::string HandoffMetrics::Serialize() const {
         gauge("master_handoff_last_snapshot_objects",
               "Objects in the previous master's shutdown snapshot",
               last.get("objects", 0).asDouble());
+        gauge("master_handoff_last_snapshot_local_disk_objects",
+              "Objects with a LOCAL_DISK replica in the previous master's "
+              "shutdown snapshot (or counted for its admission)",
+              last.get("local_disk_objects", 0).asDouble());
         gauge("master_handoff_last_snapshot_bytes",
               "Bytes of the previous master's shutdown snapshot",
               last.get("bytes", 0).asDouble());

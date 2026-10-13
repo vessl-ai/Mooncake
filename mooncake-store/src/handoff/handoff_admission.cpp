@@ -21,6 +21,8 @@ constexpr uint64_t kWorkerBytesPerShardObject = 1350;
 constexpr uint64_t kWriterBaseBytes = 64 * kMiB;
 constexpr uint64_t kShards = 1024;
 constexpr uint64_t kDiskBytesPerObject = 200;
+constexpr uint64_t kWorkerBytesPerShardDiskReplica = 200;
+constexpr uint64_t kDiskBytesPerDiskReplica = 100;
 constexpr uint64_t kDiskFixedBytes = 16 * kMiB;
 constexpr double kDiskFactor = 1.3;
 
@@ -206,7 +208,8 @@ std::string ShutdownAdmission::ToJson() const {
       << ",\"workers\":" << workers << ",\"reason\":\"" << reason
       << "\",\"headroom\":" << headroom << ",\"safety\":" << safety
       << ",\"per_worker\":" << per_worker << ",\"base\":" << base
-      << ",\"disk_needed\":" << disk_needed << "}";
+      << ",\"disk_needed\":" << disk_needed
+      << ",\"restore_needed\":" << restore_needed << "}";
     return o.str();
 }
 
@@ -216,11 +219,19 @@ ShutdownAdmission DecideShutdownAdmission(const ShutdownAdmissionInput& in) {
     out.safety = AdmissionSafetyBytes(in.memory.limit);
     out.base = kWriterBaseBytes;
     const uint64_t objects_per_shard = (in.objects + kShards - 1) / kShards;
-    out.per_worker =
-        kWorkerFixedBytes + objects_per_shard * kWorkerBytesPerShardObject;
+    const uint64_t disk_per_shard =
+        (in.local_disk_objects + kShards - 1) / kShards;
+    out.per_worker = kWorkerFixedBytes +
+                     objects_per_shard * kWorkerBytesPerShardObject +
+                     disk_per_shard * kWorkerBytesPerShardDiskReplica;
     out.disk_needed = static_cast<uint64_t>(
-        kDiskFactor * static_cast<double>(in.objects * kDiskBytesPerObject +
-                                          kDiskFixedBytes));
+        kDiskFactor *
+        static_cast<double>(in.objects * kDiskBytesPerObject +
+                            in.local_disk_objects * kDiskBytesPerDiskReplica +
+                            kDiskFixedBytes));
+    out.restore_needed = RestoreNeedBytes(
+        in.memory.limit, in.objects, in.restore_bytes_per_object,
+        in.local_disk_objects, in.restore_bytes_per_disk_replica);
 
     const uint64_t budget = SaturatingSub(out.headroom, out.safety + out.base);
     const uint64_t fit = budget / out.per_worker;
@@ -235,6 +246,13 @@ ShutdownAdmission DecideShutdownAdmission(const ShutdownAdmissionInput& in) {
         out.reason = "disk_space";
         return out;
     }
+    if (out.restore_needed > in.memory.limit) {
+        // The next master could not restore it (with its L4 state); do not
+        // spend the shutdown on a snapshot that would be discarded.
+        out.workers = 0;
+        out.reason = "restore_memory";
+        return out;
+    }
     out.admit = true;
     return out;
 }
@@ -246,13 +264,22 @@ std::string RestoreAdmission::ToJson() const {
     return o.str();
 }
 
+uint64_t RestoreNeedBytes(uint64_t limit, uint64_t objects,
+                          uint64_t bytes_per_object, uint64_t disk_replicas,
+                          uint64_t bytes_per_disk_replica) {
+    return objects * bytes_per_object + disk_replicas * bytes_per_disk_replica +
+           AdmissionSafetyBytes(limit);
+}
+
 RestoreAdmission DecideRestoreAdmission(const MemorySnapshot& memory,
                                         uint64_t objects,
-                                        uint64_t bytes_per_object) {
+                                        uint64_t bytes_per_object,
+                                        uint64_t disk_replicas,
+                                        uint64_t bytes_per_disk_replica) {
     RestoreAdmission out;
     out.headroom = memory.Headroom();
-    out.needed =
-        objects * bytes_per_object + AdmissionSafetyBytes(memory.limit);
+    out.needed = RestoreNeedBytes(memory.limit, objects, bytes_per_object,
+                                  disk_replicas, bytes_per_disk_replica);
     out.admit = out.needed <= out.headroom;
     return out;
 }

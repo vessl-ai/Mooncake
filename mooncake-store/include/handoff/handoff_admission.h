@@ -7,15 +7,21 @@
 //   headroom = limit - memory.current            (page cache counts as used)
 //   safety   = max(512 MiB, 3% of limit)
 //   per_wkr  = 16 MiB + ceil(objects / 1024) * 1350 B
-//              (one shard's StandbyObjectEntry copies + encoded chunk)
+//                     + ceil(disk / 1024) * 200 B
+//              (one shard's StandbyObjectEntry copies + encoded chunk;
+//              disk = objects with a LOCAL_DISK replica, schema 2)
 //   base     = 64 MiB                            (segments, chunk index, ...)
 //   W        = min(max_workers, cpus, floor((headroom - safety - base) /
 //                                           per_wkr))
-//   skip if W == 0 ("memory_headroom") or if the free space of the handoff
-//   file system is below 1.3 * (objects * 200 B + 16 MiB) ("disk_space").
+//   skip if W == 0 ("memory_headroom"), if the free space of the handoff
+//   file system is below 1.3 * (objects * 200 B + disk * 100 B + 16 MiB)
+//   ("disk_space"), or if the predicted restore need (below) exceeds the
+//   memory limit ("restore_memory"; the next master starts empty).
+//   The snapshot always includes L4: there is no memory-only fallback.
 //
 // Restore (after the claim, before anything is allocated):
-//   need  = objects * restore_bytes_per_object + safety
+//   need  = objects * restore_bytes_per_object
+//           + disk * restore_bytes_per_disk_replica + safety
 //   skip if need > headroom ("memory_headroom") -> cold start.
 //
 // All inputs are read through injectable file paths so tests can feed fake
@@ -73,7 +79,10 @@ uint64_t AdmissionSafetyBytes(uint64_t limit);
 struct ShutdownAdmissionInput {
     MemorySnapshot memory;
     uint64_t objects{0};
+    uint64_t local_disk_objects{0};
     uint64_t disk_free_bytes{0};
+    uint64_t restore_bytes_per_object{1280};
+    uint64_t restore_bytes_per_disk_replica{256};
     size_t max_workers{8};
     size_t cpus{1};
 };
@@ -87,6 +96,7 @@ struct ShutdownAdmission {
     uint64_t per_worker{0};
     uint64_t base{0};
     uint64_t disk_needed{0};
+    uint64_t restore_needed{0};  // predicted, incl. safety
     std::string ToJson() const;
 };
 
@@ -99,8 +109,14 @@ struct RestoreAdmission {
     std::string ToJson() const;
 };
 
+uint64_t RestoreNeedBytes(uint64_t limit, uint64_t objects,
+                          uint64_t bytes_per_object, uint64_t disk_replicas,
+                          uint64_t bytes_per_disk_replica);
+
 RestoreAdmission DecideRestoreAdmission(const MemorySnapshot& memory,
                                         uint64_t objects,
-                                        uint64_t bytes_per_object);
+                                        uint64_t bytes_per_object,
+                                        uint64_t disk_replicas = 0,
+                                        uint64_t bytes_per_disk_replica = 0);
 
 }  // namespace mooncake::handoff
