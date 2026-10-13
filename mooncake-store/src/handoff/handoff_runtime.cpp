@@ -1,5 +1,6 @@
 #include "handoff/handoff_runtime.h"
 
+#include <algorithm>
 #include <sstream>
 
 #include <glog/logging.h>
@@ -141,26 +142,37 @@ ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
     if (auto reset = ResetHandoffDir(options.root); !reset) {
         return finish("error", reset.error());
     }
-    // 4. Admission.
-    if (steps.trim) {
-        t = SteadyClock::now();
-        steps.trim();
-        report.trim_ns = NsSince(t);
-    }
-    auto memory = steps.read_memory();
-    if (!memory) {
-        return finish("error", "memory: " + memory.error());
-    }
-    report.memory = memory->ToJson();
+    // 4. Admission. malloc_trim can take seconds on a large heap, so it only
+    // runs when the first check falls short of the wanted worker count.
     ShutdownAdmissionInput in;
-    in.memory = *memory;
     in.objects = steps.object_count();
     in.disk_free_bytes = steps.disk_free(options.root);
     in.max_workers = options.max_workers;
     in.cpus = options.cpus;
     report.objects = in.objects;
-    const ShutdownAdmission admission = DecideShutdownAdmission(in);
-    report.admission = admission.ToJson();
+    ShutdownAdmission admission;
+    auto decide = [&]() -> bool {
+        auto memory = steps.read_memory();
+        if (!memory) {
+            report.detail = "memory: " + memory.error();
+            return false;
+        }
+        report.memory = memory->ToJson();
+        in.memory = *memory;
+        admission = DecideShutdownAdmission(in);
+        report.admission = admission.ToJson();
+        return true;
+    };
+    if (!decide()) return finish("error", report.detail);
+    const size_t wanted =
+        std::min(options.max_workers, std::max<size_t>(1, options.cpus));
+    if (steps.trim && admission.reason != "disk_space" &&
+        admission.workers < wanted) {
+        t = SteadyClock::now();
+        steps.trim();
+        report.trim_ns = NsSince(t);
+        if (!decide()) return finish("error", report.detail);
+    }
     if (!admission.admit) {
         return finish("skipped_" + admission.reason, "");
     }

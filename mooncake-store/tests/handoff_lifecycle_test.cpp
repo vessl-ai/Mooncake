@@ -443,9 +443,10 @@ TEST(HandoffShutdownTest, OrderAndPublishedSnapshot) {
         fake.Steps(), {root.path(), /*owner=*/true, 4, 14}, &published);
     EXPECT_EQ(report.result, "ok") << report.detail;
     EXPECT_TRUE(published.load());
-    const std::vector<std::string> expected{
-        "stop_serving", "quiesce",   "trim", "read_memory",
-        "object_count", "disk_free", "write"};
+    // Plenty of headroom: no malloc_trim.
+    const std::vector<std::string> expected{"stop_serving", "quiesce",
+                                            "object_count", "disk_free",
+                                            "read_memory",  "write"};
     EXPECT_EQ(fake.events, expected);
     EXPECT_EQ(fake.workers_seen, 4u);
     ClaimResult claim = ClaimHandoffSnapshot(root.path());
@@ -455,6 +456,30 @@ TEST(HandoffShutdownTest, OrderAndPublishedSnapshot) {
     EXPECT_TRUE(fs::exists(claim.snapshot_dir + "/handoff_manifest"));
     EXPECT_NE(ReadLastShutdown(root.path()).find("\"result\":\"ok\""),
               std::string::npos);
+}
+
+TEST(HandoffShutdownTest, TrimOnlyWhenShortOfWorkers) {
+    TempDir root;
+    FakeShutdown fake;
+    // Room for 2 of the 4 wanted workers before the trim; the trim frees
+    // enough for all 4.
+    const uint64_t safety = AdmissionSafetyBytes(80 * kGiB);
+    const uint64_t per_worker = 16 * kMiB + 1 * 1350;
+    fake.memory = Memory(80 * kGiB,
+                         80 * kGiB - (safety + 64 * kMiB + 2 * per_worker + 1));
+    ShutdownSteps steps = fake.Steps();
+    steps.trim = [&] {
+        fake.events.push_back("trim");
+        fake.memory = Memory(80 * kGiB, 1 * kGiB);
+    };
+    ShutdownReport report =
+        RunHandoffShutdown(steps, {root.path(), true, 4, 14});
+    EXPECT_EQ(report.result, "ok") << report.detail;
+    const std::vector<std::string> expected{
+        "stop_serving", "quiesce", "object_count", "disk_free",
+        "read_memory",  "trim",    "read_memory",  "write"};
+    EXPECT_EQ(fake.events, expected);
+    EXPECT_EQ(fake.workers_seen, 4u);
 }
 
 TEST(HandoffShutdownTest, NotOwnerStopsButWritesNothing) {

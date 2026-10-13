@@ -432,7 +432,8 @@ DEFINE_int32(handoff_max_age_sec, 600,
 DEFINE_uint64(handoff_restore_bytes_per_object, 1280,
               "Restore admission: expected peak RSS per object");
 DEFINE_bool(handoff_malloc_trim, true,
-            "malloc_trim(0) before the shutdown admission check");
+            "malloc_trim(0) and re-check when the shutdown admission check "
+            "gives fewer writer threads than wanted");
 DEFINE_int32(handoff_lock_wait_sec, 10,
              "How long to wait for the handoff directory lock at startup");
 DEFINE_string(handoff_cgroup_root, "/sys/fs/cgroup",

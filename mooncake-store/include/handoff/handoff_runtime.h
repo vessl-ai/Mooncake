@@ -57,7 +57,8 @@ struct ShutdownSteps {
     std::function<void()> stop_serving;
     // Stops and joins every background thread that mutates metadata.
     std::function<void()> quiesce;
-    // malloc_trim(0); may be empty.
+    // malloc_trim(0); may be empty. Only called when the first admission
+    // check gives fewer workers than wanted (or none).
     std::function<void()> trim;
     std::function<tl::expected<MemorySnapshot, std::string>()> read_memory;
     std::function<uint64_t()> object_count;
@@ -101,8 +102,9 @@ struct ShutdownReport {
 };
 
 // Order: stop_serving -> quiesce -> ownership / poison checks -> reset the
-// directory -> trim -> admission -> write into snap-<id>.tmp -> poison
-// re-check -> publish (rename + READY). Writes last_shutdown at the end.
+// directory -> admission (trim and re-check if short) -> write into
+// snap-<id>.tmp -> poison re-check -> publish (rename + READY). Writes
+// last_shutdown at the end.
 // Never throws; the caller exits the process afterwards.
 ShutdownReport RunHandoffShutdown(const ShutdownSteps& steps,
                                   const ShutdownOptions& options,

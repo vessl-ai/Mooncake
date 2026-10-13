@@ -725,6 +725,21 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
 // stopped, otherwise a handler could schedule new work (e.g. ReserveJob on a
 // stopped offboarding worker CHECK-fails).
 void MasterService::QuiesceBackgroundWork() {
+    // Per-step wall time, logged once: a slow step here lengthens the
+    // shutdown handoff gap.
+    std::ostringstream timings;
+    auto timed = [&timings](const char* name, auto&& step) {
+        const auto start = std::chrono::steady_clock::now();
+        step();
+        timings << " " << name << "_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    };
+    auto join = [](std::thread& thread) {
+        if (thread.joinable()) thread.join();
+    };
+
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -738,8 +753,8 @@ void MasterService::QuiesceBackgroundWork() {
     job_dispatch_running_ = false;
     dynamic_replication_admission_running_ = false;
     http_metadata_cleanup_running_ = false;
-    graceful_unmount_scheduler_.Stop();
-    replica_cleanup_worker_.Stop();
+    timed("graceful_unmount", [&] { graceful_unmount_scheduler_.Stop(); });
+    timed("replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -753,37 +768,24 @@ void MasterService::QuiesceBackgroundWork() {
     dynamic_replication_admission_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
 
-    if (eviction_thread_.joinable()) {
-        eviction_thread_.join();
-    }
-    if (client_monitor_thread_.joinable()) {
-        client_monitor_thread_.join();
-    }
+    timed("eviction", [&] { join(eviction_thread_); });
+    timed("client_monitor", [&] { join(client_monitor_thread_); });
 #ifdef USE_NOF
-    if (nof_heartbeat_thread_.joinable()) {
-        nof_heartbeat_thread_.join();
-    }
+    timed("nof_heartbeat", [&] { join(nof_heartbeat_thread_); });
 #endif
-    if (task_cleanup_thread_.joinable()) {
-        task_cleanup_thread_.join();
-    }
-    if (http_metadata_cleanup_thread_.joinable()) {
-        http_metadata_cleanup_thread_.join();
-    }
-    if (job_dispatch_thread_.joinable()) {
-        job_dispatch_thread_.join();
-    }
-    if (dynamic_replication_admission_thread_.joinable()) {
-        dynamic_replication_admission_thread_.join();
-    }
+    timed("task_cleanup", [&] { join(task_cleanup_thread_); });
+    timed("http_metadata_cleanup",
+          [&] { join(http_metadata_cleanup_thread_); });
+    timed("job_dispatch", [&] { join(job_dispatch_thread_); });
+    timed("dynamic_replication",
+          [&] { join(dynamic_replication_admission_thread_); });
 
     // Join the snapshot producer before dropping queued/backoff offboarding
     // work. No snapshot can observe those residual jobs after this point.
-    if (snapshot_manager_) {
-        snapshot_manager_.reset();
-    }
-    client_offboarding_worker_.Stop();
+    timed("snapshot_manager", [&] { snapshot_manager_.reset(); });
+    timed("client_offboarding", [&] { client_offboarding_worker_.Stop(); });
     background_quiesced_.store(true, std::memory_order_release);
+    LOG(INFO) << "action=quiesce_background_work" << timings.str();
 }
 
 void MasterService::SleepWhileRunning(std::chrono::milliseconds duration,
