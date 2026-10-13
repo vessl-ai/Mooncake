@@ -1710,6 +1710,17 @@ class MasterService {
     bool HasStaleOffloadTake(const TenantState& tenant_state,
                              const std::string& key, const UUID& client_id,
                              std::chrono::system_clock::time_point now) const;
+    // Every master starts without any record of the offloads its stores took
+    // from a previous master. Unless the handoff carried them (offload
+    // takes), a report of such a take may still arrive and carries only the
+    // key, so after a cold start no store takes an offload task for
+    // put_start_release_timeout. Called by mooncake_master before serving
+    // when no handoff snapshot was restored.
+    void HoldOffloadTakesAfterColdStart();
+    bool OffloadTakesHeld() const {
+        return std::chrono::system_clock::now().time_since_epoch().count() <
+               offload_take_hold_until_.load(std::memory_order_relaxed);
+    }
     // Marks `client_id` as a taker of the current offload task of each key
     // it has just drained (OffloadObjectHeartbeat) and returns the items it
     // took; only those are handed to the store.
@@ -2713,6 +2724,9 @@ class MasterService {
             opened;
     };
     HandoffDiskGate handoff_disk_gate_;
+    // system_clock ticks until which no store may take an offload task
+    // (HoldOffloadTakesAfterColdStart); 0 = no hold.
+    std::atomic<int64_t> offload_take_hold_until_{0};
     std::atomic<uint64_t> handoff_restored_offload_takes_{0};
     int64_t handoff_restored_file_capacity_{0};
 

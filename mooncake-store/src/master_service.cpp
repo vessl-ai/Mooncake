@@ -5390,7 +5390,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !metadata.HasReplica([](const Replica& replica) {
+        !offload_on_evict_ && !OffloadTakesHeld() &&
+        !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& tenant_state = accessor.GetTenantState();
@@ -8407,6 +8408,10 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
     // not track.
     std::vector<OffloadTaskItem> taken;
     const auto now = std::chrono::system_clock::now();
+    // After a cold start no store may take anything until a report of a
+    // take made from the previous master can no longer arrive (see
+    // HoldOffloadTakesAfterColdStart).
+    const bool cold_start_hold = OffloadTakesHeld();
     for (const auto& item : drained) {
         const TenantId item_tenant = enable_multi_tenants_
                                          ? TenantId(item.tenant_id)
@@ -8428,7 +8433,8 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
             mirrors.end()) {
             continue;
         }
-        if (HasStaleOffloadTake(tenant_state, object_id.user_key, client_id,
+        if (cold_start_hold ||
+            HasStaleOffloadTake(tenant_state, object_id.user_key, client_id,
                                 now)) {
             // A report of this client's earlier offload of the key may still
             // arrive and would be indistinguishable from this task's. The
@@ -8450,6 +8456,15 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
         }
     }
     return taken;
+}
+
+void MasterService::HoldOffloadTakesAfterColdStart() {
+    const auto until =
+        std::chrono::system_clock::now() + put_start_release_timeout_sec_;
+    offload_take_hold_until_.store(until.time_since_epoch().count(),
+                                   std::memory_order_relaxed);
+    LOG(INFO) << "offload_take_hold=cold_start, seconds="
+              << put_start_release_timeout_sec_.count();
 }
 
 void MasterService::ReleaseOffloadingTask(
@@ -11462,7 +11477,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           TenantState& tenant_state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
-        if (!offload_on_evict_) {
+        // No store may take an offload during the cold-start hold: evict
+        // without queuing one (a queued task would pin the source until the
+        // next drain drops it).
+        if (!offload_on_evict_ || OffloadTakesHeld()) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
@@ -11790,7 +11808,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (enable_oplog_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
-        if (!offload_on_evict_) {
+        // No store may take an offload during the cold-start hold: evict
+        // without queuing one (a queued task would pin the source until the
+        // next drain drops it).
+        if (!offload_on_evict_ || OffloadTakesHeld()) {
             // Original behavior
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }

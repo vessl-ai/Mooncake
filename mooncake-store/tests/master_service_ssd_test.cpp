@@ -741,6 +741,40 @@ TEST_F(MasterServiceSSDTest, CompletionOvertakenByItsNackIsRefused) {
     ExpectMemoryOnly(*service, "nack_key");
 }
 
+// After a cold start the master does not know which offloads its stores took
+// from the previous master; their reports carry only the key. No store takes
+// an offload task until such a report can no longer arrive.
+TEST_F(MasterServiceSSDTest, NoOffloadIsTakenRightAfterAColdStart) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;
+    config.put_start_discard_timeout_sec = 1;
+    config.put_start_release_timeout_sec = 2;
+    auto service = std::make_unique<MasterService>(config);
+    service->HoldOffloadTakesAfterColdStart();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "cold_segment", 0x390000000);
+    PutMemoryObject(*service, client_id, "cold_key", 4096);
+    auto during = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(during.has_value());
+    EXPECT_TRUE(during->empty());
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(
+        service
+            ->NotifyOffloadSuccess(client_id, {Task("cold_key", 4096)}, {file})
+            .has_value());
+    ExpectMemoryOnly(*service, "cold_key");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+    PutMemoryObject(*service, client_id, "warm_key", 4096);
+    auto after = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(after.has_value());
+    ASSERT_EQ(after->size(), 1u);
+    EXPECT_EQ(after->front().key, "warm_key");
+}
+
 // A mirror that did not get the pinned source copies from a buffer nothing
 // pins, so only the source owner's completion is registered.
 TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {

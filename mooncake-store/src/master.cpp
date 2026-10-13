@@ -1611,6 +1611,8 @@ struct HandoffContext {
     bool enabled{false};
     // False if the startup step decided this master must not serve.
     bool serve{true};
+    // True if a handoff snapshot was restored (offload takes carried).
+    bool restored{false};
     std::string root;
     mooncake::handoff::HandoffDirLock lock;
     mooncake::handoff::CgroupPaths cgroup;
@@ -1725,6 +1727,7 @@ void RunHandoffAtStartup(HandoffContext& ctx,
                           : std::min<size_t>(ctx.cpus, 16);
     const h::StartupReport report = h::RunHandoffStartup(steps, options);
     ctx.serve = report.serve;
+    ctx.restored = report.result == "ok";
     h::HandoffMetrics::Instance().SetStartup(report);
     h::HandoffMetrics::Instance().SetSegmentCounters(
         [&service](uint64_t* pending, uint64_t* confirmed, uint64_t* dropped) {
@@ -2119,6 +2122,13 @@ int main(int argc, char* argv[]) {
             // written). Nothing was restored and nothing was served.
             LOG(ERROR) << "handoff: stopping without serving";
             return 0;
+        }
+        if (!handoff.restored) {
+            // Cold start: the stores' offload takes from the previous master
+            // were not carried, so their late reports must not meet a new
+            // take of the same key.
+            wrapped_master_service->GetMasterServiceForHandoff()
+                .HoldOffloadTakesAfterColdStart();
         }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
