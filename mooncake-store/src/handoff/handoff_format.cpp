@@ -1,0 +1,447 @@
+#include "handoff/handoff_format.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <charconv>
+#include <cstring>
+#include <memory>
+
+#include <boost/functional/hash.hpp>
+
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
+
+#include "crc32c.h"
+#include "metadata_store.h"
+
+namespace mooncake::handoff {
+
+namespace {
+
+constexpr char kMagic[] = "MOONCAKE-HANDOFF";
+
+Json::Value EncodeUuid(const UUID& id) {
+    Json::Value v(Json::arrayValue);
+    v.append(Json::UInt64(id.first));
+    v.append(Json::UInt64(id.second));
+    return v;
+}
+
+bool DecodeUuid(const Json::Value& v, UUID& id) {
+    if (!v.isArray() || v.size() != 2 || !v[0].isUInt64() ||
+        !v[1].isUInt64()) {
+        return false;
+    }
+    id = {v[0].asUInt64(), v[1].asUInt64()};
+    return true;
+}
+
+Json::Value EncodeBlob(const BlobInfo& blob) {
+    Json::Value v(Json::objectValue);
+    v["key"] = blob.key;
+    v["bytes"] = Json::UInt64(blob.bytes);
+    v["crc32c"] = Json::UInt(blob.crc32c);
+    return v;
+}
+
+bool DecodeBlob(const Json::Value& v, BlobInfo& blob) {
+    if (!v.isObject() || !v["key"].isString() || !v["bytes"].isUInt64() ||
+        !v["crc32c"].isUInt()) {
+        return false;
+    }
+    blob.key = v["key"].asString();
+    blob.bytes = v["bytes"].asUInt64();
+    blob.crc32c = v["crc32c"].asUInt();
+    return !blob.key.empty();
+}
+
+bool GetU64(const Json::Value& root, const char* field, uint64_t& out) {
+    if (!root.isMember(field) || !root[field].isUInt64()) return false;
+    out = root[field].asUInt64();
+    return true;
+}
+
+bool GetStr(const Json::Value& root, const char* field, std::string& out) {
+    if (!root.isMember(field) || !root[field].isString()) return false;
+    out = root[field].asString();
+    return true;
+}
+
+}  // namespace
+
+Segment SegmentIdentity::ToSegment() const {
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = name;
+    segment.base = static_cast<uintptr_t>(base);
+    segment.size = static_cast<size_t>(size);
+    segment.te_endpoint = te_endpoint;
+    segment.protocol = protocol;
+    segment.host_id = host_id;
+    return segment;
+}
+
+SegmentIdentity SegmentIdentity::FromSegment(const Segment& segment,
+                                             const UUID& owner) {
+    SegmentIdentity identity;
+    identity.segment_id = segment.id;
+    identity.name = segment.name;
+    identity.te_endpoint = segment.te_endpoint;
+    identity.base = segment.base;
+    identity.size = segment.size;
+    identity.protocol = segment.protocol;
+    identity.host_id = segment.host_id;
+    identity.owner_client_id = owner;
+    return identity;
+}
+
+CodecFingerprint CurrentCodecFingerprint() {
+    CodecFingerprint fp;
+    fp.object_entry = struct_pack::get_type_code<StandbyObjectEntry>();
+    fp.segments =
+        struct_pack::get_type_code<std::vector<StandbySegmentInfo>>();
+    fp.quarantine =
+        struct_pack::get_type_code<std::vector<QuarantineRange>>();
+    return fp;
+}
+
+SegmentLocator::SegmentLocator(const std::vector<SegmentIdentity>& segments)
+    : segments_(segments) {
+    for (uint32_t i = 0; i < segments.size(); ++i) {
+        by_alias_[segments[i].te_endpoint].push_back(i);
+        if (segments[i].name != segments[i].te_endpoint) {
+            by_alias_[segments[i].name].push_back(i);
+        }
+    }
+}
+
+std::optional<uint32_t> SegmentLocator::Find(const std::string& endpoint,
+                                             uint64_t address,
+                                             uint64_t size) const {
+    const auto it = by_alias_.find(endpoint);
+    if (it == by_alias_.end() || size == 0) {
+        return std::nullopt;
+    }
+    for (const uint32_t index : it->second) {
+        const auto& segment = segments_[index];
+        if (address >= segment.base && address - segment.base < segment.size &&
+            size <= segment.size - (address - segment.base)) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> ValidateSegments(
+    const std::vector<SegmentIdentity>& segments) {
+    std::unordered_set<UUID, boost::hash<UUID>> ids;
+    for (const auto& s : segments) {
+        if (s.name.empty() || s.te_endpoint.empty() || s.base == 0 ||
+            s.size == 0 || s.base > UINT64_MAX - s.size) {
+            return "invalid segment " + s.name;
+        }
+        if (s.protocol == "cxl") {
+            return "cxl segment not supported: " + s.name;
+        }
+        if (s.owner_client_id == UUID{0, 0}) {
+            return "segment without owner: " + s.name;
+        }
+        if (!ids.insert(s.segment_id).second) {
+            return "duplicate segment id for " + s.name;
+        }
+    }
+    for (size_t i = 0; i < segments.size(); ++i) {
+        for (size_t j = i + 1; j < segments.size(); ++j) {
+            const auto& a = segments[i];
+            const auto& b = segments[j];
+            const bool share_alias =
+                a.te_endpoint == b.te_endpoint || a.name == b.name ||
+                a.te_endpoint == b.name || a.name == b.te_endpoint;
+            if (share_alias && a.base < b.base + b.size &&
+                b.base < a.base + a.size) {
+                return "overlapping segments " + a.name + " and " + b.name;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::string EncodeManifest(const Manifest& m) {
+    Json::Value root(Json::objectValue);
+    root["format"] = m.format;
+    root["schema_version"] = Json::UInt(m.schema_version);
+    root["snapshot_id"] = m.snapshot_id;
+    root["created_at_ms"] = Json::Int64(m.created_at_ms);
+    Json::Value codec(Json::objectValue);
+    codec["object_entry"] = Json::UInt(m.codec.object_entry);
+    codec["segments"] = Json::UInt(m.codec.segments);
+    codec["quarantine"] = Json::UInt(m.codec.quarantine);
+    root["codec"] = codec;
+    root["memory_allocator"] = m.memory_allocator;
+    root["multi_tenant"] = m.multi_tenant;
+    root["next_replica_id"] = Json::UInt64(m.next_replica_id);
+    root["object_count"] = Json::UInt64(m.object_count);
+    root["replica_count"] = Json::UInt64(m.replica_count);
+    Json::Value segments(Json::arrayValue);
+    for (const auto& s : m.segments) {
+        Json::Value v(Json::objectValue);
+        v["segment_id"] = EncodeUuid(s.segment_id);
+        v["name"] = s.name;
+        v["te_endpoint"] = s.te_endpoint;
+        v["base"] = Json::UInt64(s.base);
+        v["size"] = Json::UInt64(s.size);
+        v["protocol"] = s.protocol;
+        v["host_id"] = s.host_id;
+        v["owner_client_id"] = EncodeUuid(s.owner_client_id);
+        segments.append(v);
+    }
+    root["segments"] = segments;
+    Json::Value chunks(Json::arrayValue);
+    for (const auto& c : m.chunks) {
+        Json::Value v(Json::objectValue);
+        v["index"] = Json::UInt64(c.index);
+        v["key"] = c.key;
+        v["objects"] = Json::UInt64(c.objects);
+        v["bytes"] = Json::UInt64(c.bytes);
+        v["crc32c"] = Json::UInt(c.crc32c);
+        chunks.append(v);
+    }
+    root["chunks"] = chunks;
+    if (m.weight_metadata) {
+        root["weight_metadata"] = EncodeBlob(*m.weight_metadata);
+    }
+    root["quarantine"] = EncodeBlob(m.quarantine);
+    root["quarantine_ranges"] = Json::UInt64(m.quarantine_ranges);
+    Json::Value w(Json::objectValue);
+    w["objects"] = Json::UInt64(m.writer.objects);
+    w["replicas"] = Json::UInt64(m.writer.replicas);
+    w["skipped_processing"] = Json::UInt64(m.writer.skipped_processing);
+    w["skipped_no_exportable_replica"] =
+        Json::UInt64(m.writer.skipped_no_exportable_replica);
+    w["dropped_non_memory_replicas"] =
+        Json::UInt64(m.writer.dropped_non_memory_replicas);
+    w["dropped_incomplete_replicas"] =
+        Json::UInt64(m.writer.dropped_incomplete_replicas);
+    w["dropped_unknown_segment_replicas"] =
+        Json::UInt64(m.writer.dropped_unknown_segment_replicas);
+    w["quarantine_ranges"] = Json::UInt64(m.writer.quarantine_ranges);
+    w["quarantine_bytes"] = Json::UInt64(m.writer.quarantine_bytes);
+    w["total_bytes"] = Json::UInt64(m.writer.total_bytes);
+    w["workers"] = Json::UInt64(m.writer.workers);
+    w["duration_ms"] = Json::UInt64(m.writer.duration_ms);
+    w["peak_rss_kib"] = Json::UInt64(m.writer.peak_rss_kib);
+    root["writer"] = w;
+
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = " ";
+    const std::string body = Json::writeString(builder, root);
+    const uint32_t crc = Crc32cValue(body.data(), body.size());
+    return std::string(kMagic) + " " + std::to_string(kHandoffSchemaVersion) +
+           " " + std::to_string(crc) + " " + std::to_string(body.size()) +
+           "\n" + body;
+}
+
+tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
+    const size_t newline = file.find('\n');
+    if (newline == std::string_view::npos) {
+        return tl::make_unexpected("manifest header missing");
+    }
+    const std::string_view header = file.substr(0, newline);
+    const std::string_view body = file.substr(newline + 1);
+    // Header: magic schema crc size.
+    std::vector<std::string_view> parts;
+    size_t pos = 0;
+    while (pos <= header.size()) {
+        const size_t space = header.find(' ', pos);
+        const size_t end = space == std::string_view::npos ? header.size()
+                                                           : space;
+        parts.push_back(header.substr(pos, end - pos));
+        pos = end + 1;
+    }
+    if (parts.size() != 4 || parts[0] != kMagic) {
+        return tl::make_unexpected("manifest magic mismatch");
+    }
+    uint64_t schema = 0, crc = 0, size = 0;
+    auto parse = [](std::string_view s, uint64_t& v) {
+        auto r = std::from_chars(s.data(), s.data() + s.size(), v);
+        return r.ec == std::errc() && r.ptr == s.data() + s.size();
+    };
+    if (!parse(parts[1], schema) || !parse(parts[2], crc) ||
+        !parse(parts[3], size)) {
+        return tl::make_unexpected("manifest header malformed");
+    }
+    if (schema != kHandoffSchemaVersion) {
+        return tl::make_unexpected("unsupported handoff schema " +
+                                   std::to_string(schema));
+    }
+    if (size != body.size()) {
+        return tl::make_unexpected("manifest body size mismatch");
+    }
+    if (Crc32cValue(body.data(), body.size()) != crc) {
+        return tl::make_unexpected("manifest crc mismatch");
+    }
+
+    Json::CharReaderBuilder builder;
+    builder["failIfExtra"] = true;
+    builder["rejectDupKeys"] = true;
+    builder["strictRoot"] = true;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    Json::Value root;
+    std::string errors;
+    if (!reader->parse(body.data(), body.data() + body.size(), &root,
+                       &errors) ||
+        !root.isObject()) {
+        return tl::make_unexpected("manifest json invalid: " + errors);
+    }
+
+    Manifest m;
+    uint64_t u = 0;
+    if (!GetStr(root, "format", m.format) || m.format != kHandoffFormat) {
+        return tl::make_unexpected("manifest format mismatch");
+    }
+    if (!GetU64(root, "schema_version", u) || u != kHandoffSchemaVersion) {
+        return tl::make_unexpected("manifest schema mismatch");
+    }
+    m.schema_version = static_cast<uint32_t>(u);
+    const Json::Value& codec = root["codec"];
+    if (!GetStr(root, "snapshot_id", m.snapshot_id) ||
+        !root["created_at_ms"].isInt64() || !codec.isObject() ||
+        !codec["object_entry"].isUInt() || !codec["segments"].isUInt() ||
+        !codec["quarantine"].isUInt() ||
+        !GetStr(root, "memory_allocator", m.memory_allocator) ||
+        !root["multi_tenant"].isBool() ||
+        !GetU64(root, "next_replica_id", m.next_replica_id) ||
+        !GetU64(root, "object_count", m.object_count) ||
+        !GetU64(root, "replica_count", m.replica_count) ||
+        !root["segments"].isArray() || !root["chunks"].isArray() ||
+        !DecodeBlob(root["quarantine"], m.quarantine) ||
+        !GetU64(root, "quarantine_ranges", m.quarantine_ranges)) {
+        return tl::make_unexpected("manifest field missing or mistyped");
+    }
+    m.created_at_ms = root["created_at_ms"].asInt64();
+    m.codec.object_entry = codec["object_entry"].asUInt();
+    m.codec.segments = codec["segments"].asUInt();
+    m.codec.quarantine = codec["quarantine"].asUInt();
+    m.multi_tenant = root["multi_tenant"].asBool();
+    for (const auto& v : root["segments"]) {
+        SegmentIdentity s;
+        if (!v.isObject() || !DecodeUuid(v["segment_id"], s.segment_id) ||
+            !GetStr(v, "name", s.name) ||
+            !GetStr(v, "te_endpoint", s.te_endpoint) ||
+            !GetU64(v, "base", s.base) || !GetU64(v, "size", s.size) ||
+            !GetStr(v, "protocol", s.protocol) ||
+            !GetStr(v, "host_id", s.host_id) ||
+            !DecodeUuid(v["owner_client_id"], s.owner_client_id)) {
+            return tl::make_unexpected("manifest segment entry invalid");
+        }
+        m.segments.push_back(std::move(s));
+    }
+    for (const auto& v : root["chunks"]) {
+        ChunkInfo c;
+        if (!v.isObject() || !GetU64(v, "index", c.index) ||
+            !GetStr(v, "key", c.key) || !GetU64(v, "objects", c.objects) ||
+            !GetU64(v, "bytes", c.bytes) || !v["crc32c"].isUInt()) {
+            return tl::make_unexpected("manifest chunk entry invalid");
+        }
+        c.crc32c = v["crc32c"].asUInt();
+        m.chunks.push_back(std::move(c));
+    }
+    if (root.isMember("weight_metadata")) {
+        BlobInfo blob;
+        if (!DecodeBlob(root["weight_metadata"], blob)) {
+            return tl::make_unexpected("manifest weight entry invalid");
+        }
+        m.weight_metadata = std::move(blob);
+    }
+    const Json::Value& w = root["writer"];
+    if (w.isObject()) {
+        GetU64(w, "objects", m.writer.objects);
+        GetU64(w, "replicas", m.writer.replicas);
+        GetU64(w, "skipped_processing", m.writer.skipped_processing);
+        GetU64(w, "skipped_no_exportable_replica",
+               m.writer.skipped_no_exportable_replica);
+        GetU64(w, "dropped_non_memory_replicas",
+               m.writer.dropped_non_memory_replicas);
+        GetU64(w, "dropped_incomplete_replicas",
+               m.writer.dropped_incomplete_replicas);
+        GetU64(w, "dropped_unknown_segment_replicas",
+               m.writer.dropped_unknown_segment_replicas);
+        GetU64(w, "quarantine_ranges", m.writer.quarantine_ranges);
+        GetU64(w, "quarantine_bytes", m.writer.quarantine_bytes);
+        GetU64(w, "total_bytes", m.writer.total_bytes);
+        GetU64(w, "workers", m.writer.workers);
+        GetU64(w, "duration_ms", m.writer.duration_ms);
+        GetU64(w, "peak_rss_kib", m.writer.peak_rss_kib);
+    }
+    for (size_t i = 0; i < m.chunks.size(); ++i) {
+        if (m.chunks[i].index != i) {
+            return tl::make_unexpected("manifest chunk indices not dense");
+        }
+    }
+    return m;
+}
+
+std::vector<uint8_t> EncodeQuarantine(
+    const std::vector<QuarantineRange>& ranges) {
+    return struct_pack::serialize<std::vector<uint8_t>>(ranges);
+}
+
+tl::expected<std::vector<QuarantineRange>, std::string> DecodeQuarantine(
+    const std::vector<uint8_t>& bytes) {
+    std::vector<QuarantineRange> ranges;
+    if (struct_pack::deserialize_to(ranges, bytes) != struct_pack::errc::ok) {
+        return tl::make_unexpected("quarantine decode failed");
+    }
+    return ranges;
+}
+
+tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(
+    const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return tl::make_unexpected("open " + path + ": " +
+                                   std::strerror(errno));
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        const std::string err = std::strerror(errno);
+        ::close(fd);
+        return tl::make_unexpected("fstat " + path + ": " + err);
+    }
+    std::vector<uint8_t> data(static_cast<size_t>(st.st_size));
+    size_t done = 0;
+    while (done < data.size()) {
+        const ssize_t n = ::read(fd, data.data() + done, data.size() - done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            const std::string err = n == 0 ? "short read" : std::strerror(errno);
+            ::close(fd);
+            return tl::make_unexpected("read " + path + ": " + err);
+        }
+        done += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    return data;
+}
+
+tl::expected<std::vector<uint8_t>, std::string> ReadVerifiedBlob(
+    const std::string& dir, const std::string& key, uint64_t bytes,
+    uint32_t crc32c) {
+    auto data = ReadFileBytes(dir + "/" + key);
+    if (!data) return data;
+    if (data->size() != bytes) {
+        return tl::make_unexpected("size mismatch for " + key);
+    }
+    if (Crc32cValue(data->data(), data->size()) != crc32c) {
+        return tl::make_unexpected("crc mismatch for " + key);
+    }
+    return data;
+}
+
+}  // namespace mooncake::handoff

@@ -99,6 +99,28 @@ class ScopedSegmentAccess {
     ErrorCode ValidateRemountSegment(const Segment& segment,
                                      const UUID& client_id) const;
 
+    /**
+     * @brief Mount a segment restored from a handoff snapshot with its
+     * original identity and owner, adopting an allocator built by the restore.
+     * The segment starts non-allocatable; SetSegmentAllocatable(true) opens it
+     * once the owner has confirmed the segment. Only valid before the master
+     * serves requests.
+     */
+    ErrorCode MountRestoredSegment(
+        const Segment& segment, const UUID& client_id,
+        std::shared_ptr<ClientLivenessRecord> client_liveness,
+        std::shared_ptr<BufferAllocatorBase> allocator);
+
+    ErrorCode SetSegmentAllocatable(const UUID& segment_id, bool allocatable);
+
+    /**
+     * @brief Returns a function that binds a buffer to the segment's
+     * registration (segment lifetime and owner liveness). The function holds
+     * the registration and may be called without the segment lock.
+     */
+    std::function<void(AllocatedBuffer&)> MakeBufferBinder(
+        const UUID& segment_id) const;
+
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
 
     struct AllocatorReplacement {

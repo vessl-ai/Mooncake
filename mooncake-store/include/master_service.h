@@ -55,6 +55,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "handoff/handoff_format.h"
 
 namespace mooncake {
 
@@ -894,6 +895,72 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+
+    // ---- Shutdown handoff snapshot (INF-600, fork-only) ----
+    // Export side. Callers must have stopped the RPC server first, so that
+    // nothing allocates or frees store memory while the export runs.
+    std::vector<handoff::SegmentIdentity> ExportHandoffSegments();
+    void ExportHandoffShard(size_t shard_idx,
+                            const handoff::SegmentLocator& locator,
+                            std::vector<StandbyObjectEntry>& objects,
+                            std::vector<handoff::QuarantineRange>& quarantine,
+                            handoff::WriterStats& stats) const;
+    WeightMetadataSnapshot ExportHandoffWeightMetadata() const;
+    static size_t HandoffShardCount() { return kNumShards; }
+    static uint64_t HandoffNextReplicaId() { return Replica::next_id_.load(); }
+    bool HandoffMultiTenant() const { return enable_multi_tenants_; }
+
+    struct HandoffRestoreOptions {
+        size_t workers{8};
+    };
+    struct HandoffRestoreStats {
+        uint64_t objects{0};
+        uint64_t replicas{0};
+        uint64_t segments{0};
+        uint64_t chunks{0};
+        uint64_t quarantine_ranges{0};
+        uint64_t workers{0};
+        uint64_t manifest_ns{0};
+        uint64_t mount_ns{0};
+        uint64_t insert_wall_ns{0};
+        uint64_t load_cpu_ns{0};
+        uint64_t prepare_cpu_ns{0};
+        uint64_t insert_cpu_ns{0};
+        uint64_t rebuild_wall_ns{0};
+        uint64_t sort_cpu_ns{0};
+        uint64_t import_cpu_ns{0};
+        uint64_t finalize_ns{0};
+        uint64_t total_ns{0};
+        uint64_t rss_kib_start{0};
+        uint64_t rss_kib_after_insert{0};
+        uint64_t rss_kib_end{0};
+        uint64_t hwm_kib_end{0};
+        std::string ToJson() const;
+    };
+    // Restores a handoff snapshot into this (empty, not yet serving) master.
+    // Restored memory segments are mounted with their original identity and
+    // owner but stay unreadable and non-allocatable until the owner remounts
+    // them with the same identity. On any error the master is reset to an
+    // empty state and the error is returned.
+    tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoff(
+        const std::string& dir, const HandoffRestoreOptions& options);
+    // Exclusive-lock hold time of the last ReMountSegment call, and counters
+    // of restored segments confirmed or dropped since start.
+    uint64_t LastRemountLockHoldNs() const {
+        return last_remount_lock_hold_ns_.load(std::memory_order_relaxed);
+    }
+    uint64_t HandoffSegmentsConfirmed() const {
+        return handoff_segments_confirmed_.load(std::memory_order_relaxed);
+    }
+    uint64_t HandoffSegmentsDropped() const {
+        return handoff_segments_dropped_.load(std::memory_order_relaxed);
+    }
+    size_t HandoffPendingSegmentCount() const;
+    size_t HandoffQuarantineBufferCount() const;
+    // Releases quarantined ranges whose deadline has passed. Called by the
+    // task cleanup thread; public for tests.
+    void ReleaseExpiredHandoffQuarantine(
+        std::chrono::steady_clock::time_point now);
 
     /**
      * @brief Query the status of a task
@@ -2507,6 +2574,47 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    // ---- Shutdown handoff restore state (INF-600, fork-only) ----
+    // Restored memory segments whose owner has not yet confirmed them by a
+    // remount with the same identity. Guarded by client_mutex_; changes to
+    // the read gate (invalid_replica_endpoints_) additionally need
+    // snapshot_mutex_ held exclusively.
+    struct PendingRestoredSegment {
+        UUID owner{0, 0};
+        Segment segment;
+    };
+    std::unordered_map<UUID, PendingRestoredSegment, boost::hash<UUID>>
+        pending_restored_segments_;
+    // Ranges of replicas left out of the snapshot (in-flight puts and other
+    // incomplete replicas), held as allocations until the deadline so that a
+    // late write cannot land in reused memory.
+    struct HandoffQuarantine {
+        mutable std::mutex mutex;
+        std::chrono::steady_clock::time_point deadline{};
+        std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>>
+            buffers;
+    };
+    HandoffQuarantine handoff_quarantine_;
+    std::atomic<uint64_t> last_remount_lock_hold_ns_{0};
+    std::atomic<uint64_t> handoff_segments_confirmed_{0};
+    std::atomic<uint64_t> handoff_segments_dropped_{0};
+
+    tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoffLocked(
+        const std::string& dir, const HandoffRestoreOptions& options);
+    void ResetHandoffState();
+    bool HandoffMasterIsEmpty();
+    // Requires client_mutex_ held exclusively. Returns the pending segments
+    // that `segments` (mounted or remounted by `client_id`) prove stale.
+    std::vector<UUID> FindHandoffMismatchesLocked(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        bool is_remount) const;
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively.
+    void DropPendingRestoredSegmentLocked(const UUID& segment_id,
+                                          const char* reason);
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively.
+    void ConfirmPendingRestoredSegmentsLocked(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

@@ -343,6 +343,68 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::MountRestoredSegment(
+    const Segment& segment, const UUID& client_id,
+    std::shared_ptr<ClientLivenessRecord> client_liveness,
+    std::shared_ptr<BufferAllocatorBase> allocator) {
+    if (!allocator || segment.protocol == "cxl" || segment.base == 0 ||
+        segment.size == 0 || allocator->base() != segment.base ||
+        allocator->capacity() != segment.size) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (segment_manager_->mounted_segments_.contains(segment.id)) {
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    const auto indexed_name =
+        segment_manager_->segment_id_by_name_.find(segment.name);
+    if (indexed_name != segment_manager_->segment_id_by_name_.end()) {
+        const auto indexed_segment =
+            segment_manager_->mounted_segments_.find(indexed_name->second);
+        if (indexed_segment == segment_manager_->mounted_segments_.end() ||
+            indexed_segment->second.status == SegmentStatus::UNMOUNTING) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+    }
+    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
+    auto registration = segment_manager_->allocator_manager_.addAllocator(
+        segment.name, allocator, std::move(client_liveness));
+    registration->SetAllocatable(false);
+    segment_manager_->client_segments_[client_id].push_back(segment.id);
+    segment_manager_->mounted_segments_[segment.id] = {
+        segment, SegmentStatus::OK, std::move(allocator), registration};
+    segment_manager_->client_by_name_[segment.name] = client_id;
+    segment_manager_->segment_id_by_name_[segment.name] = segment.id;
+    AddHostSegment(segment_manager_->segments_by_host_, segment);
+    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                           segment.size);
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::SetSegmentAllocatable(const UUID& segment_id,
+                                                     bool allocatable) {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end() ||
+        !mounted->second.allocator_registration) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    mounted->second.allocator_registration->SetAllocatable(allocatable);
+    return ErrorCode::OK;
+}
+
+std::function<void(AllocatedBuffer&)> ScopedSegmentAccess::MakeBufferBinder(
+    const UUID& segment_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end() ||
+        !mounted->second.allocator_registration) {
+        return {};
+    }
+    std::shared_ptr<const SegmentAllocatorRegistration> registration =
+        mounted->second.allocator_registration;
+    return [registration](AllocatedBuffer& buffer) {
+        registration->BindBuffer(buffer);
+    };
+}
+
 ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
     const Segment& segment, const UUID& client_id) const {
     auto mounted = segment_manager_->mounted_segments_.find(segment.id);

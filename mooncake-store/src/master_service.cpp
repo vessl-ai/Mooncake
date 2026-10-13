@@ -917,6 +917,20 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     ErrorCode mount_result = ErrorCode::INTERNAL_ERROR;
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: a mount that proves a restored segment stale
+            // (e.g. its store restarted during the roll) drops it first.
+            const auto mismatched =
+                FindHandoffMismatchesLocked({segment}, client_id, false);
+            if (!mismatched.empty()) {
+                std::unique_lock<std::shared_mutex> snapshot_lock(
+                    snapshot_mutex_);
+                for (const auto& segment_id : mismatched) {
+                    DropPendingRestoredSegmentLocked(segment_id,
+                                                     "conflicting_mount");
+                }
+            }
+        }
         auto [record_it, inserted] = client_liveness_records_.try_emplace(
             client_id, std::make_shared<ClientLivenessRecord>(
                            ClientLivenessRecord::Clock::now()));
@@ -1034,6 +1048,21 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        // Records how long this call holds client_mutex_ exclusively
+        // (snapshot_mutex_ is taken inside the same scope).
+        struct LockHoldTimer {
+            std::atomic<uint64_t>& out;
+            std::chrono::steady_clock::time_point start;
+            ~LockHoldTimer() {
+                out.store(static_cast<uint64_t>(
+                              std::chrono::duration_cast<
+                                  std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count()),
+                          std::memory_order_relaxed);
+            }
+        } lock_hold_timer{last_remount_lock_hold_ns_,
+                          std::chrono::steady_clock::now()};
         auto [record_it, record_inserted] =
             client_liveness_records_.try_emplace(
                 client_id, std::make_shared<ClientLivenessRecord>(
@@ -1056,6 +1085,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 ClientLivenessState::ACTIVE);
         };
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: drop restored segments this remount proves
+            // stale before the normal validation sees them.
+            for (const auto& segment_id :
+                 FindHandoffMismatchesLocked(segments, client_id, true)) {
+                DropPendingRestoredSegmentLocked(segment_id,
+                                                 "remount_identity_mismatch");
+            }
+        }
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -1330,6 +1368,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         for (const auto* metadata : affected_objects) {
             metadata->GrantReadLease(
                 std::chrono::milliseconds(default_kv_lease_ttl_));
+        }
+
+        if (!pending_restored_segments_.empty()) {
+            // Handoff restore: the owner presented the exact restored
+            // identity, so its objects are intact. The read gate was lifted
+            // above; open the segment for allocation.
+            ConfirmPendingRestoredSegmentsLocked(segments, client_id);
         }
 
         // Change the client status to OK
@@ -3090,6 +3135,7 @@ void MasterService::TaskCleanupThreadFunc() {
         }
         CleanupExpiredSoftPins(std::chrono::system_clock::now());
         CleanupExpiredDynamicReplicationState();
+        ReleaseExpiredHandoffQuarantine(std::chrono::steady_clock::now());
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }

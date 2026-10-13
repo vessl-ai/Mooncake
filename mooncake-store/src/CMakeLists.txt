@@ -26,6 +26,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
+    master_service_handoff.cpp
+    handoff/handoff_format.cpp
+    handoff/handoff_writer.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
