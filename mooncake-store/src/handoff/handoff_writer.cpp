@@ -143,7 +143,7 @@ std::string HandoffWriteResult::ToJson() const {
       << stats.dropped_local_disk_replicas
       << ",\"dropped_local_disk_size_mismatch\":"
       << stats.dropped_local_disk_size_mismatch
-      << ",\"offload_pins\":" << stats.offload_pins
+      << ",\"offload_takes\":" << stats.offload_takes
       << ",\"total_bytes\":" << stats.total_bytes
       << ",\"workers\":" << stats.workers << ",\"chunks\":" << chunks
       << ",\"segments_ns\":" << segments_ns
@@ -203,7 +203,7 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     struct WorkerState {
         handoff::WriterStats stats;
         std::vector<handoff::QuarantineRange> quarantine;
-        std::vector<handoff::OffloadPin> pins;
+        std::vector<handoff::OffloadTake> takes;
         uint64_t export_ns{0}, encode_ns{0}, write_ns{0};
         int previous_fd{-1};
         std::string error;
@@ -227,7 +227,7 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
             auto ts = SteadyClock::now();
             std::vector<StandbyObjectEntry> objects;
             service.ExportHandoffShard(shard, locator, disk_client_ids, objects,
-                                       st.quarantine, st.pins, st.stats);
+                                       st.quarantine, st.takes, st.stats);
             st.export_ns += NsSince(ts);
 
             ts = SteadyClock::now();
@@ -278,7 +278,7 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     }
     result.chunks_wall_ns = NsSince(t);
     std::vector<handoff::QuarantineRange> quarantine;
-    std::vector<handoff::OffloadPin> pins;
+    std::vector<handoff::OffloadTake> takes;
     for (auto& st : states) {
         if (!st.error.empty()) return tl::make_unexpected(st.error);
         auto& s = manifest.writer;
@@ -298,15 +298,15 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         s.dropped_local_disk_replicas += st.stats.dropped_local_disk_replicas;
         s.dropped_local_disk_size_mismatch +=
             st.stats.dropped_local_disk_size_mismatch;
-        s.offload_pins += st.stats.offload_pins;
+        s.offload_takes += st.stats.offload_takes;
         s.total_bytes += st.stats.total_bytes;
         result.export_cpu_ns += st.export_ns;
         result.encode_cpu_ns += st.encode_ns;
         result.write_cpu_ns += st.write_ns;
         quarantine.insert(quarantine.end(), st.quarantine.begin(),
                           st.quarantine.end());
-        pins.insert(pins.end(), std::make_move_iterator(st.pins.begin()),
-                    std::make_move_iterator(st.pins.end()));
+        takes.insert(takes.end(), std::make_move_iterator(st.takes.begin()),
+                     std::make_move_iterator(st.takes.end()));
     }
     service.ExportHandoffPendingQuarantine(manifest.segments, quarantine,
                                            manifest.writer);
@@ -340,13 +340,13 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     if (!disk_blob) return tl::make_unexpected(disk_blob.error());
     manifest.local_disk = *disk_blob;
     manifest.local_disk_clients = disk_clients.size();
-    const auto pin_bytes = handoff::EncodeOffloadPins(pins);
-    auto pin_blob =
-        WriteBlob(root, handoff::kHandoffOffloadPinsFile, pin_bytes.data(),
-                  pin_bytes.size(), options.durable);
-    if (!pin_blob) return tl::make_unexpected(pin_blob.error());
-    manifest.offload_pins = *pin_blob;
-    manifest.offload_pin_count = pins.size();
+    const auto take_bytes = handoff::EncodeOffloadTakes(takes);
+    auto take_blob =
+        WriteBlob(root, handoff::kHandoffOffloadTakesFile, take_bytes.data(),
+                  take_bytes.size(), options.durable);
+    if (!take_blob) return tl::make_unexpected(take_blob.error());
+    manifest.offload_takes = *take_blob;
+    manifest.offload_take_count = takes.size();
 
     // Upstream layout (segments.bin, manifest.json, descriptor.json), so that
     // upstream tooling can read the directory. The restore does not use them.

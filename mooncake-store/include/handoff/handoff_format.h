@@ -40,18 +40,20 @@ namespace mooncake::handoff {
 
 inline constexpr char kHandoffFormat[] = "mooncake-handoff";
 // Schema 1: memory replicas only (stage 1/2). Schema 2 adds the LocalSSD
-// (L4) state: LOCAL_DISK replicas in the chunks (same chunk codec), the
-// per-client registrations and the in-flight offload pins. Schema 3 adds the
-// remaining hold time of every quarantine range, the ranges of the old
-// master's discarded replicas, and DRAINING / DRAINED segments with their
-// status. Older snapshots lack ranges that may still be written, so the
-// reader accepts schema 3 only (an older snapshot means one cold start).
-inline constexpr uint32_t kHandoffSchemaVersion = 3;
-inline constexpr uint32_t kHandoffMinSchemaVersion = 3;
+// (L4) state: LOCAL_DISK replicas in the chunks (same chunk codec) and the
+// per-client registrations. Schema 3 adds the remaining hold time of every
+// quarantine range, the ranges of the old master's discarded replicas, and
+// DRAINING / DRAINED segments with their status. Schema 4 replaces the
+// offload pins of schema 2/3 with the offload takes (OffloadTake). Older
+// snapshots lack ranges that may still be written or takes whose report may
+// still arrive, so the reader accepts schema 4 only (an older snapshot means
+// one cold start).
+inline constexpr uint32_t kHandoffSchemaVersion = 4;
+inline constexpr uint32_t kHandoffMinSchemaVersion = 4;
 inline constexpr char kHandoffManifestFile[] = "handoff_manifest";
 inline constexpr char kHandoffQuarantineFile[] = "handoff_quarantine.bin";
 inline constexpr char kHandoffLocalDiskFile[] = "handoff_local_disk.bin";
-inline constexpr char kHandoffOffloadPinsFile[] = "handoff_offload_pins.bin";
+inline constexpr char kHandoffOffloadTakesFile[] = "handoff_offload_takes.bin";
 inline constexpr char kHandoffSnapshotRoot[] = "handoff";
 
 struct SegmentIdentity {
@@ -98,13 +100,18 @@ struct QuarantineRange {
     YLT_REFL(QuarantineRange, segment_index, address, size, hold_ms);
 };
 
-// An object that had an offload task when the snapshot was taken. A store
-// may still be copying it from its own memory, so the restore keeps its
-// memory replicas from being evicted until the quarantine deadline.
-struct OffloadPin {
+// A store whose report (completion or NACK) of an offload of `key` may still
+// arrive although no master tracks that offload any more: a taker of a task
+// the old master still had (tasks are not carried, so the roll drops them),
+// or a stale take the old master still held. The restore records it as a
+// stale take for `hold_ms` after the restore ends, so the store cannot take
+// a newer offload of the key before such a report can no longer arrive.
+struct OffloadTake {
     std::string tenant_id;
     std::string key;
-    YLT_REFL(OffloadPin, tenant_id, key);
+    UUID client_id{0, 0};
+    uint64_t hold_ms{0};
+    YLT_REFL(OffloadTake, tenant_id, key, client_id, hold_ms);
 };
 
 // Fingerprints of the struct_pack layouts the chunk and segment files were
@@ -116,7 +123,7 @@ struct CodecFingerprint {
     uint32_t quarantine{0};
     // Schema 2 only; 0 in a schema-1 manifest.
     uint32_t local_disk{0};
-    uint32_t offload_pins{0};
+    uint32_t offload_takes{0};
     bool operator==(const CodecFingerprint&) const = default;
 };
 CodecFingerprint CurrentCodecFingerprint();
@@ -142,7 +149,7 @@ struct WriterStats {
     uint64_t disk_only_objects{0};
     uint64_t dropped_local_disk_replicas{0};       // owner not exported
     uint64_t dropped_local_disk_size_mismatch{0};  // object_size != size
-    uint64_t offload_pins{0};
+    uint64_t offload_takes{0};
     uint64_t total_bytes{0};
     uint64_t workers{0};
     uint64_t duration_ms{0};
@@ -171,8 +178,8 @@ struct Manifest {
     uint64_t disk_only_object_count{0};
     std::optional<BlobInfo> local_disk;  // vector<LocalSsdHandoffClient>
     uint64_t local_disk_clients{0};
-    std::optional<BlobInfo> offload_pins;  // vector<OffloadPin>
-    uint64_t offload_pin_count{0};
+    std::optional<BlobInfo> offload_takes;  // vector<OffloadTake>
+    uint64_t offload_take_count{0};
     WriterStats writer;
 };
 
@@ -211,8 +218,8 @@ std::vector<uint8_t> EncodeLocalDiskClients(
     const std::vector<LocalSsdHandoffClient>& clients);
 tl::expected<std::vector<LocalSsdHandoffClient>, std::string>
 DecodeLocalDiskClients(const std::vector<uint8_t>& bytes);
-std::vector<uint8_t> EncodeOffloadPins(const std::vector<OffloadPin>& pins);
-tl::expected<std::vector<OffloadPin>, std::string> DecodeOffloadPins(
+std::vector<uint8_t> EncodeOffloadTakes(const std::vector<OffloadTake>& takes);
+tl::expected<std::vector<OffloadTake>, std::string> DecodeOffloadTakes(
     const std::vector<uint8_t>& bytes);
 
 // Reads a whole file. Error string on I/O failure, or if the file is larger

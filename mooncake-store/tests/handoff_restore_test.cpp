@@ -200,7 +200,8 @@ class HandoffRestoreTest : public ::testing::Test {
         ASSERT_EQ(cleared->size(), keys.size());
     }
 
-    // A registration without an offload task (FileStorage rescan path).
+    // A registration without an offload task (the rescan of a store older
+    // than the L4 fix).
     static bool Register(MasterService& service, const UUID& client_id,
                          const std::string& key, const std::string& endpoint,
                          int64_t size = kObjectSize) {
@@ -593,7 +594,8 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_EQ(written.stats.objects, 45u);
     EXPECT_EQ(written.stats.local_disk_replicas, 25u);
     EXPECT_EQ(written.stats.disk_only_objects, 5u);
-    EXPECT_EQ(written.stats.offload_pins, 10u);
+    // The 10 in-flight offloads were taken by store 0.
+    EXPECT_EQ(written.stats.offload_takes, 10u);
     EXPECT_EQ(written.local_disk_clients, 1u);
 
     MasterService master(MakeL4Config());
@@ -603,7 +605,7 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_EQ(restored->local_disk_clients, 1u);
     EXPECT_EQ(restored->local_disk_replicas, 25u);
     EXPECT_EQ(restored->disk_only_objects, 5u);
-    EXPECT_EQ(restored->offload_pins, 10u);
+    EXPECT_EQ(restored->offload_takes, 10u);
     EXPECT_EQ(master.GetKeyCount(), 45u);
     EXPECT_EQ(master.HandoffLocalDiskObjectCount(), 25u);
     EXPECT_EQ(master.HandoffDiskClientsPending(), 1u);
@@ -614,16 +616,16 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_EQ(gated.error(), ErrorCode::REPLICA_IS_NOT_READY);
 
     // Another store's RPCs do not open store 0's gate. Store 1 had no L4
-    // registration: its heartbeat gets SEGMENT_NOT_FOUND (re-register as
-    // after a cold start).
+    // registration: its heartbeat gets SEGMENT_NOT_FOUND (register anew and
+    // drop its files, as after a cold start).
     ASSERT_TRUE(Remount(master, stores_[1]));
     auto other = master.OffloadObjectHeartbeat(stores_[1].client_id, true);
     ASSERT_FALSE(other.has_value());
     EXPECT_EQ(other.error(), ErrorCode::SEGMENT_NOT_FOUND);
     EXPECT_FALSE(Readable(master, "disk-only-0"));
 
-    // Store 0's next offload heartbeat succeeds (so FileStorage does not
-    // rescan) and returns no task: the old queue is not carried over.
+    // Store 0's next offload heartbeat succeeds (so FileStorage keeps its
+    // files) and returns no task: the old queue is not carried over.
     auto heartbeat = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
     ASSERT_TRUE(heartbeat.has_value()) << toString(heartbeat.error());
     EXPECT_TRUE(heartbeat->empty());
@@ -655,12 +657,8 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_TRUE(before_remount[0].is_local_disk_replica());
     ASSERT_TRUE(Remount(master, stores_[0]));
     EXPECT_EQ(Replicas(master, offloaded).size(), 2u);
-    // Objects whose offload was in flight: memory only, pinned.
+    // Objects whose offload was in flight: memory only.
     EXPECT_EQ(Replicas(master, in_flight).size(), 1u);
-    EXPECT_EQ(master.HandoffOffloadPinCount(), 10u);
-    master.ReleaseExpiredHandoffQuarantine(std::chrono::steady_clock::now() +
-                                           std::chrono::hours(1));
-    EXPECT_EQ(master.HandoffOffloadPinCount(), 0u);
 
     // New offload work flows normally after the restore.
     Put(master, stores_[0], "after");
@@ -766,8 +764,9 @@ TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
 TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
     // Schema 1 and 2 snapshots lack the held-back ranges of discarded
     // replicas and DRAINING segments, so restoring them could hand out a
-    // range a late writer still uses: they always mean a cold start.
-    for (const uint32_t schema : {1u, 2u}) {
+    // range a late writer still uses; schema 3 lacks the offload takes whose
+    // report may still arrive: they always mean a cold start.
+    for (const uint32_t schema : {1u, 2u, 3u}) {
         TempDir dir;
         stores_.clear();
         {
@@ -857,6 +856,21 @@ TEST_F(HandoffRestoreTest, L4ColdStartOnBadL4State) {
     expect_cold([](const std::string&,
                    handoff::Manifest& m) { m.local_disk_replica_count += 1; },
                 "count mismatch");
+    // An offload take without a client.
+    expect_cold(
+        [](const std::string& dir, handoff::Manifest& m) {
+            std::vector<handoff::OffloadTake> takes{
+                {"default", Key(0, 25), UUID{0, 0}, 1000}};
+            auto blob = handoff::EncodeOffloadTakes(takes);
+            std::ofstream(dir + "/" + m.offload_takes->key,
+                          std::ios::trunc | std::ios::binary)
+                .write(reinterpret_cast<const char*>(blob.data()),
+                       static_cast<std::streamsize>(blob.size()));
+            m.offload_takes->bytes = blob.size();
+            m.offload_takes->crc32c = Crc32cValue(blob.data(), blob.size());
+            m.offload_take_count = takes.size();
+        },
+        "invalid offload take");
 }
 
 TEST_F(HandoffRestoreTest, SizeMismatchedDiskReplicaIsNotExported) {
@@ -944,7 +958,10 @@ TEST_F(HandoffColdStartTest, CorruptManifestBody) {
 
 TEST_F(HandoffColdStartTest, UnknownSchemaVersion) {
     std::string text = handoff::EncodeManifest(manifest_);
-    text.replace(text.find(" 3 "), 3, " 9 ");
+    const std::string current =
+        " " + std::to_string(handoff::kHandoffSchemaVersion) + " ";
+    ASSERT_NE(text.find(current), std::string::npos);
+    text.replace(text.find(current), current.size(), " 9 ");
     std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc) << text;
     ExpectColdStart();
 }
@@ -1551,6 +1568,97 @@ TEST_F(HandoffRestoreTest, PendingEntryOfSegmentMountedFreshIsForgotten) {
     EXPECT_EQ(master.HandoffPendingSegmentCount(), 0u);
     Put(master, stores_[0], "fresh");
     EXPECT_TRUE(Readable(master, "fresh"));
+}
+
+TEST_F(HandoffRestoreTest, OffloadTakesOfTheOldMasterBlockReTakes) {
+    // A report of an offload taken from the old master can reach the new
+    // master, which has no task for it, and carries nothing but the key. The
+    // store must therefore not take an offload of that key created by the new
+    // master until such a report can no longer arrive.
+    constexpr uint64_t kReleaseSec = 2;
+    auto config = [] {
+        return MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_eviction_ratio(0.0)
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_client_live_ttl_sec(3600)
+            .set_client_suspicion_ttl_sec(3600)
+            .set_enable_offload(true)
+            .set_put_start_discard_timeout_sec(1)
+            .set_put_start_release_timeout_sec(kReleaseSec)
+            .build();
+    };
+    TempDir dir;
+    HandoffWriteResult written;
+    {
+        MasterService old_master(config());
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        EnableL4(old_master, store);
+        for (int i = 0; i < 4; ++i) Put(old_master, store, Key(0, i));
+        // The store takes all four: key 0 completes, key 1 is NACKed (a stale
+        // take: its timed-out completion may still be processed), keys 2 and
+        // 3 are still being copied when the old master stops.
+        auto tasks = old_master.OffloadObjectHeartbeat(store.client_id, true);
+        ASSERT_TRUE(tasks.has_value());
+        ASSERT_EQ(tasks->size(), 4u);
+        std::map<std::string, OffloadTaskItem> by_key;
+        for (const auto& task : *tasks) by_key.emplace(task.key, task);
+        ASSERT_TRUE(old_master
+                        .NotifyOffloadSuccess(store.client_id,
+                                              {by_key.at(Key(0, 0))},
+                                              {DiskMeta("disk-0")})
+                        .has_value());
+        StorageObjectMetadata nack;
+        nack.data_size = -1;
+        ASSERT_TRUE(old_master
+                        .NotifyOffloadSuccess(store.client_id,
+                                              {by_key.at(Key(0, 1))}, {nack})
+                        .has_value());
+        written = Write(old_master, dir.path());
+    }
+    EXPECT_EQ(written.stats.offload_takes, 3u);
+
+    MasterService master(config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {1});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->offload_takes, 3u);
+    EXPECT_EQ(master.HandoffRestoredOffloadTakes(), 3u);
+    {
+        // A roll right after the roll carries them on, with their remaining
+        // time (all three are stale takes now).
+        TempDir again;
+        EXPECT_EQ(Write(master, again.path()).stats.offload_takes, 3u);
+    }
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    EXPECT_TRUE(HasDisk(master, Key(0, 0), stores_[0].client_id));
+
+    // Keys 1-3 are removed and put again (new offload tasks on the new
+    // master); key 4 is new. A late completion of an old take would look
+    // exactly like the completion of the new task, so the store does not
+    // become a taker of the new tasks of keys 1-3 and their completions are
+    // refused (missing). Key 4 is offloaded normally.
+    auto re_put = [&](int i) {
+        ASSERT_TRUE(
+            master.Remove(Key(0, i), TenantId::Default(), true).has_value());
+        Put(master, stores_[0], Key(0, i));
+    };
+    for (int i = 1; i < 4; ++i) re_put(i);
+    Put(master, stores_[0], Key(0, 4));
+    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 4u);
+    for (int i = 1; i < 4; ++i) {
+        EXPECT_FALSE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
+    }
+    EXPECT_TRUE(HasDisk(master, Key(0, 4), stores_[0].client_id));
+
+    // Once the hold has passed, the keys are offloaded again.
+    std::this_thread::sleep_for(std::chrono::seconds(kReleaseSec) +
+                                std::chrono::milliseconds(300));
+    re_put(2);
+    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 1u);
+    EXPECT_TRUE(HasDisk(master, Key(0, 2), stores_[0].client_id));
 }
 
 }  // namespace

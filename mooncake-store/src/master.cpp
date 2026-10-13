@@ -1733,9 +1733,9 @@ void RunHandoffAtStartup(HandoffContext& ctx,
             *dropped = service.HandoffSegmentsDropped();
         });
     h::HandoffMetrics::Instance().SetLocalDiskCounters(
-        [&service](uint64_t* pending, uint64_t* pins) {
+        [&service](uint64_t* pending, uint64_t* takes) {
             *pending = service.HandoffDiskClientsPending();
-            *pins = service.HandoffOffloadPinCount();
+            *takes = service.HandoffRestoredOffloadTakes();
         });
 }
 

@@ -922,7 +922,7 @@ class MasterService {
                             const HandoffClientSet& disk_clients,
                             std::vector<StandbyObjectEntry>& objects,
                             std::vector<handoff::QuarantineRange>& quarantine,
-                            std::vector<handoff::OffloadPin>& pins,
+                            std::vector<handoff::OffloadTake>& takes,
                             handoff::WriterStats& stats) const;
     bool HandoffEnableOffload() const { return enable_offload_; }
     // Ranges still quarantined by a previous handoff restore (a roll that
@@ -965,7 +965,7 @@ class MasterService {
         uint64_t local_disk_clients{0};
         uint64_t local_disk_replicas{0};
         uint64_t disk_only_objects{0};
-        uint64_t offload_pins{0};
+        uint64_t offload_takes{0};
         uint64_t workers{0};
         uint64_t manifest_ns{0};
         uint64_t mount_ns{0};
@@ -1005,9 +1005,12 @@ class MasterService {
     size_t HandoffPendingSegmentCount() const;
     size_t HandoffQuarantineBufferCount() const;
     // Restored L4 owners whose disk replicas are still unreadable (no RPC
-    // from them yet), and pinned in-flight offload sources.
+    // from them yet), and offload takes of the old master restored as stale
+    // takes by the last restore.
     size_t HandoffDiskClientsPending() const;
-    size_t HandoffOffloadPinCount() const;
+    uint64_t HandoffRestoredOffloadTakes() const {
+        return handoff_restored_offload_takes_.load(std::memory_order_relaxed);
+    }
     // Releases quarantined ranges whose deadline has passed. Called by the
     // task cleanup thread; public for tests.
     void ReleaseExpiredHandoffQuarantine(
@@ -1695,6 +1698,12 @@ class MasterService {
         TenantState& tenant_state, ObjectMetadata* metadata,
         std::unordered_map<std::string, OffloadingTask>::iterator task_it,
         const std::optional<UUID>& reporter);
+    // Handoff export of the offload takes whose report may still arrive
+    // (see handoff::OffloadTake). Caller holds the shard.
+    void ExportHandoffOffloadTakes(const TenantId& tenant_id,
+                                   const TenantState& tenant_state,
+                                   std::vector<handoff::OffloadTake>& takes,
+                                   handoff::WriterStats& stats) const;
     void RecordStaleOffloadTakes(TenantState& tenant_state,
                                  const std::string& key,
                                  const std::vector<UUID>& clients);
@@ -2680,8 +2689,6 @@ class MasterService {
     };
     struct HandoffQuarantine {
         mutable std::mutex mutex;
-        // Deadline of the offload pins (handoff_offload_pins_).
-        std::chrono::steady_clock::time_point deadline{};
         std::vector<HandoffQuarantinedBuffer> buffers;
     };
     HandoffQuarantine handoff_quarantine_;
@@ -2705,15 +2712,7 @@ class MasterService {
             opened;
     };
     HandoffDiskGate handoff_disk_gate_;
-    // Memory replicas of objects that had an offload task in the old master,
-    // pinned (refcount) until the quarantine deadline. Guarded by
-    // handoff_quarantine_.mutex.
-    struct HandoffOffloadPin {
-        TenantId tenant_id;
-        std::string key;
-        std::vector<ReplicaID> replica_ids;
-    };
-    std::vector<HandoffOffloadPin> handoff_offload_pins_;
+    std::atomic<uint64_t> handoff_restored_offload_takes_{0};
     int64_t handoff_restored_file_capacity_{0};
 
     tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoffLocked(

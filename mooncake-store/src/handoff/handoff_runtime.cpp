@@ -456,14 +456,14 @@ std::string HandoffMetrics::Serialize() const {
           static_cast<double>(
               startup_.result == "ok" ? startup_.local_disk_replicas : 0));
     if (local_disk_counters_) {
-        uint64_t pending = 0, pins = 0;
-        local_disk_counters_(&pending, &pins);
+        uint64_t pending = 0, takes = 0;
+        local_disk_counters_(&pending, &takes);
         gauge("master_handoff_local_disk_clients_pending",
               "Restored L4 owners whose disk replicas are still unreadable",
               static_cast<double>(pending));
-        gauge("master_handoff_offload_pins",
-              "Memory replicas pinned for in-flight offloads of the old master",
-              static_cast<double>(pins));
+        gauge("master_handoff_restore_offload_takes",
+              "Offload takes of the old master restored as stale takes",
+              static_cast<double>(takes));
     }
     gauge("master_handoff_snapshot_age_seconds",
           "Age of the claimed snapshot at startup",

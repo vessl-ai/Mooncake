@@ -18,12 +18,14 @@
 // segment (see ConfirmPendingRestoredSegmentsLocked); a mismatch drops it
 // (see FindHandoffMismatchesLocked / DropPendingRestoredSegmentLocked).
 //
-// L4 (schema 2): LOCAL_DISK replicas travel in the same chunks. For every
-// store that owns a restored memory segment, its LocalSSD registration is
-// restored too, so its next offload heartbeat succeeds and it does not
-// re-register its disk keys. A restored LOCAL_DISK replica is unreadable
-// until any RPC from its owner's client id arrives (the id is random per
-// process, so a restarted store can never open it); see HandoffDiskGated.
+// L4: LOCAL_DISK replicas travel in the same chunks. For every store that
+// owns a restored memory segment, its LocalSSD registration is restored too,
+// so its next offload heartbeat succeeds and it keeps its offloaded files (a
+// store drops them whenever it has to register its disk tier anew). A
+// restored LOCAL_DISK replica is unreadable until any RPC from its owner's
+// client id arrives (the id is random per process, so a restarted store can
+// never open it); see HandoffDiskGated. Offload tasks are not carried; their
+// takers and the old master's stale takes become stale takes (OffloadTake).
 
 #include <algorithm>
 #include <atomic>
@@ -113,7 +115,7 @@ std::string MasterService::HandoffRestoreStats::ToJson() const {
       << ",\"local_disk_clients\":" << local_disk_clients
       << ",\"local_disk_replicas\":" << local_disk_replicas
       << ",\"disk_only_objects\":" << disk_only_objects
-      << ",\"offload_pins\":" << offload_pins << ",\"workers\":" << workers
+      << ",\"offload_takes\":" << offload_takes << ",\"workers\":" << workers
       << ",\"manifest_ns\":" << manifest_ns << ",\"mount_ns\":" << mount_ns
       << ",\"insert_wall_ns\":" << insert_wall_ns
       << ",\"load_cpu_ns\":" << load_cpu_ns
@@ -189,7 +191,8 @@ void MasterService::ExportHandoffShard(
     const HandoffClientSet& disk_clients,
     std::vector<StandbyObjectEntry>& objects,
     std::vector<handoff::QuarantineRange>& quarantine,
-    std::vector<handoff::OffloadPin>& pins, handoff::WriterStats& stats) const {
+    std::vector<handoff::OffloadTake>& takes,
+    handoff::WriterStats& stats) const {
     MetadataShardAccessorRO shard(this, shard_idx);
     size_t count = 0;
     for (const auto& [tenant_id, tenant_state] : shard->tenants) {
@@ -285,15 +288,41 @@ void MasterService::ExportHandoffShard(
                 ++stats.local_disk_replicas;
                 if (memory_replicas == 0) ++stats.disk_only_objects;
             }
-            // A store may still be copying this object to its disk from
-            // its own memory: keep the memory replicas pinned in the next
-            // master until the quarantine deadline.
-            if (memory_replicas > 0 &&
-                tenant_state.offloading_tasks.contains(key)) {
-                pins.push_back({entry.tenant_id, key});
-                ++stats.offload_pins;
-            }
             objects.push_back(std::move(entry));
+        }
+        ExportHandoffOffloadTakes(tenant_id, tenant_state, takes, stats);
+    }
+}
+
+void MasterService::ExportHandoffOffloadTakes(
+    const TenantId& tenant_id, const TenantState& tenant_state,
+    std::vector<handoff::OffloadTake>& takes,
+    handoff::WriterStats& stats) const {
+    // Offload tasks are not carried: the roll drops every task like
+    // ReleaseOffloadingTask does, so every taker becomes a stale take for
+    // the full release timeout (a completion carries only the key, and the
+    // taker may still be copying). Stale takes keep the time this master
+    // would still have kept them.
+    const auto now = std::chrono::system_clock::now();
+    for (const auto& [key, task] : tenant_state.offloading_tasks) {
+        for (const auto& taker : task.takers) {
+            takes.push_back(
+                {tenant_id.value(), key, taker, HandoffFullHoldMs()});
+            ++stats.offload_takes;
+        }
+    }
+    for (const auto& [key, stale] : tenant_state.stale_offload_takes) {
+        for (const auto& take : stale) {
+            if (take.deadline <= now) {
+                continue;  // this master would purge it at its next sweep
+            }
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    take.deadline - now)
+                    .count();
+            takes.push_back({tenant_id.value(), key, take.client_id,
+                             static_cast<uint64_t>(remaining) + 1});
+            ++stats.offload_takes;
         }
     }
 }
@@ -436,8 +465,8 @@ void MasterService::ResetHandoffState() {
         handoff_restored_file_capacity_ = 0;
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
         released.swap(handoff_quarantine_.buffers);
-        handoff_offload_pins_.clear();
     }
+    handoff_restored_offload_takes_.store(0, std::memory_order_relaxed);
 }
 
 bool MasterService::HandoffMasterIsEmpty() {
@@ -546,10 +575,9 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             return tl::make_unexpected("quarantine range outside segment");
         }
     }
-    // L4 state (schema 2). A schema-1 snapshot carries none: its stores
-    // re-register their disk keys as after a cold start.
+    // L4 state: registrations and offload takes.
     std::vector<LocalSsdHandoffClient> disk_clients;
-    std::vector<handoff::OffloadPin> offload_pins;
+    std::vector<handoff::OffloadTake> offload_takes;
     if (manifest->schema_version >= 2) {
         auto disk_bytes = handoff::ReadVerifiedBlob(
             dir, manifest->local_disk->key, manifest->local_disk->bytes,
@@ -560,16 +588,25 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             return tl::make_unexpected(decoded_clients.error());
         }
         disk_clients = std::move(*decoded_clients);
-        auto pin_bytes = handoff::ReadVerifiedBlob(
-            dir, manifest->offload_pins->key, manifest->offload_pins->bytes,
-            manifest->offload_pins->crc32c);
-        if (!pin_bytes) return tl::make_unexpected(pin_bytes.error());
-        auto decoded_pins = handoff::DecodeOffloadPins(*pin_bytes);
-        if (!decoded_pins) return tl::make_unexpected(decoded_pins.error());
-        offload_pins = std::move(*decoded_pins);
+        auto take_bytes = handoff::ReadVerifiedBlob(
+            dir, manifest->offload_takes->key, manifest->offload_takes->bytes,
+            manifest->offload_takes->crc32c);
+        if (!take_bytes) return tl::make_unexpected(take_bytes.error());
+        auto decoded_takes = handoff::DecodeOffloadTakes(*take_bytes);
+        if (!decoded_takes) return tl::make_unexpected(decoded_takes.error());
+        offload_takes = std::move(*decoded_takes);
         if (disk_clients.size() != manifest->local_disk_clients ||
-            offload_pins.size() != manifest->offload_pin_count) {
+            offload_takes.size() != manifest->offload_take_count) {
             return tl::make_unexpected("L4 blob count mismatch");
+        }
+    }
+    for (const auto& take : offload_takes) {
+        // A hold longer than a day cannot come from a sane release timeout
+        // (and would overflow the deadline arithmetic).
+        constexpr uint64_t kMaxTakeHoldMs = 24ull * 3600 * 1000;
+        if (take.tenant_id.empty() || take.key.empty() ||
+            take.client_id == UUID{0, 0} || take.hold_ms > kMaxTakeHoldMs) {
+            return tl::make_unexpected("invalid offload take entry");
         }
     }
     if (manifest->local_disk_replica_count > 0 && disk_clients.empty()) {
@@ -1039,8 +1076,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         RebuildTenantQuotaUsageFromMetadata();
     }
     // L4 registrations: the owners' next offload heartbeat finds them, so
-    // they do not re-register their disk keys. Their restored LOCAL_DISK
-    // replicas stay unreadable until an RPC from the owner arrives.
+    // they keep their offloaded files. Their restored LOCAL_DISK replicas
+    // stay unreadable until an RPC from the owner arrives.
     for (const auto& client : disk_clients) {
         const auto it = disk_bytes.find(client.client_id);
         const int64_t used = it == disk_bytes.end() ? 0 : it->second;
@@ -1058,24 +1095,35 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     }
     handoff_disk_gate_.active.store(!handoff_disk_gate_.opened.empty(),
                                     std::memory_order_release);
-    // Pins of in-flight offload sources (released at the quarantine
-    // deadline together with the quarantined ranges).
-    std::vector<HandoffOffloadPin> pins;
-    pins.reserve(offload_pins.size());
-    for (const auto& pin : offload_pins) {
-        const auto object_id =
-            MakeObjectIdentity(pin.key, TenantId(pin.tenant_id));
-        MetadataAccessorRW accessor(this, object_id);
-        if (!accessor.Exists()) continue;
-        HandoffOffloadPin held{object_id.tenant_id, object_id.user_key, {}};
-        accessor.Get().VisitReplicas(
-            &Replica::fn_is_memory_replica, [&held](Replica& replica) {
-                replica.inc_refcnt();
-                held.replica_ids.push_back(replica.id());
-            });
-        if (!held.replica_ids.empty()) pins.push_back(std::move(held));
+    // Offload takes of the old master become stale takes here: a report of
+    // such a take may still arrive and carries nothing but the key, so the
+    // store must not take an offload of the key that this master creates
+    // before that report can no longer arrive (OffloadTake). Each one is held
+    // for its hold time after the restore ends (the gap only adds to it).
+    {
+        const auto takes_now = std::chrono::system_clock::now();
+        for (const auto& take : offload_takes) {
+            const auto object_id =
+                MakeObjectIdentity(take.key, TenantId(take.tenant_id));
+            MetadataAccessorRW accessor(this, object_id);
+            auto& held =
+                accessor.GetTenantState().stale_offload_takes[take.key];
+            const auto deadline =
+                takes_now + std::chrono::milliseconds(take.hold_ms);
+            auto it = std::find_if(held.begin(), held.end(),
+                                   [&take](const StaleOffloadTake& h) {
+                                       return h.client_id == take.client_id;
+                                   });
+            if (it == held.end()) {
+                held.push_back(StaleOffloadTake{take.client_id, deadline});
+            } else {
+                it->deadline = std::max(it->deadline, deadline);
+            }
+        }
+        stats.offload_takes = offload_takes.size();
+        handoff_restored_offload_takes_.store(offload_takes.size(),
+                                              std::memory_order_relaxed);
     }
-    stats.offload_pins = pins.size();
     MasterMetricManager::instance().inc_mem_cache_nums(
         static_cast<int64_t>(memory_objects));
     MasterMetricManager::instance().inc_file_cache_nums(
@@ -1085,8 +1133,6 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         // have held it, counted from now (the gap only adds to it).
         const auto quarantine_now = SteadyClock::now();
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
-        handoff_quarantine_.deadline =
-            quarantine_now + put_start_release_timeout_sec_;
         for (size_t si = 0; si < nseg; ++si) {
             for (auto& [hold_ms, buffer] : quarantined_buffers[si]) {
                 handoff_quarantine_.buffers.push_back(
@@ -1095,7 +1141,6 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                      std::move(buffer)});
             }
         }
-        handoff_offload_pins_ = std::move(pins);
     }
     // Liveness clocks start now, when serving starts, not when the restore
     // started.
@@ -1289,7 +1334,6 @@ void MasterService::ConfirmPendingRestoredSegmentsLocked(
 void MasterService::ReleaseExpiredHandoffQuarantine(
     std::chrono::steady_clock::time_point now) {
     std::vector<HandoffQuarantinedBuffer> released;
-    std::vector<HandoffOffloadPin> pins;
     {
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
         std::vector<HandoffQuarantinedBuffer> kept;
@@ -1301,41 +1345,11 @@ void MasterService::ReleaseExpiredHandoffQuarantine(
             }
         }
         handoff_quarantine_.buffers.swap(kept);
-        if (now >= handoff_quarantine_.deadline) {
-            pins.swap(handoff_offload_pins_);
-        }
-        if (released.empty() && pins.empty()) {
+        if (released.empty()) {
             return;
         }
     }
-    size_t unpinned = 0;
-    if (!pins.empty()) {
-        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        for (const auto& pin : pins) {
-            MetadataAccessorRW accessor(this, {pin.tenant_id, pin.key});
-            if (!accessor.Exists()) continue;
-            // By id: the object may have been replaced meanwhile, and a
-            // new replica must not lose a reference it never got.
-            accessor.Get().VisitReplicas(
-                [&pin](const Replica& replica) {
-                    return std::find(pin.replica_ids.begin(),
-                                     pin.replica_ids.end(),
-                                     replica.id()) != pin.replica_ids.end();
-                },
-                [&unpinned](Replica& replica) {
-                    replica.dec_refcnt();
-                    ++unpinned;
-                });
-        }
-    }
-    LOG(INFO) << "handoff_quarantine=released, ranges=" << released.size()
-              << ", offload_pins=" << pins.size()
-              << ", unpinned_replicas=" << unpinned;
-}
-
-size_t MasterService::HandoffOffloadPinCount() const {
-    std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
-    return handoff_offload_pins_.size();
+    LOG(INFO) << "handoff_quarantine=released, ranges=" << released.size();
 }
 
 // ------------------------------------------------------------ L4 gate

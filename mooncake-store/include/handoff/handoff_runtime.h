@@ -200,7 +200,8 @@ class HandoffMetrics {
     // Live counters of restored segments (pending / confirmed / dropped).
     void SetSegmentCounters(
         std::function<void(uint64_t*, uint64_t*, uint64_t*)> provider);
-    // Restored L4 owners not yet seen, and pinned offload sources.
+    // Restored L4 owners not yet seen, and offload takes restored as stale
+    // takes.
     void SetLocalDiskCounters(
         std::function<void(uint64_t*, uint64_t*)> provider);
     std::string Serialize() const;
