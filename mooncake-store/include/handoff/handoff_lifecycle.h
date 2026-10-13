@@ -29,6 +29,7 @@
 // after CLAIMED makes the next start a cold start.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -86,7 +87,17 @@ class HandoffDirLock {
 
 // Writes <root>/POISON durably (a master that serves without the lock).
 tl::expected<void, std::string> WritePoison(const std::string& root);
+// True if POISON exists or its state cannot be determined (a stat error is
+// never read as "absent").
 bool PoisonExists(const std::string& root);
+
+// Result of a stat that tells "does not exist" apart from an I/O error.
+enum class PathState { kAbsent, kPresent, kUnknown };
+PathState ProbePath(const std::string& path);
+
+// The READY marker, if it exists and can be read and decoded. Used to know
+// when a READY that cannot be removed becomes too old to be restored.
+std::optional<ReadyMarker> PeekReadyMarker(const std::string& root);
 
 // Writer side. Removes every READY/CLAIMED marker, READY.tmp and snapshot
 // directory (complete or not) from `root`, then fsyncs it. Keeps LOCK,
@@ -114,6 +125,10 @@ struct ClaimResult {
     std::string snapshot_dir;  // absolute path when kClaimed
     ReadyMarker marker;
     std::string detail;
+    // kError only: a restorable READY may still be on disk (it could not be
+    // claimed nor removed, its state is unknown, or the directory could not
+    // be fsynced after removing it). A master must not serve next to it.
+    bool ready_may_remain{false};
 };
 
 // Startup side; the caller must hold the HandoffDirLock. Must run before the

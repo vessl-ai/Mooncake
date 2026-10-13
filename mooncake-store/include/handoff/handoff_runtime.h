@@ -136,13 +136,23 @@ struct StartupSteps {
     std::function<tl::expected<RestoreSummary, std::string>(
         const std::string& dir, size_t workers)>
         restore;
+    // Waits before retry number `attempt` (1, 2, ...) of a step whose
+    // failure would otherwise let this master serve next to a restorable
+    // READY (or without POISON). Returns false if the master is shutting
+    // down; the master then never serves. Empty: sleep with backoff.
+    std::function<bool(int attempt)> wait_retry;
 };
+
+// Backoff between such retries: 1 s doubling up to 10 s.
+std::chrono::milliseconds RetryBackoff(int attempt);
 
 struct StartupOptions {
     std::string root;
     bool owner{false};
     bool restore_enabled{true};
-    int64_t max_age_ms{600000};
+    // Real gaps are 15-30 s plus pod start; an older snapshot means the gap
+    // was unusual (or another master served meanwhile): start cold.
+    int64_t max_age_ms{120000};
     RestoreCostModel restore_cost;
     size_t workers{8};
     int64_t now_ms{0};  // 0: system clock
@@ -161,12 +171,21 @@ struct StartupReport {
     uint64_t claim_ns{0};
     uint64_t restore_ns{0};
     uint64_t total_ns{0};
+    // Claim or POISON attempts (more than 1 only after I/O errors).
+    uint64_t attempts{0};
+    // False: the master must not serve (it stopped while a READY it could
+    // not remove, or a missing POISON, made serving unsafe).
+    bool serve{true};
     std::string restore;  // restore stats JSON
     std::string ToJson() const;
 };
 
 // Claims READY (before anything is allocated), checks age and memory, runs
-// the restore once and always releases the claim afterwards.
+// the restore once and always releases the claim afterwards. Never lets the
+// master serve while a READY it could not claim or remove is on disk: it
+// retries (wait_retry) until the claim succeeds, the READY is removed, or the
+// READY is older than max_age (no master restores it anymore). A non-owner
+// retries writing POISON until it succeeds.
 StartupReport RunHandoffStartup(const StartupSteps& steps,
                                 const StartupOptions& options);
 

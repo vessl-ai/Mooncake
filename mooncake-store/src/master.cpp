@@ -1,5 +1,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 
 // The shutdown handoff's trim step calls glibc's malloc_trim(). Same guard as
@@ -434,8 +436,11 @@ DEFINE_int32(handoff_max_workers, 8,
              "fewer)");
 DEFINE_int32(handoff_restore_workers, 0,
              "Restore threads; 0 = available CPUs, at most 16");
-DEFINE_int32(handoff_max_age_sec, 600,
-             "Do not restore snapshots older than this");
+DEFINE_int32(handoff_max_age_sec, 120,
+             "Do not restore snapshots older than this. Real gaps are 15-30 s "
+             "plus the pod start; an older snapshot starts cold. Keep it "
+             "small: it bounds how long a snapshot survives next to a master "
+             "that does not know the handoff (rollback)");
 DEFINE_uint64(handoff_restore_bytes_per_object, 1144,
               "Restore admission: peak RSS per object that has a memory "
               "replica (measured, before the margin)");
@@ -1604,6 +1609,8 @@ namespace {
 // ---- Shutdown handoff glue (INF-600, fork-only) ----
 struct HandoffContext {
     bool enabled{false};
+    // False if the startup step decided this master must not serve.
+    bool serve{true};
     std::string root;
     mooncake::handoff::HandoffDirLock lock;
     mooncake::handoff::CgroupPaths cgroup;
@@ -1627,11 +1634,25 @@ void FlushLogsForExit() {
     std::fflush(stderr);
 }
 
+// A watchdog that fires does a little I/O (logs, last_shutdown) before
+// _exit(). If that I/O blocks (hung disk, a log lock held by a stuck
+// thread), the default action of SIGALRM still ends the process.
+void ArmWatchdogBackstop() {
+    constexpr unsigned kBackstopSec = 5;
+    std::signal(SIGALRM, SIG_DFL);
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+    alarm(kBackstopSec);
+}
+
 // Runs before the RPC server and the admin delegate exist: claims a READY
 // snapshot and restores it, or leaves an empty master (cold start).
 void RunHandoffAtStartup(HandoffContext& ctx,
                          const mooncake::MasterConfig& config,
-                         mooncake::WrappedMasterService& wrapped) {
+                         mooncake::WrappedMasterService& wrapped,
+                         const std::atomic<bool>& shutdown_requested) {
     namespace h = mooncake::handoff;
     if (FLAGS_handoff_dir.empty()) return;
     if (config.enable_ha) {
@@ -1662,11 +1683,36 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     steps.read_memory = [&ctx]() { return h::ReadMemorySnapshot(ctx.cgroup); };
     steps.restore = [&service](const std::string& dir, size_t workers)
         -> tl::expected<h::RestoreSummary, std::string> {
+        // The watchdog covers the restore only, not the claim retries
+        // before it (those end on their own, see RunHandoffStartup).
+        std::unique_ptr<h::Watchdog> watchdog;
+        if (FLAGS_handoff_restore_deadline_sec > 0) {
+            watchdog = std::make_unique<h::Watchdog>(
+                std::chrono::seconds(FLAGS_handoff_restore_deadline_sec), []() {
+                    ArmWatchdogBackstop();
+                    // CLAIMED stays behind, so the next start is a cold
+                    // start.
+                    LOG(ERROR) << "handoff_startup=deadline, action=exit";
+                    FlushLogsForExit();
+                    _exit(1);
+                });
+        }
         auto restored = service.RestoreFromHandoff(dir, {workers});
         if (!restored) return tl::make_unexpected(restored.error());
         return h::RestoreSummary{restored->objects, restored->segments,
                                  restored->local_disk_replicas,
                                  restored->ToJson()};
+    };
+    // Retries of a claim or POISON write that failed on I/O: wait with
+    // backoff, give up (and never serve) only when asked to shut down.
+    steps.wait_retry = [&shutdown_requested](int attempt) {
+        const auto until =
+            std::chrono::steady_clock::now() + h::RetryBackoff(attempt);
+        while (std::chrono::steady_clock::now() < until) {
+            if (shutdown_requested.load()) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return !shutdown_requested.load();
     };
     h::StartupOptions options;
     options.root = ctx.root;
@@ -1677,18 +1723,8 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     options.workers = FLAGS_handoff_restore_workers > 0
                           ? static_cast<size_t>(FLAGS_handoff_restore_workers)
                           : std::min<size_t>(ctx.cpus, 16);
-    std::unique_ptr<h::Watchdog> watchdog;
-    if (FLAGS_handoff_restore_deadline_sec > 0) {
-        watchdog = std::make_unique<h::Watchdog>(
-            std::chrono::seconds(FLAGS_handoff_restore_deadline_sec), []() {
-                // CLAIMED stays behind, so the next start is a cold start.
-                LOG(ERROR) << "handoff_startup=deadline, action=exit";
-                FlushLogsForExit();
-                _exit(1);
-            });
-    }
     const h::StartupReport report = h::RunHandoffStartup(steps, options);
-    watchdog.reset();
+    ctx.serve = report.serve;
     h::HandoffMetrics::Instance().SetStartup(report);
     h::HandoffMetrics::Instance().SetSegmentCounters(
         [&service](uint64_t* pending, uint64_t* confirmed, uint64_t* dropped) {
@@ -1715,6 +1751,7 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     h::Watchdog watchdog(
         std::chrono::seconds(FLAGS_handoff_shutdown_deadline_sec),
         [&ctx, &published]() {
+            ArmWatchdogBackstop();
             if (published.load()) {
                 FlushLogsForExit();
                 _exit(0);
@@ -2074,7 +2111,15 @@ int main(int argc, char* argv[]) {
         // Handoff restore (INF-600): before the admin delegate and the RPC
         // server exist, so nothing else touches the master meanwhile.
         HandoffContext handoff;
-        RunHandoffAtStartup(handoff, master_config, *wrapped_master_service);
+        RunHandoffAtStartup(handoff, master_config, *wrapped_master_service,
+                            shutdown_requested);
+        if (!handoff.serve) {
+            // Asked to stop while serving would have been unsafe (a READY
+            // that could not be removed, or POISON that could not be
+            // written). Nothing was restored and nothing was served.
+            LOG(ERROR) << "handoff: stopping without serving";
+            return 0;
+        }
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);

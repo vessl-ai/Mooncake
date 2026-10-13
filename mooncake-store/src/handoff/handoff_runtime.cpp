@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <thread>
 
 #include <glog/logging.h>
 
@@ -256,11 +257,19 @@ std::string StartupReport::ToJson() const {
       << ",\"local_disk_replicas\":" << local_disk_replicas
       << ",\"age_ms\":" << age_ms << ",\"claim_ns\":" << claim_ns
       << ",\"restore_ns\":" << restore_ns << ",\"total_ns\":" << total_ns
+      << ",\"attempts\":" << attempts
+      << ",\"serve\":" << (serve ? "true" : "false")
       << ",\"restore\":" << RawOrNull(restore) << "}";
     return o.str();
 }
 
 StartupReport RunHandoffStartup(const StartupSteps& steps,
+std::chrono::milliseconds RetryBackoff(int attempt) {
+    int64_t ms = 1000;
+    for (int i = 1; i < attempt && ms < 10000; ++i) ms *= 2;
+    return std::chrono::milliseconds(std::min<int64_t>(ms, 10000));
+}
+
                                 const StartupOptions& options) {
     const auto start = SteadyClock::now();
     StartupReport report;
@@ -273,16 +282,69 @@ StartupReport RunHandoffStartup(const StartupSteps& steps,
         return report;
     };
     if (!options.owner) {
+    const auto wait_retry = [&steps](int attempt) {
+        if (steps.wait_retry) return steps.wait_retry(attempt);
+        std::this_thread::sleep_for(RetryBackoff(attempt));
+        return true;
+    };
         // Make sure a snapshot written by the lock owner after we started
-        // serving is never restored.
-        if (auto poison = WritePoison(options.root); !poison) {
-            LOG(ERROR) << "handoff: cannot write POISON: " << poison.error();
+        // serving is never restored: do not serve before POISON is durable.
+        for (int attempt = 1;; ++attempt) {
+            report.attempts = attempt;
+            auto poison = WritePoison(options.root);
+            if (poison) break;
+            LOG(ERROR) << "handoff_startup=poison_failed, attempt=" << attempt
+                       << ", error=" << poison.error()
+                       << ", action=retry_before_serving";
+            if (!wait_retry(attempt)) {
+                report.serve = false;
+                return finish("error",
+                              "stopped before POISON could be written: " +
+                                  poison.error());
+            }
         }
         return finish("not_owner", "handoff dir lock not held");
     }
 
     auto t = SteadyClock::now();
-    const ClaimResult claim = ClaimHandoffSnapshot(options.root);
+    ClaimResult claim = ClaimHandoffSnapshot(options.root);
+    report.attempts = 1;
+    // A READY that could be neither claimed nor removed must never be
+    // restored by a later master after this one served. Retry until the
+    // claim works or the READY is too old to be restored by anyone.
+    const int64_t wait_start_ms = NowMs();
+    for (int attempt = 1;
+         claim.state == ClaimState::kError && claim.ready_may_remain;
+         ++attempt) {
+        const auto ready = PeekReadyMarker(options.root);
+        // An unreadable READY was created before this master started
+        // waiting. After stale_at_ms every master's age check refuses the
+        // READY (with the same --handoff_max_age_sec).
+        const int64_t base_ms = ready ? ready->created_at_ms : wait_start_ms;
+        const int64_t stale_at_ms = base_ms + options.max_age_ms + 1000;
+        const int64_t now_ms = NowMs();
+        LOG(ERROR) << "handoff_startup=claim_failed, attempt=" << attempt
+                   << ", detail=" << claim.detail
+                   << ", stale_in_ms=" << (stale_at_ms - now_ms)
+                   << ", action=retry_before_serving";
+        if (now_ms >= stale_at_ms) {
+            report.claim_ns = NsSince(t);
+            return finish("error",
+                          "READY could not be removed but is older "
+                          "than max_age now; serving cold: " +
+                              claim.detail);
+        }
+        if (!wait_retry(attempt)) {
+            report.claim_ns = NsSince(t);
+            report.serve = false;
+            return finish("error",
+                          "stopped while a READY that could not be removed "
+                          "remains: " +
+                              claim.detail);
+        }
+        claim = ClaimHandoffSnapshot(options.root);
+        report.attempts = attempt + 1;
+    }
     report.claim_ns = NsSince(t);
     report.snapshot = claim.marker.snapshot;
     switch (claim.state) {

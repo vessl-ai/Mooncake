@@ -250,8 +250,29 @@ tl::expected<void, std::string> WritePoison(const std::string& root) {
 }
 
 bool PoisonExists(const std::string& root) {
+    return ProbePath((fs::path(root) / kPoisonFile).string()) !=
+           PathState::kAbsent;
+}
+
+PathState ProbePath(const std::string& path) {
     std::error_code ec;
-    return fs::exists(fs::path(root) / kPoisonFile, ec);
+    const auto status = fs::symlink_status(path, ec);
+    if (ec) {
+        return ec == std::errc::no_such_file_or_directory ? PathState::kAbsent
+                                                          : PathState::kUnknown;
+    }
+    return status.type() == fs::file_type::not_found ? PathState::kAbsent
+                                                     : PathState::kPresent;
+}
+
+std::optional<ReadyMarker> PeekReadyMarker(const std::string& root) {
+    std::string text;
+    if (!ReadSmallFile(fs::path(root) / kReadyMarker, &text)) {
+        return std::nullopt;
+    }
+    auto marker = DecodeReadyMarker(text);
+    if (!marker) return std::nullopt;
+    return *marker;
 }
 
 // ------------------------------------------------------------------ writer
@@ -325,32 +346,55 @@ ClaimResult ClaimHandoffSnapshot(const std::string& root) {
     const fs::path dir(root);
     std::error_code ec;
     std::string error;
+    const auto probe = [&dir](const char* name) {
+        return ProbePath((dir / name).string());
+    };
+    // After a failed discard: a READY may survive unless it is proven gone
+    // and that removal is durable.
+    const auto fail = [&](std::string detail, bool fsynced) {
+        result.state = ClaimState::kError;
+        result.detail = std::move(detail);
+        result.ready_may_remain =
+            !fsynced || probe(kReadyMarker) != PathState::kAbsent;
+    };
     auto discard_all = [&](ClaimState state, std::string detail) {
         result.state = state;
         result.detail = std::move(detail);
         if (!RemoveLayoutEntries(dir, "", /*markers=*/true, &error)) {
-            result.state = ClaimState::kError;
-            result.detail += "; " + error;
+            fail(result.detail + "; " + error, /*fsynced=*/false);
             return;
         }
         // POISON goes last: until here a crash leaves it in place.
         fs::remove(dir / kPoisonFile, ec);
-        (void)FsyncPath(dir, /*directory=*/true);
+        if (!FsyncPath(dir, /*directory=*/true)) {
+            // The removal of READY may not survive a crash.
+            fail(result.detail + "; " + Errno("fsync", dir), /*fsynced=*/false);
+        }
     };
 
-    if (fs::exists(dir / kPoisonFile, ec)) {
+    // A stat error is never read as "absent": POISON or CLAIMED of unknown
+    // state discard everything, READY of unknown state is an error.
+    if (probe(kPoisonFile) != PathState::kAbsent) {
         discard_all(ClaimState::kPoisoned,
-                    "another master served while the lock was held");
+                    "another master served while the lock was held (or "
+                    "POISON could not be checked)");
         return result;
     }
-    if (fs::exists(dir / kClaimedMarker, ec)) {
+    if (probe(kClaimedMarker) != PathState::kAbsent) {
         discard_all(ClaimState::kAbortedPrevious,
                     "CLAIMED found: the previous restore attempt did not "
-                    "finish");
+                    "finish (or CLAIMED could not be checked)");
         return result;
     }
-    if (!fs::exists(dir / kReadyMarker, ec)) {
-        // Nothing to restore; drop half-written leftovers.
+    const PathState ready = probe(kReadyMarker);
+    if (ready == PathState::kUnknown) {
+        fail("cannot check " + (dir / kReadyMarker).string(),
+             /*fsynced=*/true);
+        return result;
+    }
+    if (ready == PathState::kAbsent) {
+        // Nothing to restore; drop half-written leftovers. A failure here
+        // leaves nothing restorable behind.
         if (!RemoveLayoutEntries(dir, "", /*markers=*/true, &error)) {
             result.state = ClaimState::kError;
             result.detail = error;
@@ -362,6 +406,8 @@ ClaimResult ClaimHandoffSnapshot(const std::string& root) {
     if (ec || !FsyncPath(dir, /*directory=*/true)) {
         discard_all(ClaimState::kError,
                     "claim READY: " + (ec ? ec.message() : "fsync failed"));
+        // ready_may_remain stays false only if everything was removed and
+        // fsynced: then serving cold is safe although the claim failed.
         return result;
     }
     std::string text;

@@ -1120,5 +1120,139 @@ TEST(HandoffEndToEndTest, ShutdownThenStartupRestoresTheIndex) {
     EXPECT_EQ(RunHandoffStartup(steps, Options(root.path())).result, "none");
 }
 
+// ---- Review 1 (INF-600, M1): never serve next to a READY that could not be
+// claimed or removed; never serve without POISON as a non-owner.
+
+// A "handoff dir" that is a regular file: every stat below it fails with
+// ENOTDIR (state unknown), every write fails. Turning it back into a
+// directory models a disk that recovers.
+struct BrokenDir {
+    TempDir parent;
+    std::string root = parent / "handoff";
+    BrokenDir() { WriteText(root, "not a directory"); }
+    void Repair() const {
+        fs::remove(root);
+        fs::create_directories(root);
+    }
+};
+
+TEST(HandoffStartupTest, UnknownStateIsNeverReadAsAbsent) {
+    BrokenDir broken;
+    EXPECT_EQ(ProbePath(broken.root + "/READY"), PathState::kUnknown);
+    EXPECT_TRUE(PoisonExists(broken.root));
+    const ClaimResult claim = ClaimHandoffSnapshot(broken.root);
+    EXPECT_EQ(claim.state, ClaimState::kError);
+    EXPECT_TRUE(claim.ready_may_remain) << claim.detail;
+
+    TempDir ok;
+    EXPECT_EQ(ProbePath(ok / "READY"), PathState::kAbsent);
+    EXPECT_FALSE(PoisonExists(ok.path()));
+    MakePublished(ok.path(), "snap-20-1", NowMs());
+    EXPECT_EQ(ProbePath(ok / "READY"), PathState::kPresent);
+    EXPECT_EQ(StartupOptions{}.max_age_ms, 120000);
+}
+
+TEST(HandoffStartupTest, ClaimFailureNeverServesWhileReadyMayRemain) {
+    BrokenDir broken;
+    FakeStartup fake;
+    StartupSteps steps = fake.Steps();
+    int waits = 0;
+    steps.wait_retry = [&](int attempt) {
+        EXPECT_EQ(attempt, waits + 1);
+        ++waits;
+        return waits < 3;  // asked to shut down during the third wait
+    };
+    StartupReport report = RunHandoffStartup(steps, Options(broken.root));
+    EXPECT_EQ(report.result, "error");
+    EXPECT_FALSE(report.serve) << report.detail;
+    EXPECT_EQ(waits, 3);
+    EXPECT_EQ(report.attempts, 3u);
+    EXPECT_EQ(fake.restores, 0);
+}
+
+TEST(HandoffStartupTest, ClaimIsRetriedUntilTheDiskRecovers) {
+    BrokenDir broken;
+    FakeStartup fake;
+    StartupSteps steps = fake.Steps();
+    steps.wait_retry = [&](int attempt) {
+        if (attempt == 2) {
+            // The disk recovers and holds a fresh snapshot.
+            broken.Repair();
+            MakePublished(broken.root, "snap-21-1", NowMs());
+        }
+        return true;
+    };
+    StartupReport report = RunHandoffStartup(steps, Options(broken.root));
+    EXPECT_EQ(report.result, "ok") << report.detail;
+    EXPECT_TRUE(report.serve);
+    EXPECT_EQ(report.attempts, 3u);
+    EXPECT_EQ(fake.restores, 1);
+    EXPECT_EQ(ProbePath(broken.root + "/READY"), PathState::kAbsent);
+}
+
+TEST(HandoffStartupTest, UnremovableReadyIsWaitedOutUntilStale) {
+    BrokenDir broken;
+    FakeStartup fake;
+    StartupSteps steps = fake.Steps();
+    int waits = 0;
+    steps.wait_retry = [&](int) {
+        ++waits;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        return true;
+    };
+    // max_age 0: a READY written before the wait started (its marker is
+    // unreadable here) is refused by every master 1 s after the wait began.
+    StartupOptions options = Options(broken.root);
+    options.max_age_ms = 0;
+    const auto start = std::chrono::steady_clock::now();
+    StartupReport report = RunHandoffStartup(steps, options);
+    EXPECT_EQ(report.result, "error");
+    EXPECT_TRUE(report.serve) << report.detail;
+    EXPECT_GE(std::chrono::steady_clock::now() - start,
+              std::chrono::milliseconds(1000));
+    EXPECT_GE(waits, 3);
+    EXPECT_EQ(fake.restores, 0);
+}
+
+TEST(HandoffStartupTest, NonOwnerServesOnlyAfterPoisonIsWritten) {
+    {
+        BrokenDir broken;
+        FakeStartup fake;
+        StartupSteps steps = fake.Steps();
+        steps.wait_retry = [](int attempt) { return attempt < 2; };
+        StartupOptions not_owner = Options(broken.root);
+        not_owner.owner = false;
+        StartupReport report = RunHandoffStartup(steps, not_owner);
+        EXPECT_EQ(report.result, "error");
+        EXPECT_FALSE(report.serve);
+        EXPECT_EQ(report.attempts, 2u);
+    }
+    {
+        BrokenDir broken;
+        FakeStartup fake;
+        StartupSteps steps = fake.Steps();
+        steps.wait_retry = [&](int) {
+            broken.Repair();
+            return true;
+        };
+        StartupOptions not_owner = Options(broken.root);
+        not_owner.owner = false;
+        StartupReport report = RunHandoffStartup(steps, not_owner);
+        EXPECT_EQ(report.result, "not_owner");
+        EXPECT_TRUE(report.serve);
+        EXPECT_EQ(report.attempts, 2u);
+        EXPECT_EQ(ProbePath(broken.root + "/POISON"), PathState::kPresent);
+    }
+}
+
+TEST(HandoffShutdownTest, PoisonOfUnknownStateBlocksThePublish) {
+    BrokenDir broken;
+    FakeShutdown fake;
+    ShutdownReport report =
+        RunHandoffShutdown(fake.Steps(), {broken.root, true, 4, 14});
+    EXPECT_EQ(report.result, "skipped_poisoned");
+    EXPECT_EQ(std::count(fake.events.begin(), fake.events.end(), "write"), 0);
+}
+
 }  // namespace
 }  // namespace mooncake::test
