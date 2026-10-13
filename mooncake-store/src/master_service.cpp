@@ -11892,12 +11892,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::vector<std::chrono::system_clock::time_point>>
         local_soft_pin(num_threads);
 
+    // A full pass takes seconds at tens of millions of objects. Stopping the
+    // eviction thread (shutdown handoff, INF-600) abandons the pass between
+    // shards; nothing has been evicted before Phase 2, and Phase 2 simply
+    // evicts less.
+    auto stopping = [this] {
+        return !eviction_running_.load(std::memory_order_relaxed);
+    };
     std::vector<std::thread> threads;
     for (int t = 0; t < num_threads; t++) {
         threads.emplace_back([&, t] {
             size_t s_start = t * shards_per_thread;
             size_t s_end = std::min(s_start + shards_per_thread, kNumShards);
-            for (size_t s = s_start; s < s_end; s++) {
+            for (size_t s = s_start; s < s_end && !stopping(); s++) {
                 MetadataShardAccessorRW shard(this, s);
                 DiscardExpiredProcessingReplicas(shard, now);
 
@@ -11935,6 +11942,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     }
     for (auto& t : threads) t.join();
+    if (stopping()) return;
 
     // Merge per-thread results
     long total_eviction_base = 0;
@@ -12007,7 +12015,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 size_t s_start = t * shards_per_thread;
                 size_t s_end =
                     std::min(s_start + shards_per_thread, kNumShards);
-                for (size_t s = s_start; s < s_end; s++) {
+                for (size_t s = s_start; s < s_end && !stopping(); s++) {
                     MetadataShardAccessorRW shard(this, s);
                     for (const auto& [tenant_id, tenant_state] :
                          shard->tenants) {
@@ -12090,6 +12098,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                             /*collect_older_or_equal=*/true);
         }
     }
+    if (stopping()) return;
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -12116,7 +12125,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
-                if (stop_eviction_scan) break;
+                if (stop_eviction_scan || stopping()) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
                 // evict_num by at most one group; using evict_num (rather than
@@ -12180,7 +12189,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound.
-    if (!stop_eviction_scan && target_evict_num > 0) {
+    if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
             std::nth_element(no_pin_objects.begin(),
