@@ -897,8 +897,17 @@ class MasterService {
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     // ---- Shutdown handoff snapshot (INF-600, fork-only) ----
-    // Export side. Callers must have stopped the RPC server first, so that
-    // nothing allocates or frees store memory while the export runs.
+    // Stops and joins every background thread and worker that mutates
+    // metadata, segments, clients or allocators (also called by the
+    // destructor). Idempotent. The RPC server must be stopped first.
+    void QuiesceBackgroundWork();
+    // True once QuiesceBackgroundWork() has run and no such thread exists.
+    bool BackgroundWorkQuiesced() const;
+    // Number of objects in the metadata shards (one shard lock at a time).
+    uint64_t HandoffObjectCount() const;
+    // Export side. Callers must have stopped the RPC server and quiesced the
+    // background work first, so that nothing allocates or frees store memory
+    // while the export runs.
     std::vector<handoff::SegmentIdentity> ExportHandoffSegments();
     void ExportHandoffShard(size_t shard_idx,
                             const handoff::SegmentLocator& locator,
@@ -906,6 +915,13 @@ class MasterService {
                             std::vector<handoff::QuarantineRange>& quarantine,
                             handoff::WriterStats& stats) const;
     WeightMetadataSnapshot ExportHandoffWeightMetadata() const;
+    // Ranges still quarantined by a previous handoff restore (a roll that
+    // follows a roll within put_start_release_timeout). They must stay
+    // quarantined in the next master as well.
+    void ExportHandoffPendingQuarantine(
+        const std::vector<handoff::SegmentIdentity>& segments,
+        std::vector<handoff::QuarantineRange>& quarantine,
+        handoff::WriterStats& stats) const;
     static size_t HandoffShardCount() { return kNumShards; }
     static uint64_t HandoffNextReplicaId() { return Replica::next_id_.load(); }
     bool HandoffMultiTenant() const { return enable_multi_tenants_; }
@@ -2592,11 +2608,17 @@ class MasterService {
     struct HandoffQuarantine {
         mutable std::mutex mutex;
         std::chrono::steady_clock::time_point deadline{};
-        std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>>
-            buffers;
+        std::vector<std::pair<UUID, std::unique_ptr<AllocatedBuffer>>> buffers;
     };
     HandoffQuarantine handoff_quarantine_;
     std::atomic<uint64_t> last_remount_lock_hold_ns_{0};
+    std::atomic<bool> background_quiesced_{false};
+    // Lets the 1 s / 0.5 s sleeps of the client monitor and job dispatch
+    // threads end early when QuiesceBackgroundWork() stops them.
+    std::mutex background_sleep_mutex_;
+    std::condition_variable background_sleep_cv_;
+    void SleepWhileRunning(std::chrono::milliseconds duration,
+                           const std::atomic<bool>& running);
     std::atomic<uint64_t> handoff_segments_confirmed_{0};
     std::atomic<uint64_t> handoff_segments_dropped_{0};
 

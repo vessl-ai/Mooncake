@@ -31,8 +31,8 @@ using SteadyClock = std::chrono::steady_clock;
 
 uint64_t NsSince(SteadyClock::time_point start) {
     return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now() -
-                                                             start)
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            SteadyClock::now() - start)
             .count());
 }
 
@@ -98,9 +98,11 @@ bool FsyncDir(const fs::path& dir) {
 }
 
 // Writes a small file completely (optionally durable) and returns its info.
-tl::expected<handoff::BlobInfo, std::string> WriteBlob(
-    const fs::path& root, const std::string& key, const void* data,
-    size_t size, bool durable) {
+tl::expected<handoff::BlobInfo, std::string> WriteBlob(const fs::path& root,
+                                                       const std::string& key,
+                                                       const void* data,
+                                                       size_t size,
+                                                       bool durable) {
     const fs::path path = root / key;
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
@@ -165,8 +167,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count();
-    manifest.snapshot_id =
-        ha::BuildBatchOpLogSnapshotId(0, std::max<int64_t>(1, manifest.created_at_ms));
+    manifest.snapshot_id = ha::BuildBatchOpLogSnapshotId(
+        0, std::max<int64_t>(1, manifest.created_at_ms));
     manifest.codec = handoff::CurrentCodecFingerprint();
     manifest.memory_allocator = "offset";
     manifest.multi_tenant = service.HandoffMultiTenant();
@@ -222,9 +224,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
             const fs::path path = root / key;
             std::error_code dir_ec;
             fs::create_directories(path.parent_path(), dir_ec);
-            const int fd = ::open(path.c_str(),
-                                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-                                  0644);
+            const int fd = ::open(
+                path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
             if (fd < 0 || !WriteAll(fd, encoded.data(), encoded.size())) {
                 st.error = Errno("write", path.string());
                 if (fd >= 0) ::close(fd);
@@ -279,6 +280,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         quarantine.insert(quarantine.end(), st.quarantine.begin(),
                           st.quarantine.end());
     }
+    service.ExportHandoffPendingQuarantine(manifest.segments, quarantine,
+                                           manifest.writer);
     manifest.chunks = std::move(chunks);
     manifest.object_count = manifest.writer.objects;
     manifest.replica_count = manifest.writer.replicas;
@@ -291,19 +294,18 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     t = SteadyClock::now();
     const auto weight = service.ExportHandoffWeightMetadata();
     const auto weight_bytes = EncodeBatchOpLogSnapshotWeightMetadata(weight);
-    auto weight_blob = WriteBlob(
-        root,
-        ha::BuildBatchOpLogSnapshotWeightMetadataKey(
-            handoff::kHandoffSnapshotRoot, manifest.snapshot_id),
-        weight_bytes.data(), weight_bytes.size(), options.durable);
+    auto weight_blob =
+        WriteBlob(root,
+                  ha::BuildBatchOpLogSnapshotWeightMetadataKey(
+                      handoff::kHandoffSnapshotRoot, manifest.snapshot_id),
+                  weight_bytes.data(), weight_bytes.size(), options.durable);
     if (!weight_blob) return tl::make_unexpected(weight_blob.error());
     manifest.weight_metadata = *weight_blob;
 
     const auto quarantine_bytes = handoff::EncodeQuarantine(quarantine);
-    auto quarantine_blob =
-        WriteBlob(root, handoff::kHandoffQuarantineFile,
-                  quarantine_bytes.data(), quarantine_bytes.size(),
-                  options.durable);
+    auto quarantine_blob = WriteBlob(root, handoff::kHandoffQuarantineFile,
+                                     quarantine_bytes.data(),
+                                     quarantine_bytes.size(), options.durable);
     if (!quarantine_blob) return tl::make_unexpected(quarantine_blob.error());
     manifest.quarantine = *quarantine_blob;
     manifest.quarantine_ranges = quarantine.size();
@@ -328,7 +330,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         segments_bytes.data(), segments_bytes.size(), options.durable);
     if (!segments_blob) return tl::make_unexpected(segments_blob.error());
     ha::BatchOpLogSnapshotManifest upstream_manifest;
-    upstream_manifest.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
+    upstream_manifest.schema_version =
+        ha::kBatchOpLogWeightSnapshotSchemaVersion;
     upstream_manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
     upstream_manifest.snapshot_id = manifest.snapshot_id;
     upstream_manifest.segments = {segments_blob->key, segments_blob->bytes,
@@ -337,9 +340,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         upstream_manifest.object_chunks.push_back(
             {c.index, c.key, c.objects, c.bytes, c.crc32c});
     }
-    upstream_manifest.weight_metadata =
-        ha::BatchOpLogSnapshotObjectDescriptor{
-            weight_blob->key, weight_blob->bytes, weight_blob->crc32c};
+    upstream_manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
+        weight_blob->key, weight_blob->bytes, weight_blob->crc32c};
     const std::string upstream_manifest_json =
         ha::EncodeBatchOpLogSnapshotManifest(upstream_manifest);
     const std::string upstream_manifest_key =
@@ -371,10 +373,10 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     if (options.durable) {
         // Directory entries of every file written so far.
         for (auto it = fs::recursive_directory_iterator(root, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+             !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
             if (it->is_directory() && !FsyncDir(it->path())) {
-                return tl::make_unexpected("fsync dir " +
-                                           it->path().string());
+                return tl::make_unexpected("fsync dir " + it->path().string());
             }
         }
     }
@@ -383,7 +385,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     manifest.writer.peak_rss_kib = ProcStatusKiB("VmHWM");
     manifest.writer.duration_ms = NsSince(total_start) / 1000000;
     const std::string manifest_text = handoff::EncodeManifest(manifest);
-    const std::string tmp_name = std::string(handoff::kHandoffManifestFile) + ".tmp";
+    const std::string tmp_name =
+        std::string(handoff::kHandoffManifestFile) + ".tmp";
     auto manifest_blob = WriteBlob(root, tmp_name, manifest_text.data(),
                                    manifest_text.size(), options.durable);
     if (!manifest_blob) return tl::make_unexpected(manifest_blob.error());

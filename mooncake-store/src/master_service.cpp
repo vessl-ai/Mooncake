@@ -719,7 +719,12 @@ MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
     throw std::invalid_argument("unknown snapshot catalog store type");
 }
 
-MasterService::~MasterService() {
+// Stops and joins every background thread and worker that can change object
+// metadata, segments, clients or allocators. Idempotent. The destructor and
+// the shutdown handoff (INF-600) use it; the RPC server must already be
+// stopped, otherwise a handler could schedule new work (e.g. ReserveJob on a
+// stopped offboarding worker CHECK-fails).
+void MasterService::QuiesceBackgroundWork() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
@@ -740,6 +745,10 @@ MasterService::~MasterService() {
 #endif
 
     // Wake sleepers so join() doesn't block for long sleep intervals.
+    {
+        std::lock_guard<std::mutex> lock(background_sleep_mutex_);
+    }
+    background_sleep_cv_.notify_all();
     task_cleanup_cv_.notify_all();
     dynamic_replication_admission_cv_.notify_all();
     http_metadata_cleanup_cv_.notify_all();
@@ -774,6 +783,31 @@ MasterService::~MasterService() {
         snapshot_manager_.reset();
     }
     client_offboarding_worker_.Stop();
+    background_quiesced_.store(true, std::memory_order_release);
+}
+
+void MasterService::SleepWhileRunning(std::chrono::milliseconds duration,
+                                      const std::atomic<bool>& running) {
+    std::unique_lock<std::mutex> lock(background_sleep_mutex_);
+    background_sleep_cv_.wait_for(lock, duration,
+                                  [&running] { return !running.load(); });
+}
+
+bool MasterService::BackgroundWorkQuiesced() const {
+    return background_quiesced_.load(std::memory_order_acquire) &&
+           !eviction_thread_.joinable() && !client_monitor_thread_.joinable() &&
+           !nof_heartbeat_thread_.joinable() &&
+           !task_cleanup_thread_.joinable() &&
+           !http_metadata_cleanup_thread_.joinable() &&
+           !job_dispatch_thread_.joinable() &&
+           !dynamic_replication_admission_thread_.joinable() &&
+           !replica_cleanup_worker_.Joinable() &&
+           !graceful_unmount_scheduler_.Joinable() &&
+           !client_offboarding_worker_.Joinable() && !snapshot_manager_;
+}
+
+MasterService::~MasterService() {
+    QuiesceBackgroundWork();
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }
@@ -1054,12 +1088,12 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             std::atomic<uint64_t>& out;
             std::chrono::steady_clock::time_point start;
             ~LockHoldTimer() {
-                out.store(static_cast<uint64_t>(
-                              std::chrono::duration_cast<
-                                  std::chrono::nanoseconds>(
-                                  std::chrono::steady_clock::now() - start)
-                                  .count()),
-                          std::memory_order_relaxed);
+                out.store(
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count()),
+                    std::memory_order_relaxed);
             }
         } lock_hold_timer{last_remount_lock_hold_ns_,
                           std::chrono::steady_clock::now()};
@@ -12655,8 +12689,8 @@ void MasterService::ClientMonitorFunc() {
             }
         }
 
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
+        SleepWhileRunning(std::chrono::milliseconds(kClientMonitorSleepMs),
+                          client_monitor_running_);
     }
 }
 
@@ -14371,8 +14405,8 @@ void MasterService::ProcessDrainJobs() {
 void MasterService::JobDispatchThreadFunc() {
     while (job_dispatch_running_) {
         ProcessDrainJobs();
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kJobDispatchThreadSleepMs));
+        SleepWhileRunning(std::chrono::milliseconds(kJobDispatchThreadSleepMs),
+                          job_dispatch_running_);
     }
 }
 

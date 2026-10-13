@@ -46,8 +46,8 @@ using SteadyClock = std::chrono::steady_clock;
 
 uint64_t NsSince(SteadyClock::time_point start) {
     return static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(SteadyClock::now() -
-                                                             start)
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            SteadyClock::now() - start)
             .count());
 }
 
@@ -185,9 +185,8 @@ void MasterService::ExportHandoffShard(
                 }
                 if (processing || !replica.is_completed() ||
                     buffer.size_ != metadata.size) {
-                    quarantine.push_back({*segment_index,
-                                          buffer.buffer_address_,
-                                          buffer.size_});
+                    quarantine.push_back(
+                        {*segment_index, buffer.buffer_address_, buffer.size_});
                     ++stats.dropped_incomplete_replicas;
                     ++stats.quarantine_ranges;
                     stats.quarantine_bytes += buffer.size_;
@@ -219,6 +218,41 @@ void MasterService::ExportHandoffShard(
 
 WeightMetadataSnapshot MasterService::ExportHandoffWeightMetadata() const {
     return weight_manager_.ExportSnapshot();
+}
+
+void MasterService::ExportHandoffPendingQuarantine(
+    const std::vector<handoff::SegmentIdentity>& segments,
+    std::vector<handoff::QuarantineRange>& quarantine,
+    handoff::WriterStats& stats) const {
+    std::unordered_map<UUID, uint32_t, boost::hash<UUID>> index_by_id;
+    for (uint32_t i = 0; i < segments.size(); ++i) {
+        index_by_id.emplace(segments[i].segment_id, i);
+    }
+    std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
+    for (const auto& [segment_id, buffer] : handoff_quarantine_.buffers) {
+        const auto it = index_by_id.find(segment_id);
+        // A dropped segment's ranges may belong to a newer mount already.
+        if (it == index_by_id.end() || !buffer || !buffer->isAllocatorValid()) {
+            continue;
+        }
+        quarantine.push_back({it->second,
+                              reinterpret_cast<uint64_t>(buffer->data()),
+                              buffer->size()});
+        ++stats.quarantine_ranges;
+        stats.quarantine_bytes += buffer->size();
+    }
+}
+
+uint64_t MasterService::HandoffObjectCount() const {
+    uint64_t count = 0;
+    for (size_t s = 0; s < kNumShards; ++s) {
+        MetadataShardAccessorRO shard(this, s);
+        for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+            (void)tenant_id;
+            count += tenant_state.metadata.size();
+        }
+    }
+    return count;
 }
 
 // ----------------------------------------------------------------- restore
@@ -299,21 +333,23 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     // ---- Phase 0a: manifest and preconditions (no locks needed yet).
     auto phase_start = SteadyClock::now();
     if (enable_ha_ || enable_dfs_) {
-        return tl::make_unexpected("handoff restore requires a standalone "
-                                   "master without DFS");
+        return tl::make_unexpected(
+            "handoff restore requires a standalone "
+            "master without DFS");
     }
     if (memory_allocator_type_ != BufferAllocatorType::OFFSET) {
-        return tl::make_unexpected("handoff restore supports only the offset "
-                                   "allocator");
+        return tl::make_unexpected(
+            "handoff restore supports only the offset "
+            "allocator");
     }
     auto manifest_bytes =
         handoff::ReadFileBytes(dir + "/" + handoff::kHandoffManifestFile);
     if (!manifest_bytes) {
         return tl::make_unexpected(manifest_bytes.error());
     }
-    auto manifest = handoff::DecodeManifest(std::string_view(
-        reinterpret_cast<const char*>(manifest_bytes->data()),
-        manifest_bytes->size()));
+    auto manifest = handoff::DecodeManifest(
+        std::string_view(reinterpret_cast<const char*>(manifest_bytes->data()),
+                         manifest_bytes->size()));
     if (!manifest) {
         return tl::make_unexpected(manifest.error());
     }
@@ -331,10 +367,10 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     }
     std::optional<WeightMetadataSnapshot> weight_metadata;
     if (manifest->weight_metadata) {
-        auto bytes = handoff::ReadVerifiedBlob(
-            dir, manifest->weight_metadata->key,
-            manifest->weight_metadata->bytes,
-            manifest->weight_metadata->crc32c);
+        auto bytes =
+            handoff::ReadVerifiedBlob(dir, manifest->weight_metadata->key,
+                                      manifest->weight_metadata->bytes,
+                                      manifest->weight_metadata->crc32c);
         if (!bytes) return tl::make_unexpected(bytes.error());
         auto decoded = DecodeBatchOpLogSnapshotWeightMetadata(*bytes);
         if (!decoded) return tl::make_unexpected(decoded.error());
@@ -362,8 +398,7 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     for (const auto& range : quarantine_ranges) {
         if (range.segment_index >= nseg ||
             locator.Find(segments[range.segment_index].te_endpoint,
-                         range.address,
-                         range.size) != range.segment_index) {
+                         range.address, range.size) != range.segment_index) {
             return tl::make_unexpected("quarantine range outside segment");
         }
     }
@@ -374,7 +409,6 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
 
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
     std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-
 
     // ---- Phase 0b: mount restored segments, closed for reads and writes.
     phase_start = SteadyClock::now();
@@ -402,8 +436,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
                 segment, identity.owner_client_id, record, allocators[i]);
             if (mounted != ErrorCode::OK) {
                 return tl::make_unexpected("mount of restored segment " +
-                                           identity.name + " failed: " +
-                                           toString(mounted));
+                                           identity.name +
+                                           " failed: " + toString(mounted));
             }
             binders[i] = segment_access.MakeBufferBinder(segment.id);
             if (!binders[i]) {
@@ -412,8 +446,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             }
             placeholders[i] = std::make_shared<DummyBufferAllocator>(
                 identity.name, identity.te_endpoint);
-            pending_restored_segments_[segment.id] = {
-                identity.owner_client_id, segment};
+            pending_restored_segments_[segment.id] = {identity.owner_client_id,
+                                                      segment};
             invalid_replica_endpoints_.insert(identity.te_endpoint);
             invalid_replica_endpoints_.insert(identity.name);
         }
@@ -453,149 +487,156 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     };
 
     phase_start = SteadyClock::now();
-    ParallelFor(manifest->chunks.size(), workers, [&](size_t chunk_index,
-                                                      size_t w) {
-        if (failed.load(std::memory_order_relaxed)) return;
-        auto& st = states[w];
-        const auto fail = [&](std::string message) {
-            if (st.error.empty()) st.error = std::move(message);
-            failed = true;
-        };
-        const auto& chunk = manifest->chunks[chunk_index];
+    ParallelFor(
+        manifest->chunks.size(), workers, [&](size_t chunk_index, size_t w) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            auto& st = states[w];
+            const auto fail = [&](std::string message) {
+                if (st.error.empty()) st.error = std::move(message);
+                failed = true;
+            };
+            const auto& chunk = manifest->chunks[chunk_index];
 
-        auto t = SteadyClock::now();
-        auto bytes =
-            handoff::ReadVerifiedBlob(dir, chunk.key, chunk.bytes, chunk.crc32c);
-        if (!bytes) {
-            fail(bytes.error());
-            return;
-        }
-        auto decoded = DecodeBatchOpLogSnapshotObjectChunk(
-            *bytes, chunk.index, chunk.objects);
-        if (!decoded) {
-            fail("chunk " + std::to_string(chunk.index) + ": " +
-                 decoded.error());
-            return;
-        }
-        std::vector<uint8_t>().swap(*bytes);
-        const auto& objects = decoded->objects;
-        st.load_ns += NsSince(t);
-
-        t = SteadyClock::now();
-        std::vector<Prepared> prepared;
-        prepared.reserve(objects.size());
-        for (const auto& entry : objects) {
-            auto [scoped_tenant_id, user_key] =
-                TenantId::ParseScopedKey(entry.key);
-            TenantId tenant_id(entry.tenant_id);
-            if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
-                tenant_id = std::move(scoped_tenant_id);
-            }
-            if (!tenant_id.IsValid() || user_key.empty()) {
-                fail("invalid tenant or key");
+            auto t = SteadyClock::now();
+            auto bytes = handoff::ReadVerifiedBlob(dir, chunk.key, chunk.bytes,
+                                                   chunk.crc32c);
+            if (!bytes) {
+                fail(bytes.error());
                 return;
             }
-            const auto& meta = entry.metadata;
-            if (meta.replicas.empty()) {
-                fail("object without replicas");
+            auto decoded = DecodeBatchOpLogSnapshotObjectChunk(
+                *bytes, chunk.index, chunk.objects);
+            if (!decoded) {
+                fail("chunk " + std::to_string(chunk.index) + ": " +
+                     decoded.error());
                 return;
             }
-            const size_t shard_idx = getShardIndex(tenant_id, user_key);
-            Prepared p{shard_idx, std::move(tenant_id), std::move(user_key),
-                       &entry, {}, {}};
-            p.replicas.reserve(meta.replicas.size());
-            for (size_t r = 0; r < meta.replicas.size(); ++r) {
-                const auto& desc = meta.replicas[r];
-                if (desc.id == 0 ||
-                    desc.id == std::numeric_limits<ReplicaID>::max()) {
-                    fail("invalid replica id");
+            std::vector<uint8_t>().swap(*bytes);
+            const auto& objects = decoded->objects;
+            st.load_ns += NsSince(t);
+
+            t = SteadyClock::now();
+            std::vector<Prepared> prepared;
+            prepared.reserve(objects.size());
+            for (const auto& entry : objects) {
+                auto [scoped_tenant_id, user_key] =
+                    TenantId::ParseScopedKey(entry.key);
+                TenantId tenant_id(entry.tenant_id);
+                if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
+                    tenant_id = std::move(scoped_tenant_id);
+                }
+                if (!tenant_id.IsValid() || user_key.empty()) {
+                    fail("invalid tenant or key");
                     return;
                 }
-                for (size_t q = 0; q < r; ++q) {
-                    if (meta.replicas[q].id == desc.id) {
-                        fail("duplicate replica id");
+                const auto& meta = entry.metadata;
+                if (meta.replicas.empty()) {
+                    fail("object without replicas");
+                    return;
+                }
+                const size_t shard_idx = getShardIndex(tenant_id, user_key);
+                Prepared p{shard_idx,
+                           std::move(tenant_id),
+                           std::move(user_key),
+                           &entry,
+                           {},
+                           {}};
+                p.replicas.reserve(meta.replicas.size());
+                for (size_t r = 0; r < meta.replicas.size(); ++r) {
+                    const auto& desc = meta.replicas[r];
+                    if (desc.id == 0 ||
+                        desc.id == std::numeric_limits<ReplicaID>::max()) {
+                        fail("invalid replica id");
                         return;
                     }
+                    for (size_t q = 0; q < r; ++q) {
+                        if (meta.replicas[q].id == desc.id) {
+                            fail("duplicate replica id");
+                            return;
+                        }
+                    }
+                    if (!desc.is_memory_replica() ||
+                        desc.status != ReplicaStatus::COMPLETE) {
+                        fail("unexpected replica kind or status");
+                        return;
+                    }
+                    const auto& buffer =
+                        desc.get_memory_descriptor().buffer_descriptor;
+                    if (buffer.size_ != meta.size ||
+                        buffer.protocol_ == "cxl") {
+                        fail("invalid memory descriptor");
+                        return;
+                    }
+                    const auto si =
+                        locator.Find(buffer.transport_endpoint_,
+                                     buffer.buffer_address_, buffer.size_);
+                    if (!si) {
+                        fail(
+                            "memory descriptor outside every restored segment");
+                        return;
+                    }
+                    st.max_id = std::max(st.max_id, desc.id);
+                    p.replicas.push_back(
+                        Replica(desc.id,
+                                std::make_unique<AllocatedBuffer>(
+                                    placeholders[*si], buffer),
+                                desc.status));
+                    p.placement.push_back(
+                        {*si, {buffer.buffer_address_, buffer.size_}});
                 }
-                if (!desc.is_memory_replica() ||
-                    desc.status != ReplicaStatus::COMPLETE) {
-                    fail("unexpected replica kind or status");
-                    return;
-                }
-                const auto& buffer =
-                    desc.get_memory_descriptor().buffer_descriptor;
-                if (buffer.size_ != meta.size || buffer.protocol_ == "cxl") {
-                    fail("invalid memory descriptor");
-                    return;
-                }
-                const auto si = locator.Find(buffer.transport_endpoint_,
-                                             buffer.buffer_address_,
-                                             buffer.size_);
-                if (!si) {
-                    fail("memory descriptor outside every restored segment");
-                    return;
-                }
-                st.max_id = std::max(st.max_id, desc.id);
-                p.replicas.push_back(Replica(
-                    desc.id,
-                    std::make_unique<AllocatedBuffer>(placeholders[*si],
-                                                      buffer),
-                    desc.status));
-                p.placement.push_back(
-                    {*si, {buffer.buffer_address_, buffer.size_}});
+                prepared.push_back(std::move(p));
             }
-            prepared.push_back(std::move(p));
-        }
-        std::sort(prepared.begin(), prepared.end(),
-                  [](const Prepared& a, const Prepared& b) {
-                      return a.shard < b.shard;
-                  });
-        st.prepare_ns += NsSince(t);
+            std::sort(prepared.begin(), prepared.end(),
+                      [](const Prepared& a, const Prepared& b) {
+                          return a.shard < b.shard;
+                      });
+            st.prepare_ns += NsSince(t);
 
-        t = SteadyClock::now();
-        size_t i = 0;
-        while (i < prepared.size()) {
-            const size_t shard_idx = prepared[i].shard;
-            MetadataShardAccessorRW shard(this, shard_idx);
-            for (; i < prepared.size() && prepared[i].shard == shard_idx; ++i) {
-                auto& object = prepared[i];
-                const auto& meta = object.entry->metadata;
-                auto& tenant_state =
-                    GetOrCreateTenantState(shard.get(), object.tenant_id);
-                auto [it, inserted] = tenant_state.metadata.emplace(
-                    std::piecewise_construct,
-                    std::forward_as_tuple(object.user_key),
-                    std::forward_as_tuple(
-                        meta.client_id, now, meta.size,
-                        std::move(object.replicas), std::nullopt,
-                        meta.hard_pinned.value_or(false), meta.data_type,
-                        meta.group_id, object.tenant_id, object.user_key));
-                if (!inserted) {
-                    fail("duplicate object " + object.user_key);
-                    return;
+            t = SteadyClock::now();
+            size_t i = 0;
+            while (i < prepared.size()) {
+                const size_t shard_idx = prepared[i].shard;
+                MetadataShardAccessorRW shard(this, shard_idx);
+                for (; i < prepared.size() && prepared[i].shard == shard_idx;
+                     ++i) {
+                    auto& object = prepared[i];
+                    const auto& meta = object.entry->metadata;
+                    auto& tenant_state =
+                        GetOrCreateTenantState(shard.get(), object.tenant_id);
+                    auto [it, inserted] = tenant_state.metadata.emplace(
+                        std::piecewise_construct,
+                        std::forward_as_tuple(object.user_key),
+                        std::forward_as_tuple(
+                            meta.client_id, now, meta.size,
+                            std::move(object.replicas), std::nullopt,
+                            meta.hard_pinned.value_or(false), meta.data_type,
+                            meta.group_id, object.tenant_id, object.user_key));
+                    if (!inserted) {
+                        fail("duplicate object " + object.user_key);
+                        return;
+                    }
+                    auto& metadata = it->second;
+                    if (!meta.group_id.empty()) {
+                        metadata.lease_ = RegisterGroupMember(
+                            object.tenant_id, object.user_key, meta.group_id);
+                    }
+                    // Every restored replica is a completed memory replica.
+                    metadata.memory_cache_total_accounted = true;
+                    size_t r = 0;
+                    metadata.VisitReplicas(
+                        [](const Replica&) { return true; },
+                        [&](Replica& replica) {
+                            const auto& [si, range] = object.placement[r];
+                            st.refs[si].push_back(
+                                {range.first, range.second, &replica});
+                            ++r;
+                        });
+                    st.replicas += r;
+                    ++st.objects;
                 }
-                auto& metadata = it->second;
-                if (!meta.group_id.empty()) {
-                    metadata.lease_ = RegisterGroupMember(
-                        object.tenant_id, object.user_key, meta.group_id);
-                }
-                // Every restored replica is a completed memory replica.
-                metadata.memory_cache_total_accounted = true;
-                size_t r = 0;
-                metadata.VisitReplicas(
-                    [](const Replica&) { return true; },
-                    [&](Replica& replica) {
-                        const auto& [si, range] = object.placement[r];
-                        st.refs[si].push_back(
-                            {range.first, range.second, &replica});
-                        ++r;
-                    });
-                st.replicas += r;
-                ++st.objects;
             }
-        }
-        st.insert_ns += NsSince(t);
-    });
+            st.insert_ns += NsSince(t);
+        });
     stats.insert_wall_ns = NsSince(phase_start);
     for (const auto& st : states) {
         if (!st.error.empty()) {
@@ -655,8 +696,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         for (size_t k = 0; k < refs.size(); ++k) {
             if (k > 0 &&
                 refs[k].address < refs[k - 1].address + refs[k - 1].size) {
-                segment_errors[si] = "overlapping ranges in segment " +
-                                     segments[si].name;
+                segment_errors[si] =
+                    "overlapping ranges in segment " + segments[si].name;
                 return;
             }
             allocations.push_back({refs[k].address - base, refs[k].size});
@@ -809,8 +850,8 @@ void MasterService::DropPendingRestoredSegmentLocked(const UUID& segment_id,
             // Invalidates every restored buffer of the segment at once; the
             // objects become unreadable now and are erased by the cleanup
             // worker.
-            (void)segment_access.CommitUnmountSegment(segment_id,
-                                                      pending.owner, capacity);
+            (void)segment_access.CommitUnmountSegment(segment_id, pending.owner,
+                                                      capacity);
         }
     }
     bool alias_still_pending = false;
