@@ -29,6 +29,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_service_handoff.cpp
     handoff/handoff_format.cpp
     handoff/handoff_writer.cpp
+    handoff/handoff_lifecycle.cpp
+    handoff/handoff_admission.cpp
+    handoff/handoff_runtime.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
