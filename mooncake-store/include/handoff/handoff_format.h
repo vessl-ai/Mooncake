@@ -180,6 +180,11 @@ struct Manifest {
     uint64_t local_disk_clients{0};
     std::optional<BlobInfo> offload_takes;  // vector<OffloadTake>
     uint64_t offload_take_count{0};
+    // Remaining cold-start take hold of the old master (0: none). A master
+    // that started cold blocks every offload take for
+    // put_start_release_timeout; the next master keeps blocking them for
+    // what is left of it.
+    uint64_t offload_take_hold_ms{0};
     WriterStats writer;
 };
 

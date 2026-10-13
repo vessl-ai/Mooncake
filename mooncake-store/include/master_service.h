@@ -1018,6 +1018,8 @@ class MasterService {
     // put_start_release_timeout. Called by mooncake_master before serving
     // when no handoff snapshot was restored.
     void HoldOffloadTakesAfterColdStart();
+    // What is left of the cold-start hold, for the handoff (0: none).
+    uint64_t HandoffOffloadTakeHoldMs() const;
     bool OffloadTakesHeld() const {
         return std::chrono::system_clock::now().time_since_epoch().count() <
                offload_take_hold_until_.load(std::memory_order_relaxed);

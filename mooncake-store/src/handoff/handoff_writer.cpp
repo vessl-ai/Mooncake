@@ -320,6 +320,7 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     // Read after the export: every id the old master handed out is below it,
     // including ids of objects that were left out.
     manifest.next_replica_id = MasterService::HandoffNextReplicaId();
+    manifest.offload_take_hold_ms = service.HandoffOffloadTakeHoldMs();
 
     // ---- Small files: quarantine, upstream compatibility artifacts, then
     // the handoff manifest last. This fork's master has no weight

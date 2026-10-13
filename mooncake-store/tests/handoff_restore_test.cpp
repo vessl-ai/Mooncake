@@ -1663,5 +1663,47 @@ TEST_F(HandoffRestoreTest, OffloadTakesOfTheOldMasterBlockReTakes) {
     EXPECT_TRUE(HasDisk(master, Key(0, 2), stores_[0].client_id));
 }
 
+TEST_F(HandoffRestoreTest, ColdStartTakeHoldIsCarried) {
+    // A master still in its cold-start hold (no store may take an offload,
+    // because reports of takes from the master before it may still arrive)
+    // hands what is left of the hold to the next master.
+    auto config = [] {
+        return MasterServiceConfig::builder()
+            .set_memory_allocator(BufferAllocatorType::OFFSET)
+            .set_eviction_ratio(0.0)
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_client_live_ttl_sec(3600)
+            .set_client_suspicion_ttl_sec(3600)
+            .set_enable_offload(true)
+            .set_put_start_discard_timeout_sec(1)
+            .set_put_start_release_timeout_sec(2)
+            .build();
+    };
+    TempDir dir;
+    {
+        MasterService old_master(config());
+        old_master.HoldOffloadTakesAfterColdStart();
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        EnableL4(old_master, store);
+        Put(old_master, store, Key(0, 0));
+        Write(old_master, dir.path());
+    }
+    MasterService master(config());
+    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
+    EXPECT_TRUE(master.OffloadTakesHeld());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    Put(master, stores_[0], Key(0, 1));
+    EXPECT_TRUE(Offload(master, stores_[0], "disk-0", 10).empty());
+    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
+    EXPECT_FALSE(master.OffloadTakesHeld());
+    Put(master, stores_[0], Key(0, 2));
+    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10),
+              std::vector<std::string>{Key(0, 2)});
+    EXPECT_TRUE(HasDisk(master, Key(0, 2), stores_[0].client_id));
+}
+
 }  // namespace
 }  // namespace mooncake::test

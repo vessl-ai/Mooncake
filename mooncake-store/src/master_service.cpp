@@ -8467,6 +8467,21 @@ void MasterService::HoldOffloadTakesAfterColdStart() {
               << put_start_release_timeout_sec_.count();
 }
 
+uint64_t MasterService::HandoffOffloadTakeHoldMs() const {
+    const auto until = std::chrono::system_clock::time_point(
+        std::chrono::system_clock::duration(
+            offload_take_hold_until_.load(std::memory_order_relaxed)));
+    const auto now = std::chrono::system_clock::now();
+    if (until <= now) {
+        return 0;
+    }
+    return static_cast<uint64_t>(
+               std::chrono::duration_cast<std::chrono::milliseconds>(until -
+                                                                     now)
+                   .count()) +
+           1;
+}
+
 void MasterService::ReleaseOffloadingTask(
     TenantState& tenant_state, ObjectMetadata* metadata,
     std::unordered_map<std::string, OffloadingTask>::iterator task_it,

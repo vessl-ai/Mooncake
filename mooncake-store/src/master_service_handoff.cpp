@@ -467,6 +467,7 @@ void MasterService::ResetHandoffState() {
         released.swap(handoff_quarantine_.buffers);
     }
     handoff_restored_offload_takes_.store(0, std::memory_order_relaxed);
+    offload_take_hold_until_.store(0, std::memory_order_relaxed);
 }
 
 bool MasterService::HandoffMasterIsEmpty() {
@@ -600,14 +601,17 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             return tl::make_unexpected("L4 blob count mismatch");
         }
     }
+    // A hold longer than a day cannot come from a sane release timeout (and
+    // would overflow the deadline arithmetic).
+    constexpr uint64_t kMaxTakeHoldMs = 24ull * 3600 * 1000;
     for (const auto& take : offload_takes) {
-        // A hold longer than a day cannot come from a sane release timeout
-        // (and would overflow the deadline arithmetic).
-        constexpr uint64_t kMaxTakeHoldMs = 24ull * 3600 * 1000;
         if (take.tenant_id.empty() || take.key.empty() ||
             take.client_id == UUID{0, 0} || take.hold_ms > kMaxTakeHoldMs) {
             return tl::make_unexpected("invalid offload take entry");
         }
+    }
+    if (manifest->offload_take_hold_ms > kMaxTakeHoldMs) {
+        return tl::make_unexpected("invalid offload take hold");
     }
     if (manifest->local_disk_replica_count > 0 && disk_clients.empty()) {
         return tl::make_unexpected("LOCAL_DISK replicas without owners");
@@ -1123,6 +1127,16 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         stats.offload_takes = offload_takes.size();
         handoff_restored_offload_takes_.store(offload_takes.size(),
                                               std::memory_order_relaxed);
+        // The old master was still in its cold-start hold: no take of any
+        // key for what is left of it (counted from now, the gap only adds).
+        if (manifest->offload_take_hold_ms > 0) {
+            const auto until = takes_now + std::chrono::milliseconds(
+                                               manifest->offload_take_hold_ms);
+            offload_take_hold_until_.store(until.time_since_epoch().count(),
+                                           std::memory_order_relaxed);
+            LOG(INFO) << "offload_take_hold=restored, ms="
+                      << manifest->offload_take_hold_ms;
+        }
     }
     MasterMetricManager::instance().inc_mem_cache_nums(
         static_cast<int64_t>(memory_objects));

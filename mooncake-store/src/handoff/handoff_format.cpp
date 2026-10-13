@@ -269,6 +269,7 @@ std::string EncodeManifest(const Manifest& m) {
     root["local_disk_clients"] = Json::UInt64(m.local_disk_clients);
     if (m.offload_takes) root["offload_takes"] = EncodeBlob(*m.offload_takes);
     root["offload_take_count"] = Json::UInt64(m.offload_take_count);
+    root["offload_take_hold_ms"] = Json::UInt64(m.offload_take_hold_ms);
     Json::Value w(Json::objectValue);
     w["objects"] = Json::UInt64(m.writer.objects);
     w["replicas"] = Json::UInt64(m.writer.replicas);
@@ -396,7 +397,8 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
                     m.local_disk_replica_count) ||
             !GetU64(root, "disk_only_object_count", m.disk_only_object_count) ||
             !GetU64(root, "local_disk_clients", m.local_disk_clients) ||
-            !GetU64(root, "offload_take_count", m.offload_take_count)) {
+            !GetU64(root, "offload_take_count", m.offload_take_count) ||
+            !GetU64(root, "offload_take_hold_ms", m.offload_take_hold_ms)) {
             return tl::make_unexpected("manifest L4 field missing or mistyped");
         }
         m.codec.local_disk = codec["local_disk"].asUInt();
