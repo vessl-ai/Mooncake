@@ -696,14 +696,16 @@ TEST_F(MasterServiceSSDTest, LateCompletionOfARemovedObjectIsRefused) {
         service->NotifyOffloadSuccess(client_id, *first, {file}).has_value());
     ExpectMemoryOnly(*service, "aba_key");
 
-    // Even after the store drained the new task, a report for the key from
-    // this store cannot be told apart from the late one, so none is
-    // registered until the stale take expires.
+    // A report for the key from this store cannot be told apart from the
+    // late one until the stale take expires: the store does not take the new
+    // task (its item is not even handed out), and a completion is refused.
     auto second = service->OffloadObjectHeartbeat(client_id, true);
     ASSERT_TRUE(second.has_value());
-    ASSERT_EQ(second->size(), 1u);
+    EXPECT_TRUE(second->empty());
     ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, *second, {file}).has_value());
+        service
+            ->NotifyOffloadSuccess(client_id, {Task("aba_key", 4096)}, {file})
+            .has_value());
     ExpectMemoryOnly(*service, "aba_key");
 }
 

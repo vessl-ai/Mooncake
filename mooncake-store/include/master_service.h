@@ -1011,6 +1011,17 @@ class MasterService {
     uint64_t HandoffRestoredOffloadTakes() const {
         return handoff_restored_offload_takes_.load(std::memory_order_relaxed);
     }
+    // Every master starts without any record of the offloads its stores took
+    // from a previous master. Unless the handoff carried them (offload
+    // takes), a report of such a take may still arrive and carries only the
+    // key, so after a cold start no store takes an offload task for
+    // put_start_release_timeout. Called by mooncake_master before serving
+    // when no handoff snapshot was restored.
+    void HoldOffloadTakesAfterColdStart();
+    bool OffloadTakesHeld() const {
+        return std::chrono::system_clock::now().time_since_epoch().count() <
+               offload_take_hold_until_.load(std::memory_order_relaxed);
+    }
     // Releases quarantined ranges whose deadline has passed. Called by the
     // task cleanup thread; public for tests.
     void ReleaseExpiredHandoffQuarantine(
@@ -1710,17 +1721,6 @@ class MasterService {
     bool HasStaleOffloadTake(const TenantState& tenant_state,
                              const std::string& key, const UUID& client_id,
                              std::chrono::system_clock::time_point now) const;
-    // Every master starts without any record of the offloads its stores took
-    // from a previous master. Unless the handoff carried them (offload
-    // takes), a report of such a take may still arrive and carries only the
-    // key, so after a cold start no store takes an offload task for
-    // put_start_release_timeout. Called by mooncake_master before serving
-    // when no handoff snapshot was restored.
-    void HoldOffloadTakesAfterColdStart();
-    bool OffloadTakesHeld() const {
-        return std::chrono::system_clock::now().time_since_epoch().count() <
-               offload_take_hold_until_.load(std::memory_order_relaxed);
-    }
     // Marks `client_id` as a taker of the current offload task of each key
     // it has just drained (OffloadObjectHeartbeat) and returns the items it
     // took; only those are handed to the store.
