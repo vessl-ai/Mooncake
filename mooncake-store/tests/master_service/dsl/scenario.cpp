@@ -1295,8 +1295,19 @@ MasterScenario& MasterScenario::When(CompleteOffloadAction action) {
     }
     if (!action.re_registration) {
         // Errors (e.g. no LOCAL_DISK segment) surface through the
-        // completion below.
-        (void)service_->OffloadObjectHeartbeat(ActorId(action.actor), true);
+        // completion below. A store reports the items it drained, so each
+        // completion echoes the task id of its key's drained item.
+        auto drained =
+            service_->OffloadObjectHeartbeat(ActorId(action.actor), true);
+        if (drained) {
+            for (auto& task : tasks) {
+                for (const auto& item : *drained) {
+                    if (item.key == task.key) {
+                        task.task_id = item.task_id;
+                    }
+                }
+            }
+        }
     }
     const auto result =
         service_->NotifyOffloadSuccess(ActorId(action.actor), tasks, metadatas);

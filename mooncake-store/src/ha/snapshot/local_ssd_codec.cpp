@@ -124,9 +124,12 @@ tl::expected<LocalSsdPersistedState, SerializationError> LocalSsdCodec::Decode(
                     }
                     auto [tenant_id, object_key] =
                         TenantId::ParseScopedKey(encoded_key);
+                    // HA-restored items carry no task id: no task of a new
+                    // leader matches them, so they are dropped at the drain.
                     task = OffloadTaskItem{.tenant_id = tenant_id.value(),
                                            .key = std::move(object_key),
-                                           .size = task_object.as<int64_t>()};
+                                           .size = task_object.as<int64_t>(),
+                                           .task_id = std::nullopt};
                 }
                 client.pending_offloads.insert_or_assign(std::move(encoded_key),
                                                          std::move(task));

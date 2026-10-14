@@ -112,6 +112,44 @@ OffloadTaskItem Task(const std::string& key, int64_t size) {
         .tenant_id = TenantId::Default().value(), .key = key, .size = size};
 }
 
+// The id of the key's current offload task, or nullopt without one.
+std::optional<L4TaskId> OffloadTaskId(MasterService& service,
+                                      const std::string& key) {
+    MasterServiceTestPeer::MetadataAccessorRO accessor(
+        &service, MasterServiceTestPeer::ObjectIdentity{
+                      .tenant_id = TenantId::Default(), .user_key = key});
+    const auto* tenant_state = accessor.GetTenantState();
+    if (tenant_state == nullptr) {
+        return std::nullopt;
+    }
+    auto it = tenant_state->offloading_tasks.find(key);
+    if (it == tenant_state->offloading_tasks.end()) {
+        return std::nullopt;
+    }
+    return it->second.task_id;
+}
+
+// Queues one more offload item for `key` onto the mailbox of the store that
+// holds its first memory replica, with a fresh id that no task has. It
+// replaces the item queued there, like an item left over from an earlier
+// task of the key.
+void QueueForeignItem(MasterService& service, const std::string& key) {
+    MasterServiceTestPeer peer(service);
+    const MasterServiceTestPeer::ObjectIdentity id{
+        .tenant_id = TenantId::Default(), .user_key = key};
+    MasterServiceTestPeer::MetadataAccessorRW accessor(&service, id);
+    ASSERT_TRUE(accessor.Exists());
+    bool pushed = false;
+    accessor.Get().VisitReplicas(
+        [](const Replica& replica) { return replica.is_memory_replica(); },
+        [&](Replica& replica) {
+            if (!pushed) {
+                pushed = peer.PushOffloadingQueue(id, replica).has_value();
+            }
+        });
+    ASSERT_TRUE(pushed);
+}
+
 void ExpectMemoryOnly(MasterService& service, const std::string& key) {
     auto replicas = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
@@ -812,23 +850,22 @@ TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {
     const bool a_is_source = first_name == "mirror_a";
     const UUID source = a_is_source ? client_a : client_b;
     const UUID other = a_is_source ? client_b : client_a;
+    const auto& source_items = a_is_source ? *from_a : *from_b;
+    const auto& other_items = a_is_source ? *from_b : *from_a;
 
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
     // The other mirror reports first: refused, and it ends the task.
     ASSERT_TRUE(
-        service->NotifyOffloadSuccess(other, {Task("mirror_key", 4096)}, {file})
-            .has_value());
+        service->NotifyOffloadSuccess(other, other_items, {file}).has_value());
     auto after_other =
         service->GetReplicaList("mirror_key", TenantId::Default());
     ASSERT_TRUE(after_other.has_value());
     EXPECT_EQ(after_other->replicas.size(), 2u);
     // The source owner's report now finds no task it took: refused as well.
-    ASSERT_TRUE(
-        service
-            ->NotifyOffloadSuccess(source, {Task("mirror_key", 4096)}, {file})
-            .has_value());
+    ASSERT_TRUE(service->NotifyOffloadSuccess(source, source_items, {file})
+                    .has_value());
     auto after_source =
         service->GetReplicaList("mirror_key", TenantId::Default());
     ASSERT_TRUE(after_source.has_value());
@@ -843,8 +880,10 @@ TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {
                     ->PutEnd(client_a, "mirror_key2", TenantId::Default(),
                              ReplicaType::MEMORY)
                     .has_value());
-    ASSERT_TRUE(service->OffloadObjectHeartbeat(client_a, true).has_value());
-    ASSERT_TRUE(service->OffloadObjectHeartbeat(client_b, true).has_value());
+    auto from_a2 = service->OffloadObjectHeartbeat(client_a, true);
+    auto from_b2 = service->OffloadObjectHeartbeat(client_b, true);
+    ASSERT_TRUE(from_a2.has_value());
+    ASSERT_TRUE(from_b2.has_value());
     auto replicas2 =
         service->GetReplicaList("mirror_key2", TenantId::Default());
     ASSERT_TRUE(replicas2.has_value());
@@ -854,12 +893,155 @@ TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {
             .buffer_descriptor.transport_endpoint_ == "mirror_a";
     ASSERT_TRUE(service
                     ->NotifyOffloadSuccess(a_is_source2 ? client_a : client_b,
-                                           {Task("mirror_key2", 4096)}, {file})
+                                           a_is_source2 ? *from_a2 : *from_b2,
+                                           {file})
                     .has_value());
     auto registered =
         service->GetReplicaList("mirror_key2", TenantId::Default());
     ASSERT_TRUE(registered.has_value());
     EXPECT_EQ(registered->replicas.size(), 3u);
+}
+
+// Every offload task gets a fresh id, and each item queued for it carries
+// that id.
+TEST_F(MasterServiceSSDTest, OffloadItemsCarryTheirTaskId) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "id_segment", 0x3a0000000);
+    PutMemoryObject(*service, client_id, "id_key_a", 4096);
+    PutMemoryObject(*service, client_id, "id_key_b", 4096);
+    const auto id_a = OffloadTaskId(*service, "id_key_a");
+    const auto id_b = OffloadTaskId(*service, "id_key_b");
+    ASSERT_TRUE(id_a.has_value());
+    ASSERT_TRUE(id_b.has_value());
+    EXPECT_EQ(id_a->epoch, service->L4TaskEpoch());
+    EXPECT_NE(id_a->epoch, 0u);
+    EXPECT_EQ(id_b->epoch, id_a->epoch);
+    EXPECT_NE(id_b->seq, id_a->seq);
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 2u);
+    for (const auto& item : *drained) {
+        ASSERT_TRUE(item.task_id.has_value()) << item.key;
+        EXPECT_EQ(*item.task_id, item.key == "id_key_a" ? *id_a : *id_b);
+    }
+}
+
+// A completion without a task id (a store that predates task ids, or a
+// rescan entry) is never registered. If its sender took the task, the task
+// ends: it would only pin its source until the TTL reaper.
+TEST_F(MasterServiceSSDTest,
+       IdLessCompletionIsRefusedButReleasesTheTaskOfItsTaker) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "noid_segment", 0x3b0000000);
+    PutMemoryObject(*service, client_id, "noid_key", 4096);
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    // Not taken yet: refused, and the queued task stays.
+    ASSERT_TRUE(
+        service
+            ->NotifyOffloadSuccess(client_id, {Task("noid_key", 4096)}, {file})
+            .has_value());
+    ExpectMemoryOnly(*service, "noid_key");
+    ASSERT_TRUE(OffloadTaskId(*service, "noid_key").has_value());
+
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
+    auto without_id = drained->front();
+    without_id.task_id.reset();
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {without_id}, {file})
+                    .has_value());
+    ExpectMemoryOnly(*service, "noid_key");
+    EXPECT_FALSE(OffloadTaskId(*service, "noid_key").has_value());
+}
+
+// A completion that names another task of the key is refused and leaves the
+// key's current task alone; that task's own report is still registered.
+TEST_F(MasterServiceSSDTest, CompletionWithAnotherTaskIdIsRefused) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "other_id_segment",
+                            0x3c0000000);
+    PutMemoryObject(*service, client_id, "other_id_key", 4096);
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
+    const L4TaskId current = *drained->front().task_id;
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    for (const L4TaskId other : {L4TaskId{current.epoch, current.seq + 1},
+                                 L4TaskId{current.epoch ^ 1, current.seq}}) {
+        auto item = drained->front();
+        item.task_id = other;
+        ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {item}, {file})
+                        .has_value());
+        ExpectMemoryOnly(*service, "other_id_key");
+        ASSERT_EQ(OffloadTaskId(*service, "other_id_key"), current);
+    }
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *drained, {file}).has_value());
+    auto replicas =
+        service->GetReplicaList("other_id_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
+}
+
+// A NACK ends only the task it names.
+TEST_F(MasterServiceSSDTest, NackWithAnotherTaskIdKeepsTheTask) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "nack_id_segment",
+                            0x3d0000000);
+    PutMemoryObject(*service, client_id, "nack_id_key", 4096);
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
+    const L4TaskId current = *drained->front().task_id;
+    auto item = drained->front();
+    item.task_id = L4TaskId{current.epoch, current.seq + 1};
+    StorageObjectMetadata nack;
+    nack.data_size = -1;
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, {item}, {nack}).has_value());
+    ASSERT_EQ(OffloadTaskId(*service, "nack_id_key"), current);
+
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *drained, {file}).has_value());
+    auto replicas = service->GetReplicaList("nack_id_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
+}
+
+// A queued item that names no current task is neither handed out nor able
+// to end the key's current task when a store drains it with offloading
+// disabled.
+TEST_F(MasterServiceSSDTest, DrainedItemsOfAnotherTaskAreDropped) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "foreign_segment",
+                            0x3e0000000);
+    PutMemoryObject(*service, client_id, "foreign_key", 4096);
+    const auto current = OffloadTaskId(*service, "foreign_key");
+    ASSERT_TRUE(current.has_value());
+
+    QueueForeignItem(*service, "foreign_key");
+    auto taken = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(taken.has_value());
+    EXPECT_TRUE(taken->empty());
+    EXPECT_EQ(OffloadTaskId(*service, "foreign_key"), current);
+
+    QueueForeignItem(*service, "foreign_key");
+    auto disabled = service->OffloadObjectHeartbeat(client_id, false);
+    ASSERT_TRUE(disabled.has_value());
+    EXPECT_TRUE(disabled->empty());
+    EXPECT_EQ(OffloadTaskId(*service, "foreign_key"), current);
 }
 
 // An offload completion whose size differs from the object is refused.

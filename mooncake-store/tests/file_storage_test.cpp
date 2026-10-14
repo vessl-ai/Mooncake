@@ -594,10 +594,12 @@ class FileStorageTest : public ::testing::Test {
     // does: each key gets a memory replica on a placeholder segment owned by
     // the store's client (PutEnd queues the offload), then the store's
     // offload heartbeat drains the tasks. Returns the placeholder segment,
-    // for DropMemoryCopies once the offload is complete.
+    // for DropMemoryCopies once the offload is complete; the drained items
+    // (which a completion must echo, task id included) go to `drained_out`.
     static Segment PrepareDrainedOffloads(
         testing::InProcMaster& master, Client& client,
         const std::vector<std::string>& keys, uint64_t size,
+        std::vector<OffloadTaskItem>* drained_out = nullptr,
         const std::string& tenant_id = "default") {
         static std::atomic<uint64_t> next_base{0x7e0000000000ULL};
         Segment segment;
@@ -630,7 +632,32 @@ class FileStorageTest : public ::testing::Test {
         std::vector<OffloadTaskItem> drained;
         EXPECT_TRUE(client.OffloadObjectHeartbeat(true, drained).has_value());
         EXPECT_EQ(drained.size(), keys.size());
+        if (drained_out != nullptr) {
+            *drained_out = std::move(drained);
+        }
         return segment;
+    }
+
+    // The drained items for the keys a backend completion callback reports
+    // (plain or tenant-scoped keys), in the same order.
+    static std::vector<OffloadTaskItem> DrainedItemsFor(
+        const std::vector<OffloadTaskItem>& drained,
+        const std::vector<std::string>& keys) {
+        std::vector<OffloadTaskItem> items;
+        for (const auto& key : keys) {
+            auto it = std::find_if(
+                drained.begin(), drained.end(),
+                [&key](const OffloadTaskItem& item) {
+                    return item.key == key ||
+                           TenantId(item.tenant_id).MakeScopedKey(item.key) ==
+                               key;
+                });
+            EXPECT_NE(it, drained.end()) << key;
+            if (it != drained.end()) {
+                items.push_back(*it);
+            }
+        }
+        return items;
     }
 
     // Drops the memory copies made by PrepareDrainedOffloads, leaving
@@ -659,18 +686,19 @@ class FileStorageTest : public ::testing::Test {
             MutexLocker locker(&fileStorage.offloading_mutex_);
             fileStorage.enable_offloading_ = true;
         }
+        std::vector<OffloadTaskItem> drained;
         const auto source_segment = PrepareDrainedOffloads(
-            master, *fileStorage.client_, expected_keys, 512);
+            master, *fileStorage.client_, expected_keys, 512, &drained);
 
         auto offload_result = fileStorage.storage_backend_->BatchOffload(
-            batch_object,
-            [&fileStorage](const std::vector<std::string>& keys,
-                           std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&fileStorage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = fileStorage.local_rpc_addr_;
                 }
-                auto result =
-                    fileStorage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = fileStorage.client_->NotifyOffloadSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 if (!result) {
                     return result.error();
                 }
@@ -766,21 +794,22 @@ class FileStorageTest : public ::testing::Test {
         // Offload one key so master tracks a LOCAL_DISK replica backed by a
         // real file on the client SSD.
         const std::string key = "heal_key" + suffix;
-        const auto source_segment =
-            PrepareDrainedOffloads(master, *client.value(), {key}, 512);
+        std::vector<OffloadTaskItem> drained;
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *client.value(), {key}, 512, &drained);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         batch_object.emplace(key,
                              std::vector<Slice>{Slice{original.data(), 512}});
         auto offload_result = file_storage.storage_backend_->BatchOffload(
-            batch_object,
-            [&file_storage](const std::vector<std::string>& keys,
-                            std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&file_storage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result =
-                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = file_storage.client_->NotifyOffloadSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
@@ -891,8 +920,9 @@ class FileStorageTest : public ::testing::Test {
         // divergence on both.
         const std::vector<std::string> wiped_keys = {"heal_batch_a",
                                                      "heal_batch_b"};
-        const auto source_segment =
-            PrepareDrainedOffloads(master, *client.value(), wiped_keys, 512);
+        std::vector<OffloadTaskItem> drained;
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *client.value(), wiped_keys, 512, &drained);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         for (const auto& key : wiped_keys) {
@@ -900,14 +930,14 @@ class FileStorageTest : public ::testing::Test {
                 key, std::vector<Slice>{Slice{original.data(), 512}});
         }
         auto offload_result = file_storage.storage_backend_->BatchOffload(
-            batch_object,
-            [&file_storage](const std::vector<std::string>& keys,
-                            std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&file_storage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result =
-                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = file_storage.client_->NotifyOffloadSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
@@ -1693,12 +1723,15 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
 
     const std::string key = "shared_key";
     // Multi-tenancy is off here, so both tenants name the same object.
+    std::vector<OffloadTaskItem> drained;
     const auto source_segment =
-        PrepareDrainedOffloads(master, *client.value(), {key}, 128);
-    std::vector<OffloadTaskItem> tasks = {
-        {.tenant_id = "tenant_a", .key = key, .size = 128},
-        {.tenant_id = "tenant_b", .key = key, .size = 128},
-    };
+        PrepareDrainedOffloads(master, *client.value(), {key}, 128, &drained);
+    ASSERT_EQ(drained.size(), 1u);
+    // The drained item reported under both tenant names: the first report
+    // registers the disk replica, the second finds the task ended.
+    std::vector<OffloadTaskItem> tasks = {drained.front(), drained.front()};
+    tasks[0].tenant_id = "tenant_a";
+    tasks[1].tenant_id = "tenant_b";
     std::vector<StorageObjectMetadata> metadatas;
     metadatas.reserve(tasks.size());
     for (const auto& task : tasks) {

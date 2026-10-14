@@ -1008,6 +1008,8 @@ class MasterService {
     // from them yet), and offload takes of the old master restored as stale
     // takes by the last restore.
     size_t HandoffDiskClientsPending() const;
+    // The epoch of this instance's L4 task ids (see NextL4TaskId).
+    uint64_t L4TaskEpoch() const { return l4_task_epoch_; }
     uint64_t HandoffRestoredOffloadTakes() const {
         return handoff_restored_offload_takes_.load(std::memory_order_relaxed);
     }
@@ -1692,9 +1694,18 @@ class MasterService {
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
+    // Every mirror's item carries `task_id`, the id of the task the caller
+    // records for these mirrors.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const L4TaskId& task_id, std::vector<UUID>* mirror_clients = nullptr);
+
+    // A new id for an L4 offload or promotion task of this instance:
+    // l4_task_epoch_ and the next sequence number.
+    L4TaskId NextL4TaskId() {
+        return L4TaskId{l4_task_epoch_, next_l4_task_seq_.fetch_add(
+                                            1, std::memory_order_relaxed)};
+    }
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -2734,6 +2745,13 @@ class MasterService {
     std::atomic<int64_t> offload_take_hold_until_{0};
     std::atomic<uint64_t> handoff_restored_offload_takes_{0};
     int64_t handoff_restored_file_capacity_{0};
+    // L4 task ids (NextL4TaskId). The epoch is drawn from OS randomness for
+    // every instance and never carried by the handoff, so a report of a task
+    // of an earlier master (before a roll, a restart or a fail-over) never
+    // matches a task of this one.
+    const uint64_t l4_task_epoch_{DrawL4TaskEpoch()};
+    std::atomic<uint64_t> next_l4_task_seq_{1};
+    static uint64_t DrawL4TaskEpoch();
 
     tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoffLocked(
         const std::string& dir, const HandoffRestoreOptions& options);
