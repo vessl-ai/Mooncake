@@ -832,6 +832,10 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
                     DropUnregisteredFiles("remount");
+                    // Tasks carried across a bucket deferral were taken
+                    // before the new registration; end them rather than
+                    // writing them after the wipe.
+                    NackCarriedOffloadTasks();
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
                     // "SSD Storage: X / Y").  This was lost on restart;
