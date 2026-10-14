@@ -817,6 +817,32 @@ class MasterService {
                                 const TenantId& tenant_id)
         -> tl::expected<void, ErrorCode>;
 
+    // The promotion calls above identify the task by key only. A late call
+    // for an earlier promotion of the key could then stage, commit or free
+    // the buffer of a newer one (a half-written replica made readable, or a
+    // buffer freed while the holder still writes into it). They are kept for
+    // stores that predate task ids and act only where that cannot happen:
+    // PromotionAllocStart and NotifyPromotionSuccess are always refused, and
+    // NotifyPromotionFailure ends only a task that has no staged replica.
+    //
+    // The calls below take the item the holder drained
+    // (PromotionObjectHeartbeat) and act only on the key's task whose id the
+    // item carries; otherwise they behave as the key-only calls did.
+    auto PromotionTaskAllocStart(
+        const UUID& client_id, const PromotionTaskItem& item,
+        const TenantId& tenant_id,
+        const std::vector<std::string>& preferred_segments)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+    auto NotifyPromotionTaskSuccess(const UUID& client_id,
+                                    const PromotionTaskItem& item,
+                                    const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+    // A call for another task than the key's current one is a no-op (OK).
+    auto NotifyPromotionTaskFailure(const UUID& client_id,
+                                    const PromotionTaskItem& item,
+                                    const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
      * @return Copy task ID on success, ErrorCode on failure
@@ -1722,7 +1748,27 @@ class MasterService {
      * recording the task in the shard's promotion_tasks map.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
+        const ObjectIdentity& object_id, Replica& source_replica,
+        const L4TaskId& task_id);
+
+    // Bodies of the promotion calls. `task_id` names the task the caller
+    // acts for (nullopt: a key-only call, see NotifyPromotionFailure).
+    auto PromotionAllocStartFor(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments,
+        const std::optional<L4TaskId>& task_id)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+    auto NotifyPromotionSuccessFor(const UUID& client_id,
+                                   const std::string& key,
+                                   const TenantId& tenant_id,
+                                   const std::optional<L4TaskId>& task_id)
+        -> tl::expected<void, ErrorCode>;
+    auto NotifyPromotionFailureFor(const UUID& client_id,
+                                   const std::string& key,
+                                   const TenantId& tenant_id,
+                                   const std::optional<L4TaskId>& task_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
