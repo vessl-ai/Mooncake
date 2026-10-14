@@ -486,15 +486,12 @@ class MasterClient {
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     /**
-     * @brief Adds multiple new objects to a specified client in batch.
-     * @param keys         A list of object keys (names) that were successfully
-     * offloaded.
+     * @brief Reports offload results (completions, and NACKs with
+     * data_size < 0) for the items the client drained.
+     * @param tasks        The drained items, echoed with their task ids.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas);
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);

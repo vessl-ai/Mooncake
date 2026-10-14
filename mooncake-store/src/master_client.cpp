@@ -1169,18 +1169,6 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(keys.size());
-    for (const auto& key : keys) {
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = tenant_id_.value(), .key = key, .size = 0});
-    }
-    return NotifyOffloadSuccess(client_id, tasks, metadatas);
-}
-
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");

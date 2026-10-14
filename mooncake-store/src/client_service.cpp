@@ -4140,14 +4140,6 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
 }
 
 tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
-    const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    auto response =
-        master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
-    return response;
-}
-
-tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
