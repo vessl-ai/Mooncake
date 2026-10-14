@@ -710,8 +710,9 @@ TEST_F(MasterServiceSSDTest, ReRegistrationDoesNotCompleteAQueuedTask) {
 }
 
 // The completion of an offload whose object was removed while the store was
-// copying (its source buffer freed and possibly reused) carries only the key.
-// It must not complete the task of an object re-put under the same key.
+// copying (its source buffer freed and possibly reused) must not complete the
+// task of an object re-put under the same key, even when the same store has
+// taken that task too: it names its own task.
 TEST_F(MasterServiceSSDTest, LateCompletionOfARemovedObjectIsRefused) {
     auto service = CreateSsdAwareOffloadService();
     const UUID client_id = generate_uuid();
@@ -721,30 +722,31 @@ TEST_F(MasterServiceSSDTest, LateCompletionOfARemovedObjectIsRefused) {
     auto first = service->OffloadObjectHeartbeat(client_id, true);
     ASSERT_TRUE(first.has_value());
     ASSERT_EQ(first->size(), 1u);
-    // Meanwhile the key is removed and re-put with bytes of the same size.
+    // Meanwhile the key is removed and re-put with bytes of the same size,
+    // and the store takes the new task right away.
     ASSERT_TRUE(
         service->Remove("aba_key", TenantId::Default(), true).has_value());
     PutMemoryObject(*service, client_id, "aba_key", 4096);
+    auto second = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(second.has_value());
+    ASSERT_EQ(second->size(), 1u);
+    ASSERT_NE(*second->front().task_id, *first->front().task_id);
 
-    // The completion of the first copy arrives.
+    // The completion of the first copy arrives: refused.
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
     ASSERT_TRUE(
         service->NotifyOffloadSuccess(client_id, *first, {file}).has_value());
     ExpectMemoryOnly(*service, "aba_key");
+    ASSERT_EQ(OffloadTaskId(*service, "aba_key"), *second->front().task_id);
 
-    // A report for the key from this store cannot be told apart from the
-    // late one until the stale take expires: the store does not take the new
-    // task (its item is not even handed out), and a completion is refused.
-    auto second = service->OffloadObjectHeartbeat(client_id, true);
-    ASSERT_TRUE(second.has_value());
-    EXPECT_TRUE(second->empty());
+    // The second copy's completion is registered.
     ASSERT_TRUE(
-        service
-            ->NotifyOffloadSuccess(client_id, {Task("aba_key", 4096)}, {file})
-            .has_value());
-    ExpectMemoryOnly(*service, "aba_key");
+        service->NotifyOffloadSuccess(client_id, *second, {file}).has_value());
+    auto replicas = service->GetReplicaList("aba_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
 }
 
 // A NACK can overtake the completion of the same copy (a completion RPC that
@@ -763,15 +765,13 @@ TEST_F(MasterServiceSSDTest, CompletionOvertakenByItsNackIsRefused) {
     nack.data_size = -1;
     ASSERT_TRUE(
         service->NotifyOffloadSuccess(client_id, *first, {nack}).has_value());
+    ASSERT_FALSE(OffloadTaskId(*service, "nack_key").has_value());
     ASSERT_TRUE(
         service->Remove("nack_key", TenantId::Default(), true).has_value());
     PutMemoryObject(*service, client_id, "nack_key", 4096);
-    // The NACK left a stale take: the store does not take the new task, and
-    // the item is not even handed out (an untracked copy would send a report
-    // the master could not tell apart from a later take's).
     auto second = service->OffloadObjectHeartbeat(client_id, true);
     ASSERT_TRUE(second.has_value());
-    EXPECT_TRUE(second->empty());
+    ASSERT_EQ(second->size(), 1u);
 
     StorageObjectMetadata file;
     file.data_size = 4096;
@@ -779,40 +779,231 @@ TEST_F(MasterServiceSSDTest, CompletionOvertakenByItsNackIsRefused) {
     ASSERT_TRUE(
         service->NotifyOffloadSuccess(client_id, *first, {file}).has_value());
     ExpectMemoryOnly(*service, "nack_key");
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *second, {file}).has_value());
+    auto replicas = service->GetReplicaList("nack_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
 }
 
-// After a cold start the master does not know which offloads its stores took
-// from the previous master; their reports carry only the key. No store takes
-// an offload task until such a report can no longer arrive.
-TEST_F(MasterServiceSSDTest, NoOffloadIsTakenRightAfterAColdStart) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.default_kv_lease_ttl = 0;
-    config.put_start_discard_timeout_sec = 1;
-    config.put_start_release_timeout_sec = 2;
-    auto service = std::make_unique<MasterService>(config);
-    service->HoldOffloadTakesAfterColdStart();
+// The scenario that returns another object's bytes when a report is matched
+// by key alone (correctness proof, orphan scenario):
+// 1. The store copies O1 and sends the completion; the RPC times out at the
+//    store, which rolls the bucket back and NACKs. The completion request is
+//    still on its way to the master.
+// 2. The NACK is processed first and ends T1. O1 is removed, O2 is put, and
+//    the store offloads O2 normally (its file for the key holds O2's bytes).
+// 3. O2 is removed. The master drops O2's disk replica; the store keeps the
+//    file (an orphan).
+// 4. O3 (same size) is put and the store takes T3. It already has a file for
+//    the key, so it does not copy and will NACK at the end of its cycle.
+// 5. In that window the late completion of step 1 is processed. By key it
+//    looks like the report of T3 by its taker; registered, it would send
+//    reads of O3 to the store's file, which holds O2's bytes.
+// The late completion names T1 and is refused.
+TEST_F(MasterServiceSSDTest, LateCompletionAfterOrphanSkipIsRefused) {
+    auto service = CreateSsdAwareOffloadService();
     const UUID client_id = generate_uuid();
-    MountMemoryAndLocalDisk(*service, client_id, "cold_segment", 0x390000000);
-    PutMemoryObject(*service, client_id, "cold_key", 4096);
-    auto during = service->OffloadObjectHeartbeat(client_id, true);
-    ASSERT_TRUE(during.has_value());
-    EXPECT_TRUE(during->empty());
+    MountMemoryAndLocalDisk(*service, client_id, "orphan_segment", 0x3f0000000);
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    StorageObjectMetadata nack;
+    nack.data_size = -1;
+    const std::string key = "orphan_key";
+
+    // 1.
+    PutMemoryObject(*service, client_id, key, 4096);
+    auto item1 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(item1.has_value());
+    ASSERT_EQ(item1->size(), 1u);
+    const auto held_completion = *item1;  // still in flight
+    // 2.
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *item1, {nack}).has_value());
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true).has_value());
+    PutMemoryObject(*service, client_id, key, 4096);
+    auto item2 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(item2.has_value());
+    ASSERT_EQ(item2->size(), 1u);
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *item2, {file}).has_value());
+    auto with_disk = service->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(with_disk.has_value());
+    ASSERT_EQ(with_disk->replicas.size(), 2u);
+    // 3.
+    ASSERT_TRUE(service->Remove(key, TenantId::Default(), true).has_value());
+    // 4.
+    PutMemoryObject(*service, client_id, key, 4096);
+    auto item3 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(item3.has_value());
+    ASSERT_EQ(item3->size(), 1u);
+    // 5.
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, held_completion, {file})
+            .has_value());
+    ExpectMemoryOnly(*service, key);
+    // T3 is untouched; the store's NACK ends it.
+    ASSERT_EQ(OffloadTaskId(*service, key), *item3->front().task_id);
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *item3, {nack}).has_value());
+    EXPECT_FALSE(OffloadTaskId(*service, key).has_value());
+    ExpectMemoryOnly(*service, key);
+}
+
+// A late NACK of an earlier task of the key does not end a newer task, whose
+// own completion is then registered.
+TEST_F(MasterServiceSSDTest, StaleNackDoesNotReleaseANewerTask) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "stale_nack_segment",
+                            0x400000000);
+    PutMemoryObject(*service, client_id, "stale_nack_key", 4096);
+    auto item1 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(item1.has_value());
+    ASSERT_EQ(item1->size(), 1u);
+    ASSERT_TRUE(service->Remove("stale_nack_key", TenantId::Default(), true)
+                    .has_value());
+    PutMemoryObject(*service, client_id, "stale_nack_key", 4096);
+    auto item2 = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(item2.has_value());
+    ASSERT_EQ(item2->size(), 1u);
+
+    StorageObjectMetadata nack;
+    nack.data_size = -1;
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *item1, {nack}).has_value());
+    ASSERT_EQ(OffloadTaskId(*service, "stale_nack_key"),
+              *item2->front().task_id);
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
     ASSERT_TRUE(
-        service
-            ->NotifyOffloadSuccess(client_id, {Task("cold_key", 4096)}, {file})
-            .has_value());
+        service->NotifyOffloadSuccess(client_id, *item2, {file}).has_value());
+    auto replicas =
+        service->GetReplicaList("stale_nack_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
+}
+
+// Two master instances draw different epochs, so a report of a task of one
+// (an earlier master: before a roll, a restart or a fail-over) never matches
+// a task of the other, even for the same key, client and sequence number.
+TEST_F(MasterServiceSSDTest, TaskIdsDifferAcrossMasterInstances) {
+    auto first = CreateSsdAwareOffloadService();
+    auto second = CreateSsdAwareOffloadService();
+    EXPECT_NE(first->L4TaskEpoch(), second->L4TaskEpoch());
+    EXPECT_NE(first->L4TaskEpoch(), 0u);
+    EXPECT_NE(second->L4TaskEpoch(), 0u);
+
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*first, client_id, "epoch_segment", 0x410000000);
+    MountMemoryAndLocalDisk(*second, client_id, "epoch_segment", 0x410000000);
+    PutMemoryObject(*first, client_id, "epoch_key", 4096);
+    PutMemoryObject(*second, client_id, "epoch_key", 4096);
+    auto from_first = first->OffloadObjectHeartbeat(client_id, true);
+    auto from_second = second->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(from_first.has_value());
+    ASSERT_TRUE(from_second.has_value());
+    ASSERT_EQ(from_first->size(), 1u);
+    ASSERT_EQ(from_second->size(), 1u);
+    EXPECT_EQ(from_first->front().task_id->seq,
+              from_second->front().task_id->seq);
+
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(second->NotifyOffloadSuccess(client_id, *from_first, {file})
+                    .has_value());
+    ExpectMemoryOnly(*second, "epoch_key");
+    ASSERT_TRUE(second->NotifyOffloadSuccess(client_id, *from_second, {file})
+                    .has_value());
+    auto replicas = second->GetReplicaList("epoch_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
+}
+
+// A task re-created while the item of the key's previous task is still
+// queued (that task expired before any drain) is handed out: its item
+// replaces the old one in the store's queue.
+TEST_F(MasterServiceSSDTest, ReCreatedTaskReplacesThePendingItem) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "requeue_segment",
+                            0x420000000);
+    PutMemoryObject(*service, client_id, "requeue_key", 4096);
+    MasterServiceTestPeer peer(*service);
+    // Eviction queues the first task (offload_on_evict).
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    const auto first = OffloadTaskId(*service, "requeue_key");
+    ASSERT_TRUE(first.has_value());
+    // It expires without a drain (TTL reaper); its item stays queued.
+    {
+        MasterServiceTestPeer::MetadataShardAccessorRW shard(
+            service.get(),
+            peer.getShardIndex(TenantId::Default(), "requeue_key"));
+        peer.DiscardExpiredProcessingReplicas(
+            shard, std::chrono::system_clock::now() + std::chrono::hours(1));
+    }
+    ASSERT_FALSE(OffloadTaskId(*service, "requeue_key").has_value());
+    // The next eviction queues the next task of the key.
+    peer.RunBatchEvictForTesting(1.0, 1.0);
+    const auto second = OffloadTaskId(*service, "requeue_key");
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(*second, *first);
+
+    auto drained = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(drained.has_value());
+    ASSERT_EQ(drained->size(), 1u);
+    EXPECT_EQ(*drained->front().task_id, *second);
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *drained, {file}).has_value());
+    auto replicas = service->GetReplicaList("requeue_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    bool has_disk = false;
+    for (const auto& replica : replicas->replicas) {
+        has_disk = has_disk || replica.is_local_disk_replica();
+    }
+    EXPECT_TRUE(has_disk);
+}
+
+// After a cold start the master knows nothing of the offloads its stores
+// took from the previous master. Their reports name tasks of that master
+// (or no task at all), so stores take offload tasks right away.
+TEST_F(MasterServiceSSDTest, OffloadIsTakenRightAfterAColdStart) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service, client_id, "cold_segment", 0x390000000);
+    PutMemoryObject(*service, client_id, "cold_key", 4096);
+    StorageObjectMetadata file;
+    file.data_size = 4096;
+    file.transport_endpoint = "disk_endpoint";
+    // A report of a take from the previous master (no id, as from a master
+    // that predates ids, or another epoch) is refused.
+    auto previous = Task("cold_key", 4096);
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {previous}, {file})
+                    .has_value());
+    previous.task_id = L4TaskId{service->L4TaskEpoch() ^ 1, 1};
+    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {previous}, {file})
+                    .has_value());
     ExpectMemoryOnly(*service, "cold_key");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
-    PutMemoryObject(*service, client_id, "warm_key", 4096);
-    auto after = service->OffloadObjectHeartbeat(client_id, true);
-    ASSERT_TRUE(after.has_value());
-    ASSERT_EQ(after->size(), 1u);
-    EXPECT_EQ(after->front().key, "warm_key");
+    auto taken = service->OffloadObjectHeartbeat(client_id, true);
+    ASSERT_TRUE(taken.has_value());
+    ASSERT_EQ(taken->size(), 1u);
+    EXPECT_EQ(taken->front().key, "cold_key");
+    ASSERT_TRUE(
+        service->NotifyOffloadSuccess(client_id, *taken, {file}).has_value());
+    auto replicas = service->GetReplicaList("cold_key", TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    EXPECT_EQ(replicas->replicas.size(), 2u);
 }
 
 // A mirror that did not get the pinned source copies from a buffer nothing

@@ -922,7 +922,6 @@ class MasterService {
                             const HandoffClientSet& disk_clients,
                             std::vector<StandbyObjectEntry>& objects,
                             std::vector<handoff::QuarantineRange>& quarantine,
-                            std::vector<handoff::OffloadTake>& takes,
                             handoff::WriterStats& stats) const;
     bool HandoffEnableOffload() const { return enable_offload_; }
     // Ranges still quarantined by a previous handoff restore (a roll that
@@ -965,7 +964,6 @@ class MasterService {
         uint64_t local_disk_clients{0};
         uint64_t local_disk_replicas{0};
         uint64_t disk_only_objects{0};
-        uint64_t offload_takes{0};
         uint64_t workers{0};
         uint64_t manifest_ns{0};
         uint64_t mount_ns{0};
@@ -1005,27 +1003,10 @@ class MasterService {
     size_t HandoffPendingSegmentCount() const;
     size_t HandoffQuarantineBufferCount() const;
     // Restored L4 owners whose disk replicas are still unreadable (no RPC
-    // from them yet), and offload takes of the old master restored as stale
-    // takes by the last restore.
+    // from them yet).
     size_t HandoffDiskClientsPending() const;
     // The epoch of this instance's L4 task ids (see NextL4TaskId).
     uint64_t L4TaskEpoch() const { return l4_task_epoch_; }
-    uint64_t HandoffRestoredOffloadTakes() const {
-        return handoff_restored_offload_takes_.load(std::memory_order_relaxed);
-    }
-    // Every master starts without any record of the offloads its stores took
-    // from a previous master. Unless the handoff carried them (offload
-    // takes), a report of such a take may still arrive and carries only the
-    // key, so after a cold start no store takes an offload task for
-    // put_start_release_timeout. Called by mooncake_master before serving
-    // when no handoff snapshot was restored.
-    void HoldOffloadTakesAfterColdStart();
-    // What is left of the cold-start hold, for the handoff (0: none).
-    uint64_t HandoffOffloadTakeHoldMs() const;
-    bool OffloadTakesHeld() const {
-        return std::chrono::steady_clock::now().time_since_epoch().count() <
-               offload_take_hold_until_.load(std::memory_order_relaxed);
-    }
     // Releases quarantined ranges whose deadline has passed. Called by the
     // task cleanup thread; public for tests.
     void ReleaseExpiredHandoffQuarantine(
@@ -1199,8 +1180,6 @@ class MasterService {
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
         std::unordered_map<std::string, OffloadingTask> offloading_tasks;
-        std::unordered_map<std::string, std::vector<StaleOffloadTake>>
-            stale_offload_takes;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
@@ -1218,8 +1197,7 @@ class MasterService {
                    promotion_tasks.empty() && promotion_candidates.empty() &&
                    dynamic_replication_pending.empty() &&
                    dynamic_replication_leases.empty() &&
-                   dynamic_replication_cooldowns.empty() &&
-                   stale_offload_takes.empty();
+                   dynamic_replication_cooldowns.empty();
         }
     };
 
@@ -1715,25 +1693,12 @@ class MasterService {
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
 
-    // Drops the offload task of `key`: releases the source refcnt (when
-    // `metadata` is given and still holds the source) and records a stale
-    // take for every taker except `reporter`, whose report has arrived.
+    // Drops the offload task of `key` and releases its source refcnt (when
+    // `metadata` is given and still holds the source). A taker that still
+    // reports it is refused: its report names a task that no longer exists.
     void ReleaseOffloadingTask(
         TenantState& tenant_state, ObjectMetadata* metadata,
-        std::unordered_map<std::string, OffloadingTask>::iterator task_it,
-        const std::optional<UUID>& reporter);
-    // Handoff export of the offload takes whose report may still arrive
-    // (see handoff::OffloadTake). Caller holds the shard.
-    void ExportHandoffOffloadTakes(const TenantId& tenant_id,
-                                   const TenantState& tenant_state,
-                                   std::vector<handoff::OffloadTake>& takes,
-                                   handoff::WriterStats& stats) const;
-    void RecordStaleOffloadTakes(TenantState& tenant_state,
-                                 const std::string& key,
-                                 const std::vector<UUID>& clients);
-    bool HasStaleOffloadTake(const TenantState& tenant_state,
-                             const std::string& key, const UUID& client_id,
-                             std::chrono::system_clock::time_point now) const;
+        std::unordered_map<std::string, OffloadingTask>::iterator task_it);
     // Marks `client_id` as a taker of the current offload task of each key
     // it has just drained (OffloadObjectHeartbeat) and returns the items it
     // took; only those are handed to the store.
@@ -2737,13 +2702,6 @@ class MasterService {
             opened;
     };
     HandoffDiskGate handoff_disk_gate_;
-    // steady_clock ticks until which no store may take an offload task
-    // (HoldOffloadTakesAfterColdStart); 0 = no hold. steady_clock, so a wall
-    // clock step (e.g. NTP right after a node reboot, when cold starts
-    // happen) cannot shorten the hold; it leaves the process only as a
-    // relative duration (HandoffOffloadTakeHoldMs).
-    std::atomic<int64_t> offload_take_hold_until_{0};
-    std::atomic<uint64_t> handoff_restored_offload_takes_{0};
     int64_t handoff_restored_file_capacity_{0};
     // L4 task ids (NextL4TaskId). The epoch is drawn from OS randomness for
     // every instance and never carried by the handoff, so a report of a task

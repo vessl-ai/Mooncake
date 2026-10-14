@@ -2420,12 +2420,11 @@ MasterService::EraseMetadata(
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
     // A store that already took the task may still be copying; its late
-    // report becomes a stale take, so it cannot complete a later task of a
+    // report names this task, so it can never complete a later task of a
     // re-put object under the same key.
     auto offload_it = tenant_state.offloading_tasks.find(key);
     if (offload_it != tenant_state.offloading_tasks.end()) {
-        ReleaseOffloadingTask(tenant_state, &metadata, offload_it,
-                              std::nullopt);
+        ReleaseOffloadingTask(tenant_state, &metadata, offload_it);
 
         // The mailbox entry must be dropped too, otherwise the next
         // OffloadObjectHeartbeat drains a task-less key back to the client and
@@ -5406,7 +5405,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // A key has at most one offload task: a second push would replace the
     // queued item of the current task with one whose id no task has.
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
-        !offload_on_evict_ && !OffloadTakesHeld() &&
+        !offload_on_evict_ &&
         !accessor.GetTenantState().offloading_tasks.contains(
             object_id.user_key) &&
         !metadata.HasReplica([](const Replica& replica) {
@@ -8411,10 +8410,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             if (task_it != tenant_state.offloading_tasks.end() &&
                 task.task_id.has_value() &&
                 *task.task_id == task_it->second.task_id) {
-                // No reporter: this client may also have taken the task in
-                // an earlier drain and still report it.
-                ReleaseOffloadingTask(tenant_state, &accessor.Get(), task_it,
-                                      std::nullopt);
+                ReleaseOffloadingTask(tenant_state, &accessor.Get(), task_it);
             }
         }
     }
@@ -8423,19 +8419,12 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
 
 std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
     const UUID& client_id, const std::vector<OffloadTaskItem>& drained) {
-    // A store copies and reports every item it gets, and a report carries
-    // only the key. An item is therefore handed out only if this drain makes
-    // the client a taker of the key's current task: the master then tracks
-    // the copy until its report (or a stale take) ends it. Any other item
-    // (no object, no task, not a mirror, a stale take, or a task this client
-    // already took) is dropped here, so no copy exists that the master does
-    // not track.
+    // A store copies and reports every item it gets. An item is handed out
+    // only if it names the key's current task and this drain makes the
+    // client a taker of that task. Any other item (no object, no task,
+    // another task's id, not a mirror, or a task this client already took)
+    // is dropped here, so a store never copies for a task it cannot report.
     std::vector<OffloadTaskItem> taken;
-    const auto now = std::chrono::system_clock::now();
-    // After a cold start no store may take anything until a report of a
-    // take made from the previous master can no longer arrive (see
-    // HoldOffloadTakesAfterColdStart).
-    const bool cold_start_hold = OffloadTakesHeld();
     for (const auto& item : drained) {
         const TenantId item_tenant = enable_multi_tenants_
                                          ? TenantId(item.tenant_id)
@@ -8463,22 +8452,6 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
             mirrors.end()) {
             continue;
         }
-        if (cold_start_hold ||
-            HasStaleOffloadTake(tenant_state, object_id.user_key, client_id,
-                                now)) {
-            // A report of this client's earlier offload of the key may still
-            // arrive and would be indistinguishable from this task's. The
-            // client keeps no claim on the task; when no mirror is left the
-            // task is released now instead of by the TTL reaper.
-            mirrors.erase(
-                std::remove(mirrors.begin(), mirrors.end(), client_id),
-                mirrors.end());
-            if (mirrors.empty()) {
-                ReleaseOffloadingTask(tenant_state, &accessor.Get(), task_it,
-                                      std::nullopt);
-            }
-            continue;
-        }
         if (std::find(task.takers.begin(), task.takers.end(), client_id) ==
             task.takers.end()) {
             task.takers.push_back(client_id);
@@ -8488,88 +8461,16 @@ std::vector<OffloadTaskItem> MasterService::RecordOffloadTakers(
     return taken;
 }
 
-void MasterService::HoldOffloadTakesAfterColdStart() {
-    const auto until =
-        std::chrono::steady_clock::now() + put_start_release_timeout_sec_;
-    offload_take_hold_until_.store(until.time_since_epoch().count(),
-                                   std::memory_order_relaxed);
-    LOG(INFO) << "offload_take_hold=cold_start, seconds="
-              << put_start_release_timeout_sec_.count();
-}
-
-uint64_t MasterService::HandoffOffloadTakeHoldMs() const {
-    const auto until = std::chrono::steady_clock::time_point(
-        std::chrono::steady_clock::duration(
-            offload_take_hold_until_.load(std::memory_order_relaxed)));
-    const auto now = std::chrono::steady_clock::now();
-    if (until <= now) {
-        return 0;
-    }
-    return static_cast<uint64_t>(
-               std::chrono::duration_cast<std::chrono::milliseconds>(until -
-                                                                     now)
-                   .count()) +
-           1;
-}
-
 void MasterService::ReleaseOffloadingTask(
     TenantState& tenant_state, ObjectMetadata* metadata,
-    std::unordered_map<std::string, OffloadingTask>::iterator task_it,
-    const std::optional<UUID>& reporter) {
+    std::unordered_map<std::string, OffloadingTask>::iterator task_it) {
     if (metadata != nullptr) {
         auto source = metadata->GetReplicaByID(task_it->second.source_id);
         if (source != nullptr) {
             source->dec_refcnt();
         }
     }
-    std::vector<UUID> pending_reports;
-    for (const auto& taker : task_it->second.takers) {
-        if (!reporter.has_value() || taker != *reporter) {
-            pending_reports.push_back(taker);
-        }
-    }
-    const std::string key = task_it->first;
     tenant_state.offloading_tasks.erase(task_it);
-    RecordStaleOffloadTakes(tenant_state, key, pending_reports);
-}
-
-void MasterService::RecordStaleOffloadTakes(TenantState& tenant_state,
-                                            const std::string& key,
-                                            const std::vector<UUID>& clients) {
-    if (clients.empty()) {
-        return;
-    }
-    // Every report of a take reaches the master within
-    // put_start_release_timeout (the bound the offload TTL reaper already
-    // assumes for an in-flight copy).
-    const auto deadline =
-        std::chrono::system_clock::now() + put_start_release_timeout_sec_;
-    auto& takes = tenant_state.stale_offload_takes[key];
-    for (const auto& client_id : clients) {
-        auto it = std::find_if(takes.begin(), takes.end(),
-                               [&client_id](const StaleOffloadTake& take) {
-                                   return take.client_id == client_id;
-                               });
-        if (it == takes.end()) {
-            takes.push_back(StaleOffloadTake{client_id, deadline});
-        } else {
-            it->deadline = std::max(it->deadline, deadline);
-        }
-    }
-}
-
-bool MasterService::HasStaleOffloadTake(
-    const TenantState& tenant_state, const std::string& key,
-    const UUID& client_id, std::chrono::system_clock::time_point now) const {
-    auto it = tenant_state.stale_offload_takes.find(key);
-    if (it == tenant_state.stale_offload_takes.end()) {
-        return false;
-    }
-    return std::any_of(it->second.begin(), it->second.end(),
-                       [&client_id, now](const StaleOffloadTake& take) {
-                           return take.client_id == client_id &&
-                                  take.deadline > now;
-                       });
 }
 
 auto MasterService::PollRemoveAll(const UUID& client_id)
@@ -8656,36 +8557,29 @@ auto MasterService::NotifyOffloadSuccess(
 
         // NACK sentinel: the store did not persist the key. Release the
         // task if this client was one of its mirrors, but skip AddReplica.
+        // A completion RPC that failed at the store is rolled back and
+        // NACKed, and the master may still process it after this NACK; it
+        // names the released task, so it is refused then.
         if (metadata.data_size < 0) {
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             MetadataAccessorRW accessor(this, request_object_id);
-            if (!accessor.Exists() && enable_multi_tenants_ &&
-                !IsTenantRegistered(request_object_id.tenant_id)) {
-                // Nothing to release, and no put can re-create the key while
-                // the tenant is unknown; do not create tenant state for it.
-                continue;
+            if (!accessor.Exists()) {
+                continue;  // no object, no task to release
             }
             auto& tenant_state = accessor.GetTenantState();
-            // A completion RPC that failed at the store is rolled back and
-            // NACKed, but the master may still process it after this NACK.
-            // Until that report can no longer arrive, this client must not
-            // take a newer task of the key.
-            RecordStaleOffloadTakes(tenant_state, request_object_id.user_key,
-                                    {client_id});
             auto task_it =
                 tenant_state.offloading_tasks.find(request_object_id.user_key);
             // A NACK ends only the task its item was queued for. One without
             // an id comes from a store that predates task ids; releasing is
             // always safe, so it ends the current task as before.
             if (task_it != tenant_state.offloading_tasks.end() &&
-                accessor.Exists() &&
                 (!task.task_id.has_value() ||
                  *task.task_id == task_it->second.task_id)) {
                 const auto& mirrors = task_it->second.mirror_clients;
                 if (std::find(mirrors.begin(), mirrors.end(), client_id) !=
                     mirrors.end()) {
                     ReleaseOffloadingTask(tenant_state, &accessor.Get(),
-                                          task_it, client_id);
+                                          task_it);
                     MasterMetricManager::instance().inc_offload_failed(
                         UuidToString(client_id));
                 }
@@ -8750,7 +8644,7 @@ auto MasterService::NotifyOffloadSuccess(
                             // source until the TTL reaper; ending a task is
                             // always safe.
                             ReleaseOffloadingTask(tenant_state, &obj_metadata,
-                                                  task_it, client_id);
+                                                  task_it);
                         }
                     } else if (*task.task_id != task_it->second.task_id) {
                         // Another task's report; this task is untouched.
@@ -8781,8 +8675,7 @@ auto MasterService::NotifyOffloadSuccess(
                         std::find(task.source_clients.begin(),
                                   task.source_clients.end(),
                                   client_id) != task.source_clients.end();
-                    ReleaseOffloadingTask(tenant_state, &obj_metadata, task_it,
-                                          client_id);
+                    ReleaseOffloadingTask(tenant_state, &obj_metadata, task_it);
 
                     if (segment_mounted) {
                         // A disk replica of an owner that is no longer
@@ -8993,7 +8886,7 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
 
     MasterMetricManager::instance().inc_offload_cancelled(
         UuidToString(mirror_clients[0]));
-    ReleaseOffloadingTask(tenant_state, &metadata, task_it, std::nullopt);
+    ReleaseOffloadingTask(tenant_state, &metadata, task_it);
     return true;
 }
 
@@ -11070,22 +10963,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                   metadata_it != tenant_state.metadata.end()
                                       ? &metadata_it->second
                                       : nullptr,
-                                  expired_it, std::nullopt);
-        }
-
-        for (auto take_it = tenant_state.stale_offload_takes.begin();
-             take_it != tenant_state.stale_offload_takes.end();) {
-            auto& takes = take_it->second;
-            takes.erase(std::remove_if(takes.begin(), takes.end(),
-                                       [&now](const StaleOffloadTake& take) {
-                                           return take.deadline <= now;
-                                       }),
-                        takes.end());
-            if (takes.empty()) {
-                take_it = tenant_state.stale_offload_takes.erase(take_it);
-            } else {
-                ++take_it;
-            }
+                                  expired_it);
         }
 
         for (auto task_it = tenant_state.promotion_tasks.begin();
@@ -11566,10 +11444,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                           TenantState& tenant_state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
-        // No store may take an offload during the cold-start hold: evict
-        // without queuing one (a queued task would pin the source until the
-        // next drain drops it).
-        if (!offload_on_evict_ || OffloadTakesHeld()) {
+        if (!offload_on_evict_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
@@ -11899,10 +11774,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (enable_oplog_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
-        // No store may take an offload during the cold-start hold: evict
-        // without queuing one (a queued task would pin the source until the
-        // next drain drops it).
-        if (!offload_on_evict_ || OffloadTakesHeld()) {
+        if (!offload_on_evict_) {
             // Original behavior
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }

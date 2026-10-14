@@ -61,16 +61,6 @@ struct OffloadingTask {
     L4TaskId task_id;
 };
 
-// A client whose report (completion or NACK) for an offload of this key
-// may still be in flight although the master no longer tracks that offload
-// (the task was dropped, or a NACK may have overtaken its completion). Until
-// the deadline the client cannot take a new offload of the key, so such a
-// late report can never be mistaken for the report of a newer task.
-struct StaleOffloadTake {
-    UUID client_id;
-    std::chrono::system_clock::time_point deadline;
-};
-
 // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
 // LOCAL_DISK replica is refcnt-pinned for the duration of the task
 // so it cannot be evicted.

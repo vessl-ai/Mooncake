@@ -594,8 +594,6 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_EQ(written.stats.objects, 45u);
     EXPECT_EQ(written.stats.local_disk_replicas, 25u);
     EXPECT_EQ(written.stats.disk_only_objects, 5u);
-    // The 10 in-flight offloads were taken by store 0.
-    EXPECT_EQ(written.stats.offload_takes, 10u);
     EXPECT_EQ(written.local_disk_clients, 1u);
 
     MasterService master(MakeL4Config());
@@ -605,7 +603,6 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_EQ(restored->local_disk_clients, 1u);
     EXPECT_EQ(restored->local_disk_replicas, 25u);
     EXPECT_EQ(restored->disk_only_objects, 5u);
-    EXPECT_EQ(restored->offload_takes, 10u);
     EXPECT_EQ(master.GetKeyCount(), 45u);
     EXPECT_EQ(master.HandoffLocalDiskObjectCount(), 25u);
     EXPECT_EQ(master.HandoffDiskClientsPending(), 1u);
@@ -764,10 +761,9 @@ TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
 TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
     // Schema 1 and 2 snapshots lack the held-back ranges of discarded
     // replicas and DRAINING segments, so restoring them could hand out a
-    // range a late writer still uses; schema 3 lacks the offload takes whose
-    // report may still arrive; schema 4 lacks the cold-start take hold: they
-    // always mean a cold start.
-    for (const uint32_t schema : {1u, 2u, 3u, 4u}) {
+    // range a late writer still uses; schemas 3 to 5 come from masters whose
+    // offload reports carried no task id: they always mean a cold start.
+    for (const uint32_t schema : {1u, 2u, 3u, 4u, 5u}) {
         TempDir dir;
         stores_.clear();
         {
@@ -857,27 +853,6 @@ TEST_F(HandoffRestoreTest, L4ColdStartOnBadL4State) {
     expect_cold([](const std::string&,
                    handoff::Manifest& m) { m.local_disk_replica_count += 1; },
                 "count mismatch");
-    // An offload take without a client.
-    expect_cold(
-        [](const std::string& dir, handoff::Manifest& m) {
-            std::vector<handoff::OffloadTake> takes{
-                {"default", Key(0, 25), UUID{0, 0}, 1000}};
-            auto blob = handoff::EncodeOffloadTakes(takes);
-            std::ofstream(dir + "/" + m.offload_takes->key,
-                          std::ios::trunc | std::ios::binary)
-                .write(reinterpret_cast<const char*>(blob.data()),
-                       static_cast<std::streamsize>(blob.size()));
-            m.offload_takes->bytes = blob.size();
-            m.offload_takes->crc32c = Crc32cValue(blob.data(), blob.size());
-            m.offload_take_count = takes.size();
-        },
-        "invalid offload take");
-    // A cold-start take hold longer than a day.
-    expect_cold(
-        [](const std::string&, handoff::Manifest& m) {
-            m.offload_take_hold_ms = 24ull * 3600 * 1000 + 1;
-        },
-        "invalid offload take hold");
 }
 
 TEST_F(HandoffRestoreTest, SizeMismatchedDiskReplicaIsNotExported) {
@@ -973,24 +948,21 @@ TEST_F(HandoffColdStartTest, UnknownSchemaVersion) {
     ExpectColdStart();
 }
 
-TEST_F(HandoffColdStartTest, MissingColdStartTakeHold) {
-    // A schema-5 manifest without offload_take_hold_ms (the field is
-    // mandatory): the hold of the old master is unknown, so a cold start.
-    const std::string text = handoff::EncodeManifest(manifest_);
-    const size_t newline = text.find('\n');
-    ASSERT_NE(newline, std::string::npos);
-    std::string body = text.substr(newline + 1);
-    const size_t at = body.find("\"offload_take_hold_ms\"");
-    ASSERT_NE(at, std::string::npos);
-    const size_t line_start = body.rfind('\n', at) + 1;
-    const size_t line_end = body.find('\n', at) + 1;
-    body.erase(line_start, line_end - line_start);
-    const std::string magic = text.substr(0, text.find(' '));
-    std::ofstream(Path(handoff::kHandoffManifestFile), std::ios::trunc)
-        << magic << " " << handoff::kHandoffSchemaVersion << " "
-        << Crc32cValue(body.data(), body.size()) << " " << body.size() << "\n"
-        << body;
-    ExpectColdStart(BufferAllocatorType::OFFSET, "L4 field missing");
+// Schema 6 carries no offload state: no take blob and no take or hold field
+// (a reader that found them would have to trust key-only reports).
+TEST_F(HandoffRestoreTest, ManifestCarriesNoOffloadState) {
+    TempDir dir;
+    WriteL4Snapshot(dir.path());
+    auto bytes = handoff::ReadFileBytes(dir.path() + "/" +
+                                        handoff::kHandoffManifestFile);
+    ASSERT_TRUE(bytes.has_value());
+    const std::string text(reinterpret_cast<const char*>(bytes->data()),
+                           bytes->size());
+    EXPECT_EQ(text.find("offload_take"), std::string::npos) << text;
+    EXPECT_FALSE(fs::exists(dir.path() + "/handoff_offload_takes.bin"));
+    auto manifest = handoff::DecodeManifest(text);
+    ASSERT_TRUE(manifest.has_value()) << manifest.error();
+    EXPECT_EQ(manifest->schema_version, 6u);
 }
 
 TEST_F(HandoffColdStartTest, CodecFingerprintMismatch) {
@@ -1597,235 +1569,93 @@ TEST_F(HandoffRestoreTest, PendingEntryOfSegmentMountedFreshIsForgotten) {
     EXPECT_TRUE(Readable(master, "fresh"));
 }
 
-TEST_F(HandoffRestoreTest, OffloadTakesOfTheOldMasterBlockReTakes) {
-    // A report of an offload taken from the old master can reach the new
-    // master, which has no task for it, and carries nothing but the key. The
-    // store must therefore not take an offload of that key created by the new
-    // master until such a report can no longer arrive.
-    constexpr uint64_t kReleaseSec = 2;
-    auto config = [] {
-        return MasterServiceConfig::builder()
-            .set_memory_allocator(BufferAllocatorType::OFFSET)
-            .set_eviction_ratio(0.0)
-            .set_eviction_high_watermark_ratio(1.0)
-            .set_client_live_ttl_sec(3600)
-            .set_client_suspicion_ttl_sec(3600)
-            .set_enable_offload(true)
-            .set_put_start_discard_timeout_sec(1)
-            .set_put_start_release_timeout_sec(kReleaseSec)
-            .build();
-    };
+TEST_F(HandoffRestoreTest, RollCarriesNoOffloadStateAndRefusesOldReports) {
+    // No offload state crosses the roll. A report of an offload the store
+    // took from the old master can still reach the new master; it names a
+    // task of the old master (its epoch), so the new master refuses it, also
+    // when the store has meanwhile taken the new master's task of the same
+    // key. The store takes the new master's tasks right away.
     TempDir dir;
-    HandoffWriteResult written;
+    std::map<std::string, OffloadTaskItem> old_items;
+    uint64_t old_epoch = 0;
     {
-        MasterService old_master(config());
+        MasterService old_master(MakeL4Config());
+        old_epoch = old_master.L4TaskEpoch();
         Store store{generate_uuid(), {MakeSegment(0)}};
         ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
                         .has_value());
         stores_.push_back(store);
         EnableL4(old_master, store);
         for (int i = 0; i < 4; ++i) Put(old_master, store, Key(0, i));
-        // The store takes all four: key 0 completes, key 1 is NACKed (a stale
-        // take: its timed-out completion may still be processed), keys 2 and
-        // 3 are still being copied when the old master stops.
+        // The store takes all four: key 0 completes, key 1 is NACKed (its
+        // timed-out completion may still be processed later), keys 2 and 3
+        // are still being copied when the old master stops.
         auto tasks = old_master.OffloadObjectHeartbeat(store.client_id, true);
         ASSERT_TRUE(tasks.has_value());
         ASSERT_EQ(tasks->size(), 4u);
-        std::map<std::string, OffloadTaskItem> by_key;
-        for (const auto& task : *tasks) by_key.emplace(task.key, task);
+        for (const auto& task : *tasks) old_items.emplace(task.key, task);
         ASSERT_TRUE(old_master
                         .NotifyOffloadSuccess(store.client_id,
-                                              {by_key.at(Key(0, 0))},
+                                              {old_items.at(Key(0, 0))},
                                               {DiskMeta("disk-0")})
                         .has_value());
         StorageObjectMetadata nack;
         nack.data_size = -1;
         ASSERT_TRUE(old_master
                         .NotifyOffloadSuccess(store.client_id,
-                                              {by_key.at(Key(0, 1))}, {nack})
+                                              {old_items.at(Key(0, 1))}, {nack})
                         .has_value());
-        written = Write(old_master, dir.path());
+        Write(old_master, dir.path());
     }
-    EXPECT_EQ(written.stats.offload_takes, 3u);
 
-    MasterService master(config());
+    MasterService master(MakeL4Config());
+    ASSERT_NE(master.L4TaskEpoch(), old_epoch);
     auto restored = master.RestoreFromHandoff(dir.path(), {1});
     ASSERT_TRUE(restored.has_value()) << restored.error();
-    EXPECT_EQ(restored->offload_takes, 3u);
-    EXPECT_EQ(master.HandoffRestoredOffloadTakes(), 3u);
-    {
-        // A roll right after the roll carries them on, with their remaining
-        // time (all three are stale takes now).
-        TempDir again;
-        EXPECT_EQ(Write(master, again.path()).stats.offload_takes, 3u);
-    }
     ASSERT_TRUE(Remount(master, stores_[0]));
     EXPECT_TRUE(HasDisk(master, Key(0, 0), stores_[0].client_id));
 
-    // Keys 1-3 are removed and put again (new offload tasks on the new
-    // master); key 4 is new. A late completion of an old take would look
-    // exactly like the completion of the new task, so the store does not
-    // become a taker of the new tasks of keys 1-3 and their completions are
-    // refused (missing). Key 4 is offloaded normally.
-    auto re_put = [&](int i) {
-        ASSERT_TRUE(
-            master.Remove(Key(0, i), TenantId::Default(), true).has_value());
-        Put(master, stores_[0], Key(0, i));
+    auto late = [&](int i) {
+        ASSERT_TRUE(master
+                        .NotifyOffloadSuccess(stores_[0].client_id,
+                                              {old_items.at(Key(0, i))},
+                                              {DiskMeta("disk-0")})
+                        .has_value());
     };
-    for (int i = 1; i < 4; ++i) re_put(i);
-    Put(master, stores_[0], Key(0, 4));
-    // Only key 4's item is handed out; the others are dropped on the master.
-    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10),
-              std::vector<std::string>{Key(0, 4)});
+    // Late reports of the old takes: the objects exist, without a task.
+    for (int i = 1; i < 4; ++i) late(i);
     for (int i = 1; i < 4; ++i) {
         EXPECT_FALSE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
     }
-    EXPECT_TRUE(HasDisk(master, Key(0, 4), stores_[0].client_id));
 
-    // Once the hold has passed, the keys are offloaded again.
-    std::this_thread::sleep_for(std::chrono::seconds(kReleaseSec) +
-                                std::chrono::milliseconds(300));
-    re_put(2);
-    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 1u);
-    EXPECT_TRUE(HasDisk(master, Key(0, 2), stores_[0].client_id));
-}
-
-// L4 master whose cold-start take hold lasts `release_sec`.
-MasterServiceConfig MakeTakeHoldConfig(uint64_t release_sec) {
-    return MasterServiceConfig::builder()
-        .set_memory_allocator(BufferAllocatorType::OFFSET)
-        .set_eviction_ratio(0.0)
-        .set_eviction_high_watermark_ratio(1.0)
-        .set_client_live_ttl_sec(3600)
-        .set_client_suspicion_ttl_sec(3600)
-        .set_enable_offload(true)
-        .set_put_start_discard_timeout_sec(1)
-        .set_put_start_release_timeout_sec(release_sec)
-        .build();
-}
-
-uint64_t ManifestTakeHoldMs(const std::string& dir) {
-    auto bytes =
-        handoff::ReadFileBytes(dir + "/" + handoff::kHandoffManifestFile);
-    EXPECT_TRUE(bytes.has_value());
-    if (!bytes) return 0;
-    auto manifest = handoff::DecodeManifest(std::string_view(
-        reinterpret_cast<const char*>(bytes->data()), bytes->size()));
-    EXPECT_TRUE(manifest.has_value());
-    return manifest ? manifest->offload_take_hold_ms : 0;
-}
-
-TEST_F(HandoffRestoreTest, ColdStartTakeHoldIsCarried) {
-    // A master still in its cold-start hold (no store may take an offload,
-    // because reports of takes from the master before it may still arrive)
-    // hands what is left of the hold to the next master.
-    auto config = [] { return MakeTakeHoldConfig(2); };
-    TempDir dir;
-    {
-        MasterService old_master(config());
-        old_master.HoldOffloadTakesAfterColdStart();
-        Store store{generate_uuid(), {MakeSegment(0)}};
-        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
-                        .has_value());
-        stores_.push_back(store);
-        EnableL4(old_master, store);
-        Put(old_master, store, Key(0, 0));
-        Write(old_master, dir.path());
+    // Keys 1-3 are removed and put again (new tasks of the new master); key 4
+    // is new. The store takes all four right away.
+    for (int i = 1; i < 4; ++i) {
+        ASSERT_TRUE(
+            master.Remove(Key(0, i), TenantId::Default(), true).has_value());
+        Put(master, stores_[0], Key(0, i));
     }
-    MasterService master(config());
-    ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {1}).has_value());
-    EXPECT_TRUE(master.OffloadTakesHeld());
-    ASSERT_TRUE(Remount(master, stores_[0]));
-    Put(master, stores_[0], Key(0, 1));
-    EXPECT_TRUE(Offload(master, stores_[0], "disk-0", 10).empty());
-    std::this_thread::sleep_for(std::chrono::milliseconds(2300));
-    EXPECT_FALSE(master.OffloadTakesHeld());
-    Put(master, stores_[0], Key(0, 2));
-    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10),
-              std::vector<std::string>{Key(0, 2)});
-    EXPECT_TRUE(HasDisk(master, Key(0, 2), stores_[0].client_id));
-}
-
-TEST_F(HandoffRestoreTest, ColdStartTakeHoldLastsAcrossTwoRolls) {
-    // A cold-start hold armed at t0 must block takes until at least t0 + T
-    // (real time), however often the master is rolled meanwhile: every
-    // handoff exports no less than what is left of the hold and the next
-    // master re-arms it for that long after its restore. A restore that
-    // re-armed only a part of it would fail the "at least" checks below.
-    using std::chrono::milliseconds;
-    using std::chrono::steady_clock;
-    constexpr uint64_t kHoldSec = 4;
-    constexpr uint64_t kHoldMs = kHoldSec * 1000;
-    // Truncation to ms and scheduling between the clock reads.
-    constexpr uint64_t kToleranceMs = 50;
-    auto ms_since = [](steady_clock::time_point from) {
-        return static_cast<uint64_t>(
-            std::chrono::ceil<milliseconds>(steady_clock::now() - from)
-                .count());
-    };
-    TempDir first, second;
-    // Read before the hold is armed, so the hold ends no earlier than
-    // t0 + T.
-    const auto t0 = steady_clock::now();
-    {
-        MasterService old_master(MakeTakeHoldConfig(kHoldSec));
-        old_master.HoldOffloadTakesAfterColdStart();
-        Store store{generate_uuid(), {MakeSegment(0)}};
-        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
-                        .has_value());
-        stores_.push_back(store);
-        EnableL4(old_master, store);
-        Put(old_master, store, Key(0, 0));
-        Write(old_master, first.path());
+    Put(master, stores_[0], Key(0, 4));
+    auto taken = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_TRUE(taken.has_value());
+    ASSERT_EQ(taken->size(), 4u);
+    for (const auto& item : *taken) {
+        ASSERT_TRUE(item.task_id.has_value());
+        EXPECT_EQ(item.task_id->epoch, master.L4TaskEpoch());
     }
-    const uint64_t first_ms = ManifestTakeHoldMs(first.path());
-    EXPECT_LE(first_ms, kHoldMs + 1);
-    EXPECT_GE(first_ms + ms_since(t0) + kToleranceMs, kHoldMs);
-
-    // First roll: the restored hold is the exported one minus the time
-    // since the restore started, never less.
-    {
-        MasterService middle(MakeTakeHoldConfig(kHoldSec));
-        const auto restore_start = steady_clock::now();
-        ASSERT_TRUE(middle.RestoreFromHandoff(first.path(), {1}).has_value());
-        const uint64_t restored_ms = middle.HandoffOffloadTakeHoldMs();
-        EXPECT_GE(restored_ms + ms_since(restore_start) + kToleranceMs,
-                  first_ms);
-        EXPECT_LE(restored_ms, first_ms + 1);
-        ASSERT_TRUE(Remount(middle, stores_[0]));
-        Put(middle, stores_[0], Key(0, 1));
-        EXPECT_TRUE(Offload(middle, stores_[0], "disk-0", 10).empty());
-        // Second roll, still during the carried hold.
-        Write(middle, second.path());
+    // The old takes' reports arrive while the store holds the new takes of
+    // the same keys: still refused.
+    for (int i = 1; i < 4; ++i) late(i);
+    for (int i = 1; i < 4; ++i) {
+        EXPECT_FALSE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
     }
-    const uint64_t second_ms = ManifestTakeHoldMs(second.path());
-    EXPECT_GT(second_ms, 0u);
-    EXPECT_LE(second_ms, first_ms + 1);
-    EXPECT_GE(second_ms + ms_since(t0) + kToleranceMs, kHoldMs);
-
-    MasterService master(MakeTakeHoldConfig(kHoldSec));
-    const auto restore_start = steady_clock::now();
-    ASSERT_TRUE(master.RestoreFromHandoff(second.path(), {1}).has_value());
-    const uint64_t restored_ms = master.HandoffOffloadTakeHoldMs();
-    EXPECT_GE(restored_ms + ms_since(restore_start) + kToleranceMs, second_ms);
-    EXPECT_GE(restored_ms + ms_since(t0) + kToleranceMs, kHoldMs);
-    ASSERT_TRUE(Remount(master, stores_[0]));
-
-    // Still held shortly before t0 + T.
-    const auto almost = t0 + milliseconds(kHoldMs - 500);
-    ASSERT_LT(steady_clock::now(), almost) << "the rolls took too long";
-    std::this_thread::sleep_until(almost);
-    EXPECT_TRUE(master.OffloadTakesHeld());
-    Put(master, stores_[0], Key(0, 2));
-    EXPECT_TRUE(Offload(master, stores_[0], "disk-0", 10).empty());
-
-    // Free once the hold is over (plus the gaps of the two restores).
-    std::this_thread::sleep_until(t0 + milliseconds(kHoldMs + 600));
-    EXPECT_FALSE(master.OffloadTakesHeld());
-    Put(master, stores_[0], Key(0, 3));
-    EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10),
-              std::vector<std::string>{Key(0, 3)});
-    EXPECT_TRUE(HasDisk(master, Key(0, 3), stores_[0].client_id));
+    // The new takes complete.
+    std::vector<StorageObjectMetadata> metas(taken->size(), DiskMeta("disk-0"));
+    ASSERT_TRUE(master.NotifyOffloadSuccess(stores_[0].client_id, *taken, metas)
+                    .has_value());
+    for (int i = 1; i < 5; ++i) {
+        EXPECT_TRUE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
+    }
 }
 
 }  // namespace

@@ -132,7 +132,6 @@ CodecFingerprint CurrentCodecFingerprint() {
     fp.quarantine = struct_pack::get_type_code<std::vector<QuarantineRange>>();
     fp.local_disk =
         struct_pack::get_type_code<std::vector<LocalSsdHandoffClient>>();
-    fp.offload_takes = struct_pack::get_type_code<std::vector<OffloadTake>>();
     return fp;
 }
 
@@ -144,8 +143,7 @@ bool CodecMatches(const CodecFingerprint& fp, uint32_t schema) {
         return false;
     }
     if (schema < 2) return true;
-    return fp.local_disk == current.local_disk &&
-           fp.offload_takes == current.offload_takes;
+    return fp.local_disk == current.local_disk;
 }
 
 SegmentLocator::SegmentLocator(const std::vector<SegmentIdentity>& segments)
@@ -223,7 +221,6 @@ std::string EncodeManifest(const Manifest& m) {
     codec["segments"] = Json::UInt(m.codec.segments);
     codec["quarantine"] = Json::UInt(m.codec.quarantine);
     codec["local_disk"] = Json::UInt(m.codec.local_disk);
-    codec["offload_takes"] = Json::UInt(m.codec.offload_takes);
     root["codec"] = codec;
     root["memory_allocator"] = m.memory_allocator;
     root["multi_tenant"] = m.multi_tenant;
@@ -267,9 +264,6 @@ std::string EncodeManifest(const Manifest& m) {
     root["disk_only_object_count"] = Json::UInt64(m.disk_only_object_count);
     if (m.local_disk) root["local_disk"] = EncodeBlob(*m.local_disk);
     root["local_disk_clients"] = Json::UInt64(m.local_disk_clients);
-    if (m.offload_takes) root["offload_takes"] = EncodeBlob(*m.offload_takes);
-    root["offload_take_count"] = Json::UInt64(m.offload_take_count);
-    root["offload_take_hold_ms"] = Json::UInt64(m.offload_take_hold_ms);
     Json::Value w(Json::objectValue);
     w["objects"] = Json::UInt64(m.writer.objects);
     w["replicas"] = Json::UInt64(m.writer.replicas);
@@ -293,7 +287,6 @@ std::string EncodeManifest(const Manifest& m) {
         Json::UInt64(m.writer.dropped_local_disk_replicas);
     w["dropped_local_disk_size_mismatch"] =
         Json::UInt64(m.writer.dropped_local_disk_size_mismatch);
-    w["offload_takes"] = Json::UInt64(m.writer.offload_takes);
     w["total_bytes"] = Json::UInt64(m.writer.total_bytes);
     w["workers"] = Json::UInt64(m.writer.workers);
     w["duration_ms"] = Json::UInt64(m.writer.duration_ms);
@@ -391,26 +384,20 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
     m.codec.segments = codec["segments"].asUInt();
     m.codec.quarantine = codec["quarantine"].asUInt();
     if (m.schema_version >= 2) {
-        if (!codec["local_disk"].isUInt() || !codec["offload_takes"].isUInt() ||
-            !root["enable_offload"].isBool() ||
+        if (!codec["local_disk"].isUInt() || !root["enable_offload"].isBool() ||
             !GetU64(root, "local_disk_replica_count",
                     m.local_disk_replica_count) ||
             !GetU64(root, "disk_only_object_count", m.disk_only_object_count) ||
-            !GetU64(root, "local_disk_clients", m.local_disk_clients) ||
-            !GetU64(root, "offload_take_count", m.offload_take_count) ||
-            !GetU64(root, "offload_take_hold_ms", m.offload_take_hold_ms)) {
+            !GetU64(root, "local_disk_clients", m.local_disk_clients)) {
             return tl::make_unexpected("manifest L4 field missing or mistyped");
         }
         m.codec.local_disk = codec["local_disk"].asUInt();
-        m.codec.offload_takes = codec["offload_takes"].asUInt();
         m.enable_offload = root["enable_offload"].asBool();
-        BlobInfo local_disk, takes;
-        if (!DecodeBlob(root["local_disk"], local_disk) ||
-            !DecodeBlob(root["offload_takes"], takes)) {
+        BlobInfo local_disk;
+        if (!DecodeBlob(root["local_disk"], local_disk)) {
             return tl::make_unexpected("manifest L4 blob entry invalid");
         }
         m.local_disk = std::move(local_disk);
-        m.offload_takes = std::move(takes);
     }
     m.multi_tenant = root["multi_tenant"].asBool();
     for (const auto& v : root["segments"]) {
@@ -472,7 +459,6 @@ tl::expected<Manifest, std::string> DecodeManifest(std::string_view file) {
                m.writer.dropped_local_disk_replicas);
         GetU64(w, "dropped_local_disk_size_mismatch",
                m.writer.dropped_local_disk_size_mismatch);
-        GetU64(w, "offload_takes", m.writer.offload_takes);
         GetU64(w, "total_bytes", m.writer.total_bytes);
         GetU64(w, "workers", m.writer.workers);
         GetU64(w, "duration_ms", m.writer.duration_ms);
@@ -512,19 +498,6 @@ DecodeLocalDiskClients(const std::vector<uint8_t>& bytes) {
         return tl::make_unexpected("local disk clients decode failed");
     }
     return clients;
-}
-
-std::vector<uint8_t> EncodeOffloadTakes(const std::vector<OffloadTake>& takes) {
-    return struct_pack::serialize<std::vector<uint8_t>>(takes);
-}
-
-tl::expected<std::vector<OffloadTake>, std::string> DecodeOffloadTakes(
-    const std::vector<uint8_t>& bytes) {
-    std::vector<OffloadTake> takes;
-    if (struct_pack::deserialize_to(takes, bytes) != struct_pack::errc::ok) {
-        return tl::make_unexpected("offload takes decode failed");
-    }
-    return takes;
 }
 
 tl::expected<std::vector<uint8_t>, std::string> ReadFileBytes(

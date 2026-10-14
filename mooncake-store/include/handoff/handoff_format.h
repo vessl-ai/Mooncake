@@ -43,19 +43,19 @@ inline constexpr char kHandoffFormat[] = "mooncake-handoff";
 // (L4) state: LOCAL_DISK replicas in the chunks (same chunk codec) and the
 // per-client registrations. Schema 3 adds the remaining hold time of every
 // quarantine range, the ranges of the old master's discarded replicas, and
-// DRAINING / DRAINED segments with their status. Schema 4 replaces the
-// offload pins of schema 2/3 with the offload takes (OffloadTake). Schema 5
-// adds the remaining cold-start take hold (offload_take_hold_ms). Older
-// snapshots lack ranges that may still be written, takes whose report may
-// still arrive or the hold that blocks such takes, and a reader of an older
-// schema would ignore the hold, so the reader accepts schema 5 only (an older
-// snapshot means one cold start) and a schema-4 build refuses this one.
-inline constexpr uint32_t kHandoffSchemaVersion = 5;
-inline constexpr uint32_t kHandoffMinSchemaVersion = 5;
+// DRAINING / DRAINED segments with their status. Schemas 4 and 5 carried the
+// offload takes and the cold-start take hold of a master whose offload
+// reports carried only the key. Schema 6 carries no offload state: every
+// offload report names its task by an L4 task id whose epoch is new for every
+// master, so the new master refuses all reports of the old master's tasks.
+// The reader accepts schema 6 only (an older snapshot means one cold start):
+// a schema-5 reader would take a schema-6 snapshot as one without takes or
+// hold and accept key-only reports.
+inline constexpr uint32_t kHandoffSchemaVersion = 6;
+inline constexpr uint32_t kHandoffMinSchemaVersion = 6;
 inline constexpr char kHandoffManifestFile[] = "handoff_manifest";
 inline constexpr char kHandoffQuarantineFile[] = "handoff_quarantine.bin";
 inline constexpr char kHandoffLocalDiskFile[] = "handoff_local_disk.bin";
-inline constexpr char kHandoffOffloadTakesFile[] = "handoff_offload_takes.bin";
 inline constexpr char kHandoffSnapshotRoot[] = "handoff";
 
 struct SegmentIdentity {
@@ -102,20 +102,6 @@ struct QuarantineRange {
     YLT_REFL(QuarantineRange, segment_index, address, size, hold_ms);
 };
 
-// A store whose report (completion or NACK) of an offload of `key` may still
-// arrive although no master tracks that offload any more: a taker of a task
-// the old master still had (tasks are not carried, so the roll drops them),
-// or a stale take the old master still held. The restore records it as a
-// stale take for `hold_ms` after the restore ends, so the store cannot take
-// a newer offload of the key before such a report can no longer arrive.
-struct OffloadTake {
-    std::string tenant_id;
-    std::string key;
-    UUID client_id{0, 0};
-    uint64_t hold_ms{0};
-    YLT_REFL(OffloadTake, tenant_id, key, client_id, hold_ms);
-};
-
 // Fingerprints of the struct_pack layouts the chunk and segment files were
 // written with. A reader built from a different layout rejects the snapshot
 // before decoding anything.
@@ -125,7 +111,6 @@ struct CodecFingerprint {
     uint32_t quarantine{0};
     // Schema 2 only; 0 in a schema-1 manifest.
     uint32_t local_disk{0};
-    uint32_t offload_takes{0};
     bool operator==(const CodecFingerprint&) const = default;
 };
 CodecFingerprint CurrentCodecFingerprint();
@@ -151,7 +136,6 @@ struct WriterStats {
     uint64_t disk_only_objects{0};
     uint64_t dropped_local_disk_replicas{0};       // owner not exported
     uint64_t dropped_local_disk_size_mismatch{0};  // object_size != size
-    uint64_t offload_takes{0};
     uint64_t total_bytes{0};
     uint64_t workers{0};
     uint64_t duration_ms{0};
@@ -180,13 +164,6 @@ struct Manifest {
     uint64_t disk_only_object_count{0};
     std::optional<BlobInfo> local_disk;  // vector<LocalSsdHandoffClient>
     uint64_t local_disk_clients{0};
-    std::optional<BlobInfo> offload_takes;  // vector<OffloadTake>
-    uint64_t offload_take_count{0};
-    // Remaining cold-start take hold of the old master (0: none; schema 5,
-    // mandatory). A master that started cold blocks every offload take for
-    // put_start_release_timeout; the next master keeps blocking them for
-    // what is left of it.
-    uint64_t offload_take_hold_ms{0};
     WriterStats writer;
 };
 
@@ -225,9 +202,6 @@ std::vector<uint8_t> EncodeLocalDiskClients(
     const std::vector<LocalSsdHandoffClient>& clients);
 tl::expected<std::vector<LocalSsdHandoffClient>, std::string>
 DecodeLocalDiskClients(const std::vector<uint8_t>& bytes);
-std::vector<uint8_t> EncodeOffloadTakes(const std::vector<OffloadTake>& takes);
-tl::expected<std::vector<OffloadTake>, std::string> DecodeOffloadTakes(
-    const std::vector<uint8_t>& bytes);
 
 // Reads a whole file. Error string on I/O failure, or if the file is larger
 // than `max_bytes` (checked before anything is allocated).

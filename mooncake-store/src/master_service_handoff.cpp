@@ -24,8 +24,10 @@
 // store drops them whenever it has to register its disk tier anew). A
 // restored LOCAL_DISK replica is unreadable until any RPC from its owner's
 // client id arrives (the id is random per process, so a restarted store can
-// never open it); see HandoffDiskGated. Offload tasks are not carried; their
-// takers and the old master's stale takes become stale takes (OffloadTake).
+// never open it); see HandoffDiskGated. No offload state is carried: offload
+// tasks are dropped, and a late report of one names a task of the old
+// master (its L4 task id has the old master's epoch), which no task of the
+// new master has, so it is refused there.
 
 #include <algorithm>
 #include <atomic>
@@ -115,8 +117,8 @@ std::string MasterService::HandoffRestoreStats::ToJson() const {
       << ",\"local_disk_clients\":" << local_disk_clients
       << ",\"local_disk_replicas\":" << local_disk_replicas
       << ",\"disk_only_objects\":" << disk_only_objects
-      << ",\"offload_takes\":" << offload_takes << ",\"workers\":" << workers
-      << ",\"manifest_ns\":" << manifest_ns << ",\"mount_ns\":" << mount_ns
+      << ",\"workers\":" << workers << ",\"manifest_ns\":" << manifest_ns
+      << ",\"mount_ns\":" << mount_ns
       << ",\"insert_wall_ns\":" << insert_wall_ns
       << ",\"load_cpu_ns\":" << load_cpu_ns
       << ",\"prepare_cpu_ns\":" << prepare_cpu_ns
@@ -191,7 +193,6 @@ void MasterService::ExportHandoffShard(
     const HandoffClientSet& disk_clients,
     std::vector<StandbyObjectEntry>& objects,
     std::vector<handoff::QuarantineRange>& quarantine,
-    std::vector<handoff::OffloadTake>& takes,
     handoff::WriterStats& stats) const {
     MetadataShardAccessorRO shard(this, shard_idx);
     size_t count = 0;
@@ -289,40 +290,6 @@ void MasterService::ExportHandoffShard(
                 if (memory_replicas == 0) ++stats.disk_only_objects;
             }
             objects.push_back(std::move(entry));
-        }
-        ExportHandoffOffloadTakes(tenant_id, tenant_state, takes, stats);
-    }
-}
-
-void MasterService::ExportHandoffOffloadTakes(
-    const TenantId& tenant_id, const TenantState& tenant_state,
-    std::vector<handoff::OffloadTake>& takes,
-    handoff::WriterStats& stats) const {
-    // Offload tasks are not carried: the roll drops every task like
-    // ReleaseOffloadingTask does, so every taker becomes a stale take for
-    // the full release timeout (a completion carries only the key, and the
-    // taker may still be copying). Stale takes keep the time this master
-    // would still have kept them.
-    const auto now = std::chrono::system_clock::now();
-    for (const auto& [key, task] : tenant_state.offloading_tasks) {
-        for (const auto& taker : task.takers) {
-            takes.push_back(
-                {tenant_id.value(), key, taker, HandoffFullHoldMs()});
-            ++stats.offload_takes;
-        }
-    }
-    for (const auto& [key, stale] : tenant_state.stale_offload_takes) {
-        for (const auto& take : stale) {
-            if (take.deadline <= now) {
-                continue;  // this master would purge it at its next sweep
-            }
-            const auto remaining =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    take.deadline - now)
-                    .count();
-            takes.push_back({tenant_id.value(), key, take.client_id,
-                             static_cast<uint64_t>(remaining) + 1});
-            ++stats.offload_takes;
         }
     }
 }
@@ -466,8 +433,6 @@ void MasterService::ResetHandoffState() {
         std::lock_guard<std::mutex> lock(handoff_quarantine_.mutex);
         released.swap(handoff_quarantine_.buffers);
     }
-    handoff_restored_offload_takes_.store(0, std::memory_order_relaxed);
-    offload_take_hold_until_.store(0, std::memory_order_relaxed);
 }
 
 bool MasterService::HandoffMasterIsEmpty() {
@@ -576,9 +541,8 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             return tl::make_unexpected("quarantine range outside segment");
         }
     }
-    // L4 state: registrations and offload takes.
+    // L4 state: registrations.
     std::vector<LocalSsdHandoffClient> disk_clients;
-    std::vector<handoff::OffloadTake> offload_takes;
     if (manifest->schema_version >= 2) {
         auto disk_bytes = handoff::ReadVerifiedBlob(
             dir, manifest->local_disk->key, manifest->local_disk->bytes,
@@ -589,29 +553,9 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
             return tl::make_unexpected(decoded_clients.error());
         }
         disk_clients = std::move(*decoded_clients);
-        auto take_bytes = handoff::ReadVerifiedBlob(
-            dir, manifest->offload_takes->key, manifest->offload_takes->bytes,
-            manifest->offload_takes->crc32c);
-        if (!take_bytes) return tl::make_unexpected(take_bytes.error());
-        auto decoded_takes = handoff::DecodeOffloadTakes(*take_bytes);
-        if (!decoded_takes) return tl::make_unexpected(decoded_takes.error());
-        offload_takes = std::move(*decoded_takes);
-        if (disk_clients.size() != manifest->local_disk_clients ||
-            offload_takes.size() != manifest->offload_take_count) {
+        if (disk_clients.size() != manifest->local_disk_clients) {
             return tl::make_unexpected("L4 blob count mismatch");
         }
-    }
-    // A hold longer than a day cannot come from a sane release timeout (and
-    // would overflow the deadline arithmetic).
-    constexpr uint64_t kMaxTakeHoldMs = 24ull * 3600 * 1000;
-    for (const auto& take : offload_takes) {
-        if (take.tenant_id.empty() || take.key.empty() ||
-            take.client_id == UUID{0, 0} || take.hold_ms > kMaxTakeHoldMs) {
-            return tl::make_unexpected("invalid offload take entry");
-        }
-    }
-    if (manifest->offload_take_hold_ms > kMaxTakeHoldMs) {
-        return tl::make_unexpected("invalid offload take hold");
     }
     if (manifest->local_disk_replica_count > 0 && disk_clients.empty()) {
         return tl::make_unexpected("LOCAL_DISK replicas without owners");
@@ -1099,46 +1043,6 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     }
     handoff_disk_gate_.active.store(!handoff_disk_gate_.opened.empty(),
                                     std::memory_order_release);
-    // Offload takes of the old master become stale takes here: a report of
-    // such a take may still arrive and carries nothing but the key, so the
-    // store must not take an offload of the key that this master creates
-    // before that report can no longer arrive (OffloadTake). Each one is held
-    // for its hold time after the restore ends (the gap only adds to it).
-    {
-        const auto takes_now = std::chrono::system_clock::now();
-        for (const auto& take : offload_takes) {
-            const auto object_id =
-                MakeObjectIdentity(take.key, TenantId(take.tenant_id));
-            MetadataAccessorRW accessor(this, object_id);
-            auto& held =
-                accessor.GetTenantState().stale_offload_takes[take.key];
-            const auto deadline =
-                takes_now + std::chrono::milliseconds(take.hold_ms);
-            auto it = std::find_if(held.begin(), held.end(),
-                                   [&take](const StaleOffloadTake& h) {
-                                       return h.client_id == take.client_id;
-                                   });
-            if (it == held.end()) {
-                held.push_back(StaleOffloadTake{take.client_id, deadline});
-            } else {
-                it->deadline = std::max(it->deadline, deadline);
-            }
-        }
-        stats.offload_takes = offload_takes.size();
-        handoff_restored_offload_takes_.store(offload_takes.size(),
-                                              std::memory_order_relaxed);
-        // The old master was still in its cold-start hold: no take of any
-        // key for what is left of it (counted from now, the gap only adds).
-        if (manifest->offload_take_hold_ms > 0) {
-            const auto until =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(manifest->offload_take_hold_ms);
-            offload_take_hold_until_.store(until.time_since_epoch().count(),
-                                           std::memory_order_relaxed);
-            LOG(INFO) << "offload_take_hold=restored, ms="
-                      << manifest->offload_take_hold_ms;
-        }
-    }
     MasterMetricManager::instance().inc_mem_cache_nums(
         static_cast<int64_t>(memory_objects));
     MasterMetricManager::instance().inc_file_cache_nums(

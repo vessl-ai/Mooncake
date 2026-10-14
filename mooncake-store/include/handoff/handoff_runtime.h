@@ -200,10 +200,8 @@ class HandoffMetrics {
     // Live counters of restored segments (pending / confirmed / dropped).
     void SetSegmentCounters(
         std::function<void(uint64_t*, uint64_t*, uint64_t*)> provider);
-    // Restored L4 owners not yet seen, and offload takes restored as stale
-    // takes.
-    void SetLocalDiskCounters(
-        std::function<void(uint64_t*, uint64_t*)> provider);
+    // Restored L4 owners not yet seen.
+    void SetLocalDiskCounters(std::function<void(uint64_t*)> provider);
     std::string Serialize() const;
 
    private:
@@ -212,7 +210,7 @@ class HandoffMetrics {
     StartupReport startup_;
     std::string last_shutdown_json_;
     std::function<void(uint64_t*, uint64_t*, uint64_t*)> segment_counters_;
-    std::function<void(uint64_t*, uint64_t*)> local_disk_counters_;
+    std::function<void(uint64_t*)> local_disk_counters_;
 };
 
 }  // namespace mooncake::handoff
