@@ -4145,6 +4145,13 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
 }
 
+tl::expected<void, ErrorCode> Client::NotifyOffloadTaskSuccess(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    return master_client_.NotifyOffloadTaskSuccess(client_id_, tasks,
+                                                   metadatas);
+}
+
 void Client::SetDfsStorageBackend(
     std::shared_ptr<DistributedStorageBackend> backend) {
     dfs_storage_backend_ = std::move(backend);

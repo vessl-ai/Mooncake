@@ -1655,24 +1655,62 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
     timer.LogRequest("action=notify_offload_success");
+    if (tasks.size() != metadatas.size()) {
+        auto result = tl::expected<void, ErrorCode>(
+            tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        timer.LogResponseExpected(result);
+        return result;
+    }
+    // This name carries NACKs, and the completions of stores that predate
+    // task ids. A completion is registered only through
+    // NotifyOffloadTaskSuccess: a store sends its id-bearing completions
+    // there, so a master that predates task ids (which would match them by
+    // key alone) answers "function not registered" and the store rolls the
+    // bucket back. Completions arriving here are dropped (as the master
+    // would refuse them anyway: they carry no task id, or come from a
+    // store that also knows the new name).
+    std::vector<OffloadTaskItem> nack_tasks;
+    std::vector<StorageObjectMetadata> nack_metadatas;
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        if (metadatas[i].data_size < 0) {
+            nack_tasks.push_back(tasks[i]);
+            nack_metadatas.push_back(metadatas[i]);
+        }
+    }
+    if (nack_tasks.size() != tasks.size()) {
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=notify_offload_success_refused"
+                  << ", reason=completion_without_task_rpc, count="
+                  << tasks.size() - nack_tasks.size();
+    }
+    auto result = NotifyOffloadReports(client_id, nack_tasks, nack_metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
 
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadTaskSuccess(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "NotifyOffloadTaskSuccess");
+    timer.LogRequest("action=notify_offload_task_success");
+    auto result = NotifyOffloadReports(client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadReports(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
     for (const auto& task : tasks) {
         auto tenant_id =
             ResolveRequestTenantId(master_service_.IsTenantQuotaEnabled()
                                        ? std::string_view(task.tenant_id)
                                        : TenantId::kDefaultValue);
         if (!tenant_id) {
-            auto result = tl::expected<void, ErrorCode>(
-                tl::make_unexpected(tenant_id.error()));
-            timer.LogResponseExpected(result);
-            return result;
+            return tl::make_unexpected(tenant_id.error());
         }
     }
-
-    auto result =
-        master_service_.NotifyOffloadSuccess(client_id, tasks, metadatas);
-    timer.LogResponseExpected(result);
-    return result;
+    return master_service_.NotifyOffloadSuccess(client_id, tasks, metadatas);
 }
 
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
@@ -1945,6 +1983,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyOffloadTaskSuccess>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(

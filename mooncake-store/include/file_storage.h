@@ -379,6 +379,12 @@ class FileStorage {
     std::atomic<bool> filesystem_check_running_{false};
     // Test-only replacement for CheckFilesystem; returns errno.
     std::function<int(bool sync_first)> test_filesystem_check_;
+    // Test-only replacement for the offload completion RPC
+    // (Client::NotifyOffloadTaskSuccess).
+    std::function<tl::expected<void, ErrorCode>(
+        const std::vector<OffloadTaskItem>&,
+        const std::vector<StorageObjectMetadata>&)>
+        test_offload_completion_rpc_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
 };

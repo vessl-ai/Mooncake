@@ -620,6 +620,12 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    // Completions are registered only through this RPC name (see
+    // MasterClient::NotifyOffloadTaskSuccess); NotifyOffloadSuccess above
+    // carries NACKs.
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
 

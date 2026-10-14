@@ -495,6 +495,14 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    /**
+     * @brief Reports offload completions (and NACKs) under the RPC name that
+     * only masters with task ids know; the only way a completion is
+     * registered. An older master answers with an RPC error.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a

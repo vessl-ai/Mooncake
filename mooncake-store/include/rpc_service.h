@@ -248,6 +248,13 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // Offload reports (completions and NACKs) of a store that echoes task
+    // ids. The only RPC through which a completion is registered; the one
+    // above takes NACKs only (see its definition).
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
@@ -378,6 +385,11 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    // Tenant checks, then MasterService::NotifyOffloadSuccess.
+    tl::expected<void, ErrorCode> NotifyOffloadReports(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     MasterService master_service_;
     std::atomic<uint32_t> heartbeat_rpc_port_{0};
 };

@@ -248,6 +248,11 @@ struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyOffloadTaskSuccess> {
+    static constexpr const char* value = "NotifyOffloadTaskSuccess";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
@@ -1192,6 +1197,18 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadTaskSuccess(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadTaskSuccess");
+    timer.LogRequest("client_id=", client_id, ", tasks_count=", tasks.size());
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyOffloadTaskSuccess, void>(
+            client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }
