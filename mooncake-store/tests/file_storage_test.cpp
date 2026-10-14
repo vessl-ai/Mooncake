@@ -345,6 +345,109 @@ class FileStorageTest : public ::testing::Test {
         return fileStorage.deferred_task_by_storage_key_;
     }
 
+    static tl::expected<void, ErrorCode> FileStorageProcessDrainedOffloads(
+        FileStorage& fileStorage, std::vector<OffloadTaskItem> drained) {
+        return fileStorage.ProcessDrainedOffloads(std::move(drained));
+    }
+
+    static bool StorageKeyExists(FileStorage& fileStorage,
+                                 const std::string& key) {
+        auto exists = fileStorage.storage_backend_->IsExist(
+            TenantId::Default().MakeScopedKey(key));
+        EXPECT_TRUE(exists.has_value());
+        return exists.has_value() && exists.value();
+    }
+
+    static void FileStorageDropCarriedOffloadTasksOfAnotherEpoch(
+        FileStorage& fileStorage, const std::vector<OffloadTaskItem>& drained) {
+        fileStorage.DropCarriedOffloadTasksOfAnotherEpoch(drained);
+    }
+
+    // A store with one memory segment and an L4 registration on an in-process
+    // master, and objects put into that segment: the setup of the offload
+    // tests that drain real items.
+    struct OffloadRig {
+        testing::InProcMaster master;
+        std::unique_ptr<void, decltype(&std::free)> segment{nullptr,
+                                                            &std::free};
+        std::unique_ptr<SimpleAllocator> allocator;
+        std::string endpoint;
+        std::shared_ptr<Client> client;
+        static constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+
+        void Start() {
+            ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                         .set_enable_offload(true)
+                                         .set_default_kv_lease_ttl(0)
+                                         .set_root_fs_dir("")
+                                         .build()));
+            segment.reset(allocate_buffer_allocator_memory(kSegmentSize));
+            ASSERT_NE(segment, nullptr);
+            allocator = std::make_unique<SimpleAllocator>(kSegmentSize);
+            endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+            auto client_result =
+                Client::Create(endpoint, master.metadata_url(), "tcp",
+                               std::nullopt, master.master_address());
+            ASSERT_TRUE(client_result.has_value());
+            client = client_result.value();
+            ASSERT_TRUE(
+                client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+            ASSERT_TRUE(client->RegisterLocalMemory(
+                allocator->getBase(), kSegmentSize, "cpu:0", false, false));
+            ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        }
+
+        void Put(const std::string& key, const std::string& value) {
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            void* buffer = allocator->allocate(value.size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, value.data(), value.size());
+            std::vector<Slice> slices{{buffer, value.size()}};
+            ASSERT_TRUE(client->Put(key, slices, replicate));
+            allocator->deallocate(buffer, value.size());
+        }
+
+        std::vector<OffloadTaskItem> Drain() {
+            std::vector<OffloadTaskItem> items;
+            EXPECT_TRUE(client->OffloadObjectHeartbeat(true, items));
+            return items;
+        }
+
+        size_t DiskReplicas(const std::string& key) {
+            auto query = client->Query(key);
+            EXPECT_TRUE(query.has_value());
+            size_t count = 0;
+            if (query) {
+                for (const auto& replica : query->replicas) {
+                    count += replica.is_local_disk_replica();
+                }
+            }
+            return count;
+        }
+
+        // True while the master still tracks an offload task of the key (an
+        // upsert is refused with OBJECT_HAS_REPLICATION_TASK).
+        bool HasOffloadTask(const std::string& key) {
+            std::string value(128, 'u');
+            void* buffer = allocator->allocate(value.size());
+            EXPECT_NE(buffer, nullptr);
+            std::memcpy(buffer, value.data(), value.size());
+            std::vector<Slice> slices{{buffer, value.size()}};
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            auto upsert = client->Upsert(key, slices, replicate);
+            allocator->deallocate(buffer, value.size());
+            return !upsert.has_value() &&
+                   upsert.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK;
+        }
+
+        void Stop() {
+            EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+            EXPECT_TRUE(client->unregisterLocalMemory(allocator->getBase()));
+        }
+    };
+
     static void FileStoragePartitionUnbucketedTasks(
         const std::unordered_map<std::string, OffloadTaskItem>&
             task_by_storage_key,
@@ -1562,6 +1665,104 @@ TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
     // construction it produces a NACK, and the NACK path dereferences the null
     // client_ this fixture relies on. It is covered at unit level by
     // PartitionUnbucketedTasks_redrained_then_skipped.
+}
+
+// An item without a task id comes from a master that matches reports by key
+// alone: the store NACKs it without copying (the master ends its task), and
+// still offloads the items that carry an id.
+TEST_F(FileStorageTest, ItemsWithoutTaskIdAreNackedNotCopied) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("plain_key", std::string(128, 'p'));
+    rig.Put("tagged_key", std::string(128, 't'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 2u);
+    for (auto& item : items) {
+        ASSERT_TRUE(item.task_id.has_value());
+        if (item.key == "plain_key") item.task_id.reset();
+    }
+    ASSERT_TRUE(rig.HasOffloadTask("plain_key"));
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/no_task_id_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, items));
+
+    EXPECT_FALSE(StorageKeyExists(file_storage, "plain_key"));
+    EXPECT_EQ(rig.DiskReplicas("plain_key"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("plain_key"));
+
+    EXPECT_TRUE(StorageKeyExists(file_storage, "tagged_key"));
+    EXPECT_EQ(rig.DiskReplicas("tagged_key"), 1u);
+    rig.Stop();
+}
+
+// A task carried across a bucket deferral (#3006) is reported, possibly
+// several heartbeats later, with the id of the item that was drained for
+// it, so the master registers it.
+TEST_F(FileStorageTest, CarriedTaskReportsEchoTheirTaskId) {
+    OffloadRig rig;
+    rig.Start();
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "2");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/carry_echo_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+
+    rig.Put("first_key", std::string(128, 'f'));
+    auto first = rig.Drain();
+    ASSERT_EQ(first.size(), 1u);
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, first));
+    // Not enough for a bucket: carried, not reported.
+    ASSERT_EQ(GetDeferredTaskByStorageKey(file_storage).size(), 1u);
+    EXPECT_EQ(rig.DiskReplicas("first_key"), 0u);
+
+    rig.Put("second_key", std::string(128, 's'));
+    auto second = rig.Drain();
+    ASSERT_EQ(second.size(), 1u);
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, second));
+    EXPECT_TRUE(GetDeferredTaskByStorageKey(file_storage).empty());
+    EXPECT_EQ(rig.DiskReplicas("first_key"), 1u);
+    EXPECT_EQ(rig.DiskReplicas("second_key"), 1u);
+    rig.Stop();
+}
+
+// Carried tasks of another master (another epoch) are dropped together with
+// their pooled keys once the store drains items of the current master; those
+// of the current master stay.
+TEST_F(FileStorageTest, CarriedTasksOfAnotherMasterAreDropped) {
+    auto make_task = [](const std::string& key, uint64_t epoch) {
+        return OffloadTaskItem{.tenant_id = "default",
+                               .key = key,
+                               .size = 1,
+                               .task_id = L4TaskId{epoch, 1}};
+    };
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageOffloadObjects(
+        fileStorage, {make_task("old_1", 7), make_task("old_2", 7)}));
+    ASSERT_EQ(GetDeferredTaskByStorageKey(fileStorage).size(), 2u);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2u);
+
+    // Same master: nothing is dropped. No drained id: nothing is known.
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage,
+                                                     {make_task("next", 7)});
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage, {});
+    EXPECT_EQ(GetDeferredTaskByStorageKey(fileStorage).size(), 2u);
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2u);
+
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage,
+                                                     {make_task("next", 8)});
+    EXPECT_TRUE(GetDeferredTaskByStorageKey(fileStorage).empty());
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0u);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {

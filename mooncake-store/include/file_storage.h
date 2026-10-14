@@ -160,6 +160,24 @@ class FileStorage {
         const std::vector<OffloadTaskItem>& offloading_objects);
 
     /**
+     * @brief Handles the offload items of one heartbeat drain: NACKs items
+     * without a task id without copying them, drops carried tasks of another
+     * master (DropCarriedOffloadTasksOfAnotherEpoch), and offloads the rest
+     * (OffloadObjects).
+     */
+    tl::expected<void, ErrorCode> ProcessDrainedOffloads(
+        std::vector<OffloadTaskItem> drained);
+
+    /**
+     * @brief Drops the carried tasks (deferred_task_by_storage_key_) and their
+     * pooled keys whose task id has another epoch than the items just
+     * drained: they belong to a master that is gone, and the current master
+     * refuses their reports, so writing them would only leave orphan files.
+     */
+    void DropCarriedOffloadTasksOfAnotherEpoch(
+        const std::vector<OffloadTaskItem>& drained);
+
+    /**
      * @brief Classifies a BatchOffload error as affecting only the current
      * bucket rather than the whole offload cycle.
      *
