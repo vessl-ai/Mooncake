@@ -55,6 +55,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "handoff/handoff_format.h"
 
 namespace mooncake {
 
@@ -816,6 +817,32 @@ class MasterService {
                                 const TenantId& tenant_id)
         -> tl::expected<void, ErrorCode>;
 
+    // The promotion calls above identify the task by key only. A late call
+    // for an earlier promotion of the key could then stage, commit or free
+    // the buffer of a newer one (a half-written replica made readable, or a
+    // buffer freed while the holder still writes into it). They are kept for
+    // stores that predate task ids and act only where that cannot happen:
+    // PromotionAllocStart and NotifyPromotionSuccess are always refused, and
+    // NotifyPromotionFailure ends only a task that has no staged replica.
+    //
+    // The calls below take the item the holder drained
+    // (PromotionObjectHeartbeat) and act only on the key's task whose id the
+    // item carries; otherwise they behave as the key-only calls did.
+    auto PromotionTaskAllocStart(
+        const UUID& client_id, const PromotionTaskItem& item,
+        const TenantId& tenant_id,
+        const std::vector<std::string>& preferred_segments)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+    auto NotifyPromotionTaskSuccess(const UUID& client_id,
+                                    const PromotionTaskItem& item,
+                                    const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+    // A call for another task than the key's current one is a no-op (OK).
+    auto NotifyPromotionTaskFailure(const UUID& client_id,
+                                    const PromotionTaskItem& item,
+                                    const TenantId& tenant_id)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Create a copy task to copy an object's replicas to target segments
      * @return Copy task ID on success, ErrorCode on failure
@@ -894,6 +921,129 @@ class MasterService {
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
         BatchOpLogPromotionHandoff handoff,
         size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+
+    // ---- Shutdown handoff snapshot (INF-600, fork-only) ----
+    // Stops and joins every background thread and worker that mutates
+    // metadata, segments, clients or allocators (also called by the
+    // destructor). Idempotent. The RPC server must be stopped first.
+    void QuiesceBackgroundWork();
+    // True once QuiesceBackgroundWork() has run and no such thread exists.
+    bool BackgroundWorkQuiesced() const;
+    // Number of objects in the metadata shards (one shard lock at a time).
+    uint64_t HandoffObjectCount() const;
+    // Number of objects with a completed LOCAL_DISK replica (at most one per
+    // object), from the per-shard counters; used by the admission control.
+    uint64_t HandoffLocalDiskObjectCount() const;
+    // Export side. Callers must have stopped the RPC server and quiesced the
+    // background work first, so that nothing allocates or frees store memory
+    // while the export runs.
+    std::vector<handoff::SegmentIdentity> ExportHandoffSegments();
+    // LocalSSD clients whose L4 state is exported: registered and owner of
+    // at least one exported memory segment (L4 is all-or-nothing per store).
+    std::vector<LocalSsdHandoffClient> ExportHandoffLocalDiskClients(
+        const std::vector<handoff::SegmentIdentity>& segments) const;
+    using HandoffClientSet = std::unordered_set<UUID, boost::hash<UUID>>;
+    void ExportHandoffShard(size_t shard_idx,
+                            const handoff::SegmentLocator& locator,
+                            const HandoffClientSet& disk_clients,
+                            std::vector<StandbyObjectEntry>& objects,
+                            std::vector<handoff::QuarantineRange>& quarantine,
+                            handoff::WriterStats& stats) const;
+    bool HandoffEnableOffload() const { return enable_offload_; }
+    // Ranges still quarantined by a previous handoff restore (a roll that
+    // follows a roll within put_start_release_timeout). They must stay
+    // quarantined in the next master as well, for their remaining time.
+    void ExportHandoffPendingQuarantine(
+        const std::vector<handoff::SegmentIdentity>& segments,
+        std::vector<handoff::QuarantineRange>& quarantine,
+        handoff::WriterStats& stats) const;
+    // Memory ranges of discarded replicas (preempted or stale puts, expired
+    // replication tasks, replaced upsert / move sources) that this master
+    // still holds back because a writer or reader may still use them. They
+    // are quarantined in the next master for their remaining time.
+    void ExportHandoffDiscardedQuarantine(
+        const handoff::SegmentLocator& locator,
+        std::vector<handoff::QuarantineRange>& quarantine,
+        handoff::WriterStats& stats);
+    // Hold time of a quarantined range whose remaining time is unknown (an
+    // incomplete replica that is still in the metadata).
+    uint64_t HandoffFullHoldMs() const {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                put_start_release_timeout_sec_)
+                .count());
+    }
+    static size_t HandoffShardCount() { return kNumShards; }
+    static uint64_t HandoffNextReplicaId() { return Replica::next_id_.load(); }
+    bool HandoffMultiTenant() const { return enable_multi_tenants_; }
+
+    struct HandoffRestoreOptions {
+        size_t workers{8};
+    };
+    struct HandoffRestoreStats {
+        uint64_t objects{0};
+        uint64_t replicas{0};
+        uint64_t segments{0};
+        uint64_t chunks{0};
+        uint64_t quarantine_ranges{0};
+        uint64_t schema{0};
+        uint64_t local_disk_clients{0};
+        uint64_t local_disk_replicas{0};
+        uint64_t disk_only_objects{0};
+        uint64_t workers{0};
+        uint64_t manifest_ns{0};
+        uint64_t mount_ns{0};
+        uint64_t insert_wall_ns{0};
+        uint64_t load_cpu_ns{0};
+        uint64_t prepare_cpu_ns{0};
+        uint64_t insert_cpu_ns{0};
+        uint64_t rebuild_wall_ns{0};
+        uint64_t sort_cpu_ns{0};
+        uint64_t import_cpu_ns{0};
+        uint64_t finalize_ns{0};
+        uint64_t total_ns{0};
+        uint64_t rss_kib_start{0};
+        uint64_t rss_kib_after_insert{0};
+        uint64_t rss_kib_end{0};
+        uint64_t hwm_kib_end{0};
+        std::string ToJson() const;
+    };
+    // Restores a handoff snapshot into this (empty, not yet serving) master.
+    // Restored memory segments are mounted with their original identity and
+    // owner but stay unreadable and non-allocatable until the owner remounts
+    // them with the same identity. On any error the master is reset to an
+    // empty state and the error is returned.
+    tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoff(
+        const std::string& dir, const HandoffRestoreOptions& options);
+    // Exclusive-lock hold time of the last ReMountSegment call, and counters
+    // of restored segments confirmed or dropped since start.
+    uint64_t LastRemountLockHoldNs() const {
+        return last_remount_lock_hold_ns_.load(std::memory_order_relaxed);
+    }
+    uint64_t HandoffSegmentsConfirmed() const {
+        return handoff_segments_confirmed_.load(std::memory_order_relaxed);
+    }
+    uint64_t HandoffSegmentsDropped() const {
+        return handoff_segments_dropped_.load(std::memory_order_relaxed);
+    }
+    size_t HandoffPendingSegmentCount() const;
+    size_t HandoffQuarantineBufferCount() const;
+    // Restored L4 owners whose disk replicas are still unreadable (no RPC
+    // from them yet).
+    size_t HandoffDiskClientsPending() const;
+    // The epoch of this instance's L4 task ids (see NextL4TaskId).
+    uint64_t L4TaskEpoch() const { return l4_task_epoch_; }
+    // Releases quarantined ranges whose deadline has passed. Called by the
+    // task cleanup thread; public for tests.
+    void ReleaseExpiredHandoffQuarantine(
+        std::chrono::steady_clock::time_point now);
+    // Forgets restored segments that are still pending although they are no
+    // longer mounted (e.g. unmounted by the TTL offboarding of an owner that
+    // never came back) or were mounted again as fresh segments: lifts their
+    // read gate and releases their quarantine.
+    // Called by the task cleanup thread; public for tests. Returns how many
+    // were forgotten.
+    size_t ReconcileHandoffPendingSegments();
 
     /**
      * @brief Query the status of a task
@@ -1055,7 +1205,7 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, ReplicationTask> replication_tasks;
-        std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
+        std::unordered_map<std::string, OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
             promotion_candidates;
@@ -1548,9 +1698,18 @@ class MasterService {
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
+    // Every mirror's item carries `task_id`, the id of the task the caller
+    // records for these mirrors.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica,
-        std::vector<UUID>* mirror_clients = nullptr);
+        const L4TaskId& task_id, std::vector<UUID>* mirror_clients = nullptr);
+
+    // A new id for an L4 offload or promotion task of this instance:
+    // l4_task_epoch_ and the next sequence number.
+    L4TaskId NextL4TaskId() {
+        return L4TaskId{l4_task_epoch_, next_l4_task_seq_.fetch_add(
+                                            1, std::memory_order_relaxed)};
+    }
 
     // Cancels the offload task on `object_id`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
@@ -1559,6 +1718,18 @@ class MasterService {
     bool CancelQueuedOffloadTask(TenantState& tenant_state,
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
+
+    // Drops the offload task of `key` and releases its source refcnt (when
+    // `metadata` is given and still holds the source). A taker that still
+    // reports it is refused: its report names a task that no longer exists.
+    void ReleaseOffloadingTask(
+        TenantState& tenant_state, ObjectMetadata* metadata,
+        std::unordered_map<std::string, OffloadingTask>::iterator task_it);
+    // Marks `client_id` as a taker of the current offload task of each key
+    // it has just drained (OffloadObjectHeartbeat) and returns the items it
+    // took; only those are handed to the store.
+    std::vector<OffloadTaskItem> RecordOffloadTakers(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& drained);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
@@ -1577,7 +1748,27 @@ class MasterService {
      * recording the task in the shard's promotion_tasks map.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
+        const ObjectIdentity& object_id, Replica& source_replica,
+        const L4TaskId& task_id);
+
+    // Bodies of the promotion calls. `task_id` names the task the caller
+    // acts for (nullopt: a key-only call, see NotifyPromotionFailure).
+    auto PromotionAllocStartFor(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments,
+        const std::optional<L4TaskId>& task_id)
+        -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
+    auto NotifyPromotionSuccessFor(const UUID& client_id,
+                                   const std::string& key,
+                                   const TenantId& tenant_id,
+                                   const std::optional<L4TaskId>& task_id)
+        -> tl::expected<void, ErrorCode>;
+    auto NotifyPromotionFailureFor(const UUID& client_id,
+                                   const std::string& key,
+                                   const TenantId& tenant_id,
+                                   const std::optional<L4TaskId>& task_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
@@ -2293,6 +2484,10 @@ class MasterService {
             return ttl_ <= now;
         }
 
+        // Handoff export (INF-600): the ranges and release time.
+        const std::vector<Replica>& replicas() const { return replicas_; }
+        std::chrono::system_clock::time_point ttl() const { return ttl_; }
+
        private:
         friend class MetadataSerializer;
         std::vector<Replica> replicas_;
@@ -2507,6 +2702,98 @@ class MasterService {
         standby_allocator_keepalive_;
     std::vector<StandbySegmentInfo> standby_memory_segments_;
     std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    // ---- Shutdown handoff restore state (INF-600, fork-only) ----
+    // Restored memory segments whose owner has not yet confirmed them by a
+    // remount with the same identity. Guarded by client_mutex_; changes to
+    // the read gate (invalid_replica_endpoints_) additionally need
+    // snapshot_mutex_ held exclusively.
+    struct PendingRestoredSegment {
+        UUID owner{0, 0};
+        Segment segment;
+    };
+    std::unordered_map<UUID, PendingRestoredSegment, boost::hash<UUID>>
+        pending_restored_segments_;
+    // Ranges the old master still held back (in-flight puts, other
+    // incomplete replicas, discarded replicas), held as allocations until
+    // each one's deadline so that a late write or read cannot touch reused
+    // memory.
+    struct HandoffQuarantinedBuffer {
+        UUID segment_id{0, 0};
+        std::chrono::steady_clock::time_point deadline{};
+        std::unique_ptr<AllocatedBuffer> buffer;
+    };
+    struct HandoffQuarantine {
+        mutable std::mutex mutex;
+        std::vector<HandoffQuarantinedBuffer> buffers;
+    };
+    HandoffQuarantine handoff_quarantine_;
+    std::atomic<uint64_t> last_remount_lock_hold_ns_{0};
+    std::atomic<bool> background_quiesced_{false};
+    // Lets the 1 s / 0.5 s sleeps of the client monitor and job dispatch
+    // threads end early when QuiesceBackgroundWork() stops them.
+    std::mutex background_sleep_mutex_;
+    std::condition_variable background_sleep_cv_;
+    void SleepWhileRunning(std::chrono::milliseconds duration,
+                           const std::atomic<bool>& running);
+    std::atomic<uint64_t> handoff_segments_confirmed_{0};
+    std::atomic<uint64_t> handoff_segments_dropped_{0};
+    // Restored L4 owners: client id -> opened. Keys are fixed by the restore
+    // (before serving) and only cleared by ResetHandoffState; values flip
+    // once, so readers need no lock beyond what they already hold.
+    struct HandoffDiskGate {
+        std::atomic<bool> active{false};
+        std::unordered_map<UUID, std::unique_ptr<std::atomic<bool>>,
+                           boost::hash<UUID>>
+            opened;
+    };
+    HandoffDiskGate handoff_disk_gate_;
+    int64_t handoff_restored_file_capacity_{0};
+    // L4 task ids (NextL4TaskId). The epoch is drawn from OS randomness for
+    // every instance and never carried by the handoff, so a report of a task
+    // of an earlier master (before a roll, a restart or a fail-over) never
+    // matches a task of this one.
+    const uint64_t l4_task_epoch_{DrawL4TaskEpoch()};
+    std::atomic<uint64_t> next_l4_task_seq_{1};
+    static uint64_t DrawL4TaskEpoch();
+
+    tl::expected<HandoffRestoreStats, std::string> RestoreFromHandoffLocked(
+        const std::string& dir, const HandoffRestoreOptions& options);
+    void ResetHandoffState();
+    bool HandoffMasterIsEmpty();
+    // Requires client_mutex_ held exclusively. Returns the pending segments
+    // that `segments` (mounted or remounted by `client_id`) prove stale.
+    std::vector<UUID> FindHandoffMismatchesLocked(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        bool is_remount) const;
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively.
+    // `requester` is the client whose mount or remount proved the segment
+    // stale; if it is not the owner, the owner restarted, so its restored
+    // L4 registration is dropped too.
+    void DropPendingRestoredSegmentLocked(const UUID& segment_id,
+                                          const char* reason,
+                                          const UUID& requester);
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively. Removes
+    // the pending entry, lifts its read gate unless another pending segment
+    // shares an alias, and releases its quarantined ranges (their
+    // registration is invalid once the segment is unmounted).
+    void ForgetPendingRestoredSegmentLocked(
+        std::unordered_map<UUID, PendingRestoredSegment,
+                           boost::hash<UUID>>::iterator it);
+    // Restored L4 gate. Any RPC carrying `client_id` proves the owner process
+    // is alive; its restored LOCAL_DISK replicas become readable.
+    void OpenHandoffDiskGate(const UUID& client_id);
+    bool HandoffDiskGated(const UUID& client_id) const;
+    // Erases from `metadata` a LOCAL_DISK replica owned by another client
+    // that has no LocalSSD registration any more (e.g. a store that
+    // restarted during a handoff roll), so `client_id` can register its own.
+    // Requires the object's shard lock. Returns true if one was erased.
+    bool EraseUnregisteredOwnerDiskReplica(MetadataShardAccessorRW& shard,
+                                           ObjectMetadata& metadata,
+                                           const UUID& client_id);
+    // Requires client_mutex_ and snapshot_mutex_ held exclusively.
+    void ConfirmPendingRestoredSegmentsLocked(
+        const std::vector<Segment>& segments, const UUID& client_id);
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 

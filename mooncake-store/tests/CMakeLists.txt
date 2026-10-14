@@ -64,6 +64,7 @@ set_tests_properties(replica_selection_env_opt_in_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
+add_store_test(l4_task_id_wire_test l4_task_id_wire_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
@@ -74,6 +75,8 @@ endif()
 add_subdirectory(master_service)
 
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(handoff_restore_test handoff_restore_test.cpp)
+add_store_test(handoff_lifecycle_test handoff_lifecycle_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_ha_test(master_service_evict_scenario_test
             master_service_evict_scenario_test.cpp)

@@ -6,6 +6,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
+#include <memory>
+#include <unordered_set>
 #include <string>
 #include <thread>
 
@@ -66,9 +69,173 @@ class FailingReadBackend : public BucketStorageBackend {
     DiskErrorObserver observer_;
 };
 
+// Commit another offload after grouping but before this batch reaches the
+// backend. This deterministically exercises the duplicate race from #4097
+// without relying on a second thread winning a filesystem/RPC race.
+class ConcurrentOffloadBackend : public BucketStorageBackend {
+   public:
+    ConcurrentOffloadBackend(const FileStorageConfig& config,
+                             const BucketBackendConfig& bucket_config,
+                             std::unordered_set<std::string> duplicate_keys,
+                             bool fail_write)
+        : BucketStorageBackend(config, bucket_config),
+          duplicate_keys_(std::move(duplicate_keys)),
+          fail_write_(fail_write) {}
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete,
+        EvictionHandler eviction = nullptr) override {
+        std::unordered_map<std::string, std::vector<Slice>> duplicates;
+        for (const auto& key : duplicate_keys_) {
+            duplicates.emplace(key, batch.at(key));
+        }
+        if (!duplicates.empty()) {
+            // The local commit survives even if its Master notification was
+            // lost. The retry must release its own task without claiming a
+            // new disk replica for the skipped write.
+            auto result =
+                BucketStorageBackend::BatchOffload(duplicates, nullptr);
+            if (!result) return result;
+        }
+        if (fail_write_) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
+                                                  std::move(eviction));
+    }
+
+   private:
+    std::unordered_set<std::string> duplicate_keys_;
+    bool fail_write_;
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    void RunSkippedOffloadScenario(
+        size_t duplicate_count, bool fail_write,
+        StorageBackendType backend_type = StorageBackendType::kBucket) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client_result =
+            Client::Create(endpoint, master.metadata_url(), "tcp", std::nullopt,
+                           master.master_address());
+        ASSERT_TRUE(client_result.has_value());
+        auto client = client_result.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const std::vector<std::string> keys = {"duplicate_key", "other_key"};
+        std::vector<std::string> values = {std::string(128, 'a'),
+                                           std::string(128, 'b')};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            void* buffer = allocator.allocate(values[i].size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, values[i].data(), values[i].size());
+            std::vector<Slice> slices{{buffer, values[i].size()}};
+            ASSERT_TRUE(client->Put(keys[i], slices, replicate));
+            allocator.deallocate(buffer, values[i].size());
+        }
+        std::vector<OffloadTaskItem> tasks;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+        ASSERT_EQ(tasks.size(), keys.size());
+        void* overwrite_buffer = allocator.allocate(values.front().size());
+        ASSERT_NE(overwrite_buffer, nullptr);
+        std::memset(overwrite_buffer, 'c', values.front().size());
+        std::vector<Slice> overwrite{{overwrite_buffer, values.front().size()}};
+        for (const auto& key : keys) {
+            auto blocked = client->Upsert(key, overwrite, replicate);
+            ASSERT_FALSE(blocked.has_value());
+            ASSERT_EQ(blocked.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        }
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = backend_type;
+        config.storage_filepath = data_path + "/skipped_ssd";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage file_storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = keys.size();
+        std::unordered_set<std::string> duplicates;
+        for (size_t i = 0; i < duplicate_count; ++i) {
+            duplicates.insert(TenantId::Default().MakeScopedKey(keys[i]));
+        }
+        if (backend_type == StorageBackendType::kBucket) {
+            file_storage.storage_backend_ =
+                std::make_shared<ConcurrentOffloadBackend>(
+                    config, bucket_config, std::move(duplicates), fail_write);
+        } else {
+            // File-per-key also returns success for a partially written batch
+            // and omits failed keys from its completion callback.
+            file_storage.storage_backend_->SetTestFailurePredicate(
+                [duplicates](const std::string& key) {
+                    return duplicates.count(key) != 0;
+                });
+        }
+        auto backend = file_storage.storage_backend_;
+        ASSERT_TRUE(backend->Init());
+        auto result = file_storage.OffloadObjects(tasks);
+        if (fail_write) {
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+        } else {
+            ASSERT_TRUE(result.has_value());
+        }
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto storage_key = TenantId::Default().MakeScopedKey(keys[i]);
+            const bool persisted = backend_type == StorageBackendType::kBucket
+                                       ? !fail_write || i < duplicate_count
+                                       : i >= duplicate_count;
+            auto exists = backend->IsExist(storage_key);
+            ASSERT_TRUE(exists.has_value());
+            EXPECT_EQ(exists.value(), persisted);
+            if (persisted) {
+                std::string actual(values[i].size(), '\0');
+                std::unordered_map<std::string, Slice> read{
+                    {storage_key, {actual.data(), actual.size()}}};
+                ASSERT_TRUE(backend->BatchLoad(read));
+                EXPECT_EQ(actual, values[i]);
+            }
+            auto query = client->Query(keys[i]);
+            ASSERT_TRUE(query.has_value());
+            size_t disk_replicas = 0;
+            for (const auto& replica : query->replicas) {
+                disk_replicas += replica.is_local_disk_replica();
+            }
+            // Only newly committed keys may register a disk replica. A skip
+            // is a NACK, never a success with a fabricated bucket descriptor.
+            EXPECT_EQ(disk_replicas,
+                      (!fail_write && i >= duplicate_count) ? 1u : 0u);
+            // Upsert is blocked both by an in-flight offload marker and by a
+            // retained source reference. It must become available immediately,
+            // without waiting for the offload task timeout.
+            auto overwritten = client->Upsert(keys[i], overwrite, replicate);
+            EXPECT_TRUE(overwritten.has_value())
+                << keys[i] << ": " << toString(overwritten.error());
+        }
+        allocator.deallocate(overwrite_buffer, values.front().size());
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -177,6 +344,118 @@ class FileStorageTest : public ::testing::Test {
     GetDeferredTaskByStorageKey(FileStorage& fileStorage) {
         return fileStorage.deferred_task_by_storage_key_;
     }
+
+    static tl::expected<void, ErrorCode> FileStorageProcessDrainedOffloads(
+        FileStorage& fileStorage, std::vector<OffloadTaskItem> drained) {
+        return fileStorage.ProcessDrainedOffloads(std::move(drained));
+    }
+
+    static void SetOffloadCompletionRpc(
+        FileStorage& fileStorage,
+        std::function<tl::expected<void, ErrorCode>(
+            const std::vector<OffloadTaskItem>&,
+            const std::vector<StorageObjectMetadata>&)>
+            rpc) {
+        fileStorage.test_offload_completion_rpc_ = std::move(rpc);
+    }
+
+    static bool StorageKeyExists(FileStorage& fileStorage,
+                                 const std::string& key) {
+        auto exists = fileStorage.storage_backend_->IsExist(
+            TenantId::Default().MakeScopedKey(key));
+        EXPECT_TRUE(exists.has_value());
+        return exists.has_value() && exists.value();
+    }
+
+    static void FileStorageDropCarriedOffloadTasksOfAnotherEpoch(
+        FileStorage& fileStorage, const std::vector<OffloadTaskItem>& drained) {
+        fileStorage.DropCarriedOffloadTasksOfAnotherEpoch(drained);
+    }
+
+    // A store with one memory segment and an L4 registration on an in-process
+    // master, and objects put into that segment: the setup of the offload
+    // tests that drain real items.
+    struct OffloadRig {
+        testing::InProcMaster master;
+        std::unique_ptr<void, decltype(&std::free)> segment{nullptr,
+                                                            &std::free};
+        std::unique_ptr<SimpleAllocator> allocator;
+        std::string endpoint;
+        std::shared_ptr<Client> client;
+        static constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+
+        void Start() {
+            ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                         .set_enable_offload(true)
+                                         .set_default_kv_lease_ttl(0)
+                                         .set_root_fs_dir("")
+                                         .build()));
+            segment.reset(allocate_buffer_allocator_memory(kSegmentSize));
+            ASSERT_NE(segment, nullptr);
+            allocator = std::make_unique<SimpleAllocator>(kSegmentSize);
+            endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+            auto client_result =
+                Client::Create(endpoint, master.metadata_url(), "tcp",
+                               std::nullopt, master.master_address());
+            ASSERT_TRUE(client_result.has_value());
+            client = client_result.value();
+            ASSERT_TRUE(
+                client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+            ASSERT_TRUE(client->RegisterLocalMemory(
+                allocator->getBase(), kSegmentSize, "cpu:0", false, false));
+            ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        }
+
+        void Put(const std::string& key, const std::string& value) {
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            void* buffer = allocator->allocate(value.size());
+            ASSERT_NE(buffer, nullptr);
+            std::memcpy(buffer, value.data(), value.size());
+            std::vector<Slice> slices{{buffer, value.size()}};
+            ASSERT_TRUE(client->Put(key, slices, replicate));
+            allocator->deallocate(buffer, value.size());
+        }
+
+        std::vector<OffloadTaskItem> Drain() {
+            std::vector<OffloadTaskItem> items;
+            EXPECT_TRUE(client->OffloadObjectHeartbeat(true, items));
+            return items;
+        }
+
+        size_t DiskReplicas(const std::string& key) {
+            auto query = client->Query(key);
+            EXPECT_TRUE(query.has_value());
+            size_t count = 0;
+            if (query) {
+                for (const auto& replica : query->replicas) {
+                    count += replica.is_local_disk_replica();
+                }
+            }
+            return count;
+        }
+
+        // True while the master still tracks an offload task of the key (an
+        // upsert is refused with OBJECT_HAS_REPLICATION_TASK).
+        bool HasOffloadTask(const std::string& key) {
+            std::string value(128, 'u');
+            void* buffer = allocator->allocate(value.size());
+            EXPECT_NE(buffer, nullptr);
+            std::memcpy(buffer, value.data(), value.size());
+            std::vector<Slice> slices{{buffer, value.size()}};
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            auto upsert = client->Upsert(key, slices, replicate);
+            allocator->deallocate(buffer, value.size());
+            return !upsert.has_value() &&
+                   upsert.error() == ErrorCode::OBJECT_HAS_REPLICATION_TASK;
+        }
+
+        void Stop() {
+            EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+            EXPECT_TRUE(client->unregisterLocalMemory(allocator->getBase()));
+        }
+    };
 
     static void FileStoragePartitionUnbucketedTasks(
         const std::unordered_map<std::string, OffloadTaskItem>&
@@ -422,8 +701,96 @@ class FileStorageTest : public ::testing::Test {
         fenced = fileStorage.disk_fenced_.load();
     }
 
+    // The master registers a LOCAL_DISK replica only as the completion of
+    // an offload task the store drained. Sets that up the way production
+    // does: each key gets a memory replica on a placeholder segment owned by
+    // the store's client (PutEnd queues the offload), then the store's
+    // offload heartbeat drains the tasks. Returns the placeholder segment,
+    // for DropMemoryCopies once the offload is complete; the drained items
+    // (which a completion must echo, task id included) go to `drained_out`.
+    static Segment PrepareDrainedOffloads(
+        testing::InProcMaster& master, Client& client,
+        const std::vector<std::string>& keys, uint64_t size,
+        std::vector<OffloadTaskItem>* drained_out = nullptr,
+        const std::string& tenant_id = "default") {
+        static std::atomic<uint64_t> next_base{0x7e0000000000ULL};
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.base = next_base.fetch_add(0x10000000ULL);
+        segment.size = 64 * 1024 * 1024;
+        segment.name = "offload-source-" + std::to_string(segment.base);
+        segment.te_endpoint = segment.name;
+        EXPECT_TRUE(master.service()
+                        ->MountSegment(segment, client.getClientId())
+                        .has_value());
+        for (const auto& key : keys) {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = segment.name;
+            EXPECT_TRUE(master.service()
+                            ->PutStart(client.getClientId(), key, size, config,
+                                       tenant_id)
+                            .has_value());
+            EXPECT_TRUE(master.service()
+                            ->PutEnd(client.getClientId(),
+                                     ObjectMeta{key, std::nullopt},
+                                     ReplicaType::MEMORY, tenant_id)
+                            .has_value());
+            // These masters also allocate a DISK (root_fs_dir) replica that
+            // nobody writes here; drop it.
+            (void)master.service()->PutRevoke(client.getClientId(), key,
+                                              ReplicaType::DISK, tenant_id);
+        }
+        std::vector<OffloadTaskItem> drained;
+        EXPECT_TRUE(client.OffloadObjectHeartbeat(true, drained).has_value());
+        EXPECT_EQ(drained.size(), keys.size());
+        if (drained_out != nullptr) {
+            *drained_out = std::move(drained);
+        }
+        return segment;
+    }
+
+    // The drained items for the keys a backend completion callback reports
+    // (plain or tenant-scoped keys), in the same order.
+    static std::vector<OffloadTaskItem> DrainedItemsFor(
+        const std::vector<OffloadTaskItem>& drained,
+        const std::vector<std::string>& keys) {
+        std::vector<OffloadTaskItem> items;
+        for (const auto& key : keys) {
+            auto it = std::find_if(
+                drained.begin(), drained.end(),
+                [&key](const OffloadTaskItem& item) {
+                    return item.key == key ||
+                           TenantId(item.tenant_id).MakeScopedKey(item.key) ==
+                               key;
+                });
+            EXPECT_NE(it, drained.end()) << key;
+            if (it != drained.end()) {
+                items.push_back(*it);
+            }
+        }
+        return items;
+    }
+
+    // Drops the memory copies made by PrepareDrainedOffloads, leaving
+    // LOCAL_DISK-only objects, and unmounts the placeholder segment so that
+    // no later put is placed on it. Default tenant only: this fork's RPC
+    // wrapper of BatchReplicaClear takes no tenant.
+    static void DropMemoryCopies(testing::InProcMaster& master, Client& client,
+                                 const std::vector<std::string>& keys,
+                                 const Segment& segment) {
+        auto cleared = master.service()->BatchReplicaClear(
+            keys, client.getClientId(), segment.name);
+        ASSERT_TRUE(cleared.has_value());
+        EXPECT_EQ(cleared->size(), keys.size());
+        EXPECT_TRUE(master.service()
+                        ->UnmountSegment(segment.id, client.getClientId())
+                        .has_value());
+    }
+
     void AssertHeartbeatEvictsAllKeys(
-        FileStorage& fileStorage, const std::vector<std::string>& expected_keys,
+        testing::InProcMaster& master, FileStorage& fileStorage,
+        const std::vector<std::string>& expected_keys,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_object) {
         ASSERT_TRUE(fileStorage.storage_backend_->Init());
@@ -431,16 +798,19 @@ class FileStorageTest : public ::testing::Test {
             MutexLocker locker(&fileStorage.offloading_mutex_);
             fileStorage.enable_offloading_ = true;
         }
+        std::vector<OffloadTaskItem> drained;
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *fileStorage.client_, expected_keys, 512, &drained);
 
         auto offload_result = fileStorage.storage_backend_->BatchOffload(
-            batch_object,
-            [&fileStorage](const std::vector<std::string>& keys,
-                           std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&fileStorage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = fileStorage.local_rpc_addr_;
                 }
-                auto result =
-                    fileStorage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = fileStorage.client_->NotifyOffloadTaskSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 if (!result) {
                     return result.error();
                 }
@@ -449,6 +819,8 @@ class FileStorageTest : public ::testing::Test {
         ASSERT_TRUE(offload_result.has_value());
         ASSERT_EQ(offload_result.value(),
                   static_cast<int64_t>(expected_keys.size()));
+        DropMemoryCopies(master, *fileStorage.client_, expected_keys,
+                         source_segment);
 
         for (const auto& key : expected_keys) {
             auto query_result = fileStorage.client_->Query(key);
@@ -534,22 +906,26 @@ class FileStorageTest : public ::testing::Test {
         // Offload one key so master tracks a LOCAL_DISK replica backed by a
         // real file on the client SSD.
         const std::string key = "heal_key" + suffix;
+        std::vector<OffloadTaskItem> drained;
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *client.value(), {key}, 512, &drained);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         batch_object.emplace(key,
                              std::vector<Slice>{Slice{original.data(), 512}});
         auto offload_result = file_storage.storage_backend_->BatchOffload(
-            batch_object,
-            [&file_storage](const std::vector<std::string>& keys,
-                            std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&file_storage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result =
-                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = file_storage.client_->NotifyOffloadTaskSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
+        DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
         // Wire the probe the way RealClient does in production: existence
         // against this process's offload files.
@@ -656,6 +1032,9 @@ class FileStorageTest : public ::testing::Test {
         // divergence on both.
         const std::vector<std::string> wiped_keys = {"heal_batch_a",
                                                      "heal_batch_b"};
+        std::vector<OffloadTaskItem> drained;
+        const auto source_segment = PrepareDrainedOffloads(
+            master, *client.value(), wiped_keys, 512, &drained);
         std::string original(512, 'x');
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
         for (const auto& key : wiped_keys) {
@@ -663,17 +1042,18 @@ class FileStorageTest : public ::testing::Test {
                 key, std::vector<Slice>{Slice{original.data(), 512}});
         }
         auto offload_result = file_storage.storage_backend_->BatchOffload(
-            batch_object,
-            [&file_storage](const std::vector<std::string>& keys,
-                            std::vector<StorageObjectMetadata>& metadatas) {
+            batch_object, [&file_storage, &drained](
+                              const std::vector<std::string>& keys,
+                              std::vector<StorageObjectMetadata>& metadatas) {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = file_storage.local_rpc_addr_;
                 }
-                auto result =
-                    file_storage.client_->NotifyOffloadSuccess(keys, metadatas);
+                auto result = file_storage.client_->NotifyOffloadTaskSuccess(
+                    DrainedItemsFor(drained, keys), metadatas);
                 return result ? ErrorCode::OK : result.error();
             });
         ASSERT_TRUE(offload_result.has_value());
+        DropMemoryCopies(master, *client.value(), wiped_keys, source_segment);
 
         client.value()->SetLocalDiskProbe(
             [&file_storage](const std::string& k) -> std::optional<bool> {
@@ -733,6 +1113,30 @@ class FileStorageTest : public ::testing::Test {
         std::free(seg_ptr);
     }
 };
+
+TEST_F(FileStorageTest, SkippedOffloadAllDuplicatesReleaseSourceTasks) {
+    RunSkippedOffloadScenario(2, false);
+}
+
+TEST_F(FileStorageTest, SkippedOffloadMixedBatchReleasesSourceTasks) {
+    RunSkippedOffloadScenario(1, false);
+}
+
+TEST_F(FileStorageTest, SkippedOffloadFreshBatchKeepsSuccessNotifications) {
+    RunSkippedOffloadScenario(0, false);
+}
+
+TEST_F(FileStorageTest, SkippedOffloadPartialFileWriteReleasesSourceTasks) {
+    RunSkippedOffloadScenario(1, false, StorageBackendType::kFilePerKey);
+}
+
+TEST_F(FileStorageTest, SkippedOffloadAllFileWritesFailReleasesSourceTasks) {
+    RunSkippedOffloadScenario(2, false, StorageBackendType::kFilePerKey);
+}
+
+TEST_F(FileStorageTest, SkippedOffloadWriteFailureReleasesAllSourceTasks) {
+    RunSkippedOffloadScenario(1, true);
+}
 
 TEST_F(FileStorageTest, IsEnableOffloading) {
     std::unordered_map<std::string, std::string> all_object;
@@ -1272,6 +1676,169 @@ TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
     // PartitionUnbucketedTasks_redrained_then_skipped.
 }
 
+// An item without a task id comes from a master that matches reports by key
+// alone: the store NACKs it without copying (the master ends its task), and
+// still offloads the items that carry an id.
+TEST_F(FileStorageTest, ItemsWithoutTaskIdAreNackedNotCopied) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("plain_key", std::string(128, 'p'));
+    rig.Put("tagged_key", std::string(128, 't'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 2u);
+    for (auto& item : items) {
+        ASSERT_TRUE(item.task_id.has_value());
+        if (item.key == "plain_key") item.task_id.reset();
+    }
+    ASSERT_TRUE(rig.HasOffloadTask("plain_key"));
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/no_task_id_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, items));
+
+    EXPECT_FALSE(StorageKeyExists(file_storage, "plain_key"));
+    EXPECT_EQ(rig.DiskReplicas("plain_key"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("plain_key"));
+
+    EXPECT_TRUE(StorageKeyExists(file_storage, "tagged_key"));
+    EXPECT_EQ(rig.DiskReplicas("tagged_key"), 1u);
+    rig.Stop();
+}
+
+// A task carried across a bucket deferral (#3006) is reported, possibly
+// several heartbeats later, with the id of the item that was drained for
+// it, so the master registers it.
+TEST_F(FileStorageTest, CarriedTaskReportsEchoTheirTaskId) {
+    OffloadRig rig;
+    rig.Start();
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "2");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/carry_echo_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+
+    rig.Put("first_key", std::string(128, 'f'));
+    auto first = rig.Drain();
+    ASSERT_EQ(first.size(), 1u);
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, first));
+    // Not enough for a bucket: carried, not reported.
+    ASSERT_EQ(GetDeferredTaskByStorageKey(file_storage).size(), 1u);
+    EXPECT_EQ(rig.DiskReplicas("first_key"), 0u);
+
+    rig.Put("second_key", std::string(128, 's'));
+    auto second = rig.Drain();
+    ASSERT_EQ(second.size(), 1u);
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(file_storage, second));
+    EXPECT_TRUE(GetDeferredTaskByStorageKey(file_storage).empty());
+    EXPECT_EQ(rig.DiskReplicas("first_key"), 1u);
+    EXPECT_EQ(rig.DiskReplicas("second_key"), 1u);
+    rig.Stop();
+}
+
+// A completion is registered only through NotifyOffloadTaskSuccess; the old
+// RPC name carries NACKs (and refuses completions), so a master that predates
+// task ids, which only knows the old name, can never register one.
+TEST_F(FileStorageTest, CompletionsRegisterOnlyThroughTheTaskRpc) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("done_key", std::string(128, 'd'));
+    rig.Put("nack_key", std::string(128, 'n'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 2u);
+    std::vector<OffloadTaskItem> done, nacked;
+    for (const auto& item : items) {
+        (item.key == "done_key" ? done : nacked).push_back(item);
+    }
+    StorageObjectMetadata file{.bucket_id = 1,
+                               .offset = 0,
+                               .key_size = 8,
+                               .data_size = 128,
+                               .transport_endpoint = rig.endpoint};
+    ASSERT_TRUE(rig.client->NotifyOffloadSuccess(done, {file}));
+    EXPECT_EQ(rig.DiskReplicas("done_key"), 0u);
+    EXPECT_TRUE(rig.HasOffloadTask("done_key"));
+    ASSERT_TRUE(rig.client->NotifyOffloadTaskSuccess(done, {file}));
+    EXPECT_EQ(rig.DiskReplicas("done_key"), 1u);
+
+    StorageObjectMetadata nack{-1, 0, 0, -1, ""};
+    ASSERT_TRUE(rig.HasOffloadTask("nack_key"));
+    ASSERT_TRUE(rig.client->NotifyOffloadSuccess(nacked, {nack}));
+    EXPECT_FALSE(rig.HasOffloadTask("nack_key"));
+    rig.Stop();
+}
+
+// When the completion RPC fails (e.g. "function not registered" from a master
+// that predates task ids), the store rolls the bucket back and NACKs: no file
+// stays behind that a key-only master could register.
+TEST_F(FileStorageTest, CompletionRpcErrorRollsTheBucketBack) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("rollback_key", std::string(128, 'r'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 1u);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/rollback_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    int completion_calls = 0;
+    SetOffloadCompletionRpc(file_storage,
+                            [&completion_calls](const auto&, const auto&) {
+                                ++completion_calls;
+                                return tl::expected<void, ErrorCode>(
+                                    tl::make_unexpected(ErrorCode::RPC_FAIL));
+                            });
+    (void)FileStorageProcessDrainedOffloads(file_storage, items);
+
+    EXPECT_EQ(completion_calls, 1);
+    EXPECT_FALSE(StorageKeyExists(file_storage, "rollback_key"));
+    EXPECT_EQ(rig.DiskReplicas("rollback_key"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));  // NACKed
+    rig.Stop();
+}
+
+// Carried tasks of another master (another epoch) are dropped together with
+// their pooled keys once the store drains items of the current master; those
+// of the current master stay.
+TEST_F(FileStorageTest, CarriedTasksOfAnotherMasterAreDropped) {
+    auto make_task = [](const std::string& key, uint64_t epoch) {
+        return OffloadTaskItem{.tenant_id = "default",
+                               .key = key,
+                               .size = 1,
+                               .task_id = L4TaskId{epoch, 1}};
+    };
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageOffloadObjects(
+        fileStorage, {make_task("old_1", 7), make_task("old_2", 7)}));
+    ASSERT_EQ(GetDeferredTaskByStorageKey(fileStorage).size(), 2u);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2u);
+
+    // Same master: nothing is dropped. No drained id: nothing is known.
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage,
+                                                     {make_task("next", 7)});
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage, {});
+    EXPECT_EQ(GetDeferredTaskByStorageKey(fileStorage).size(), 2u);
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2u);
+
+    FileStorageDropCarriedOffloadTasksOfAnotherEpoch(fileStorage,
+                                                     {make_task("next", 8)});
+    EXPECT_TRUE(GetDeferredTaskByStorageKey(fileStorage).empty());
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0u);
+}
+
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
     std::filesystem::path master_root =
         std::filesystem::path(data_path) / "heartbeat_master";
@@ -1315,7 +1882,8 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
         buffers.push_back(std::move(buffer));
     }
 
-    AssertHeartbeatEvictsAllKeys(file_storage, expected_keys, batch_object);
+    AssertHeartbeatEvictsAllKeys(master, file_storage, expected_keys,
+                                 batch_object);
 }
 
 // A drain deregisters the disk tier; the heartbeat re-mounts the segment
@@ -1429,10 +1997,16 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
     FileStorage file_storage(config, client.value(), local_rpc_addr);
 
     const std::string key = "shared_key";
-    std::vector<OffloadTaskItem> tasks = {
-        {.tenant_id = "tenant_a", .key = key, .size = 128},
-        {.tenant_id = "tenant_b", .key = key, .size = 128},
-    };
+    // Multi-tenancy is off here, so both tenants name the same object.
+    std::vector<OffloadTaskItem> drained;
+    const auto source_segment =
+        PrepareDrainedOffloads(master, *client.value(), {key}, 128, &drained);
+    ASSERT_EQ(drained.size(), 1u);
+    // The drained item reported under both tenant names: the first report
+    // registers the disk replica, the second finds the task ended.
+    std::vector<OffloadTaskItem> tasks = {drained.front(), drained.front()};
+    tasks[0].tenant_id = "tenant_a";
+    tasks[1].tenant_id = "tenant_b";
     std::vector<StorageObjectMetadata> metadatas;
     metadatas.reserve(tasks.size());
     for (const auto& task : tasks) {
@@ -1444,7 +2018,8 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
             .transport_endpoint = local_rpc_addr,
         });
     }
-    ASSERT_TRUE(client.value()->NotifyOffloadSuccess(tasks, metadatas));
+    ASSERT_TRUE(client.value()->NotifyOffloadTaskSuccess(tasks, metadatas));
+    DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
     for (const auto& task : tasks) {
         auto before = client.value()->BatchQuery({key}, task.tenant_id);
@@ -1839,6 +2414,144 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
         client.value()->OffloadObjectHeartbeat(true, offload_items);
     ASSERT_FALSE(heartbeat_rpc.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+// A store whose LOCAL_DISK registration is new (here: re-mounted after the
+// master forgot it) drops the files it holds before it takes any task. The
+// master never registers a file the store already had, so such files could
+// only block a fresh offload of their keys.
+TEST_F(FileStorageTest, RemountAfterSegmentNotFoundDropsUnregisteredFiles) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "remount_wipe_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/remount_wipe";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+    ASSERT_TRUE(file_storage.storage_backend_->Init());
+    {
+        MutexLocker locker(&file_storage.offloading_mutex_);
+        file_storage.enable_offloading_ = true;
+    }
+
+    // A file the master does not know (e.g. left by a removed key).
+    const std::string key = "remount_wipe_key";
+    std::string bytes(512, 'o');
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    batch_object.emplace(key, std::vector<Slice>{Slice{bytes.data(), 512}});
+    ASSERT_TRUE(file_storage.storage_backend_
+                    ->BatchOffload(batch_object,
+                                   [](const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&) {
+                                       return ErrorCode::OK;
+                                   })
+                    .has_value());
+    ASSERT_TRUE(file_storage.Exists(key).value_or(false));
+
+    // The master forgets the store's LOCAL_DISK segment.
+    ASSERT_TRUE(client.value()->UnmountLocalDiskSegment().has_value());
+
+    ASSERT_TRUE(FileStorageHeartbeat(file_storage).has_value());
+    auto exists = file_storage.Exists(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+    // The segment is registered again, and nothing was registered from the
+    // dropped file.
+    std::vector<OffloadTaskItem> items;
+    EXPECT_TRUE(client.value()->OffloadObjectHeartbeat(true, items));
+    auto query = client.value()->Query(key);
+    ASSERT_FALSE(query.has_value());
+    EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+// The store reports an offload only if the memory replica it copied from
+// still exists after the copy: a removed and re-put key has a new replica.
+TEST_F(FileStorageTest, OffloadSourcesUnchangedDetectsAReplacedSource) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "source_check_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    // No root_fs_dir: a DISK replica still being written would make the
+    // force remove below fail with REPLICA_IS_NOT_READY.
+    auto master_config =
+        InProcMasterConfigBuilder().set_enable_offload(true).build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    constexpr size_t kSegSize = 64 * 1024 * 1024;
+    void* seg_ptr = allocate_buffer_allocator_memory(kSegSize);
+    ASSERT_NE(seg_ptr, nullptr);
+    ASSERT_TRUE(
+        client.value()->MountSegment(seg_ptr, kSegSize, "tcp").has_value());
+    SimpleAllocator allocator(16 * 1024 * 1024);
+    ASSERT_TRUE(client.value()
+                    ->RegisterLocalMemory(allocator.getBase(), 16 * 1024 * 1024,
+                                          "cpu:0", false, false)
+                    .has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/source_check";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    const std::string key = "source_check_key";
+    auto put = [&](char fill) {
+        void* buf = allocator.allocate(512);
+        ASSERT_NE(buf, nullptr);
+        std::memset(buf, fill, 512);
+        std::vector<Slice> slices{Slice{buf, 512}};
+        ReplicateConfig cfg;
+        cfg.replica_num = 1;
+        ASSERT_TRUE(client.value()->Put(key, slices, cfg).has_value());
+        allocator.deallocate(buf, 512);
+    };
+    put('a');
+    std::unordered_map<std::string, std::vector<Slice>> slices;
+    std::unordered_map<std::string, ReplicaID> ids;
+    ASSERT_TRUE(
+        file_storage.BatchQuerySegmentSlices({key}, "default", slices, &ids));
+    ASSERT_EQ(ids.size(), 1u);
+    const std::string storage_key = TenantId("default").MakeScopedKey(key);
+    const std::unordered_map<std::string, OffloadTaskItem> tasks{
+        {storage_key,
+         OffloadTaskItem{.tenant_id = "default", .key = key, .size = 512}}};
+    const std::unordered_map<std::string, ReplicaID> sources{
+        {storage_key, ids.at(key)}};
+    EXPECT_TRUE(
+        file_storage.OffloadSourcesUnchanged({storage_key}, tasks, sources));
+
+    // The key is removed and put again while the store would be copying.
+    ASSERT_TRUE(client.value()->Remove(key, true).has_value());
+    put('b');
+    EXPECT_FALSE(
+        file_storage.OffloadSourcesUnchanged({storage_key}, tasks, sources));
+
+    EXPECT_TRUE(client.value()->UnmountSegment(seg_ptr, kSegSize).has_value());
+    std::free(seg_ptr);
 }
 
 }  // namespace mooncake

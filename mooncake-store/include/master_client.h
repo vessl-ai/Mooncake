@@ -486,16 +486,21 @@ class MasterClient {
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     /**
-     * @brief Adds multiple new objects to a specified client in batch.
-     * @param keys         A list of object keys (names) that were successfully
-     * offloaded.
+     * @brief Reports offload results (completions, and NACKs with
+     * data_size < 0) for the items the client drained.
+     * @param tasks        The drained items, echoed with their task ids.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    /**
+     * @brief Reports offload completions (and NACKs) under the RPC name that
+     * only masters with task ids know; the only way a completion is
+     * registered. An older master answers with an RPC error.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
@@ -542,6 +547,19 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    /**
+     * @brief The promotion calls of a store that names the task by the item
+     * it drained (task id; see MasterService::PromotionTaskAllocStart).
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const UUID& client_id,
+                            const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const UUID& client_id, const PromotionTaskItem& item);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const UUID& client_id, const PromotionTaskItem& item);
 
     /**
      * @brief Start a copy operation
