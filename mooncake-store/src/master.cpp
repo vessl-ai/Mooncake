@@ -1,7 +1,14 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <malloc.h>
 #include <unistd.h>
+
+// The shutdown handoff's trim step calls glibc's malloc_trim(). Same guard as
+// MasterService::MaybeTrimHeap() (master_service.cpp): jemalloc implements no
+// malloc_trim() and a non-glibc libc may not have it, so those builds skip
+// the step.
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
@@ -1732,7 +1739,12 @@ void RunHandoffAtStartup(HandoffContext& ctx,
     steps.stop_serving = stop_serving;
     steps.quiesce = [&service]() { service.QuiesceBackgroundWork(); };
     if (FLAGS_handoff_malloc_trim) {
+#if !defined(STORE_USE_JEMALLOC) && defined(__GLIBC__)
         steps.trim = []() { malloc_trim(0); };
+#else
+        LOG(WARNING) << "handoff_malloc_trim ignored: this build has no "
+                        "glibc malloc_trim() (jemalloc or another libc)";
+#endif
     }
     steps.read_memory = [&ctx]() { return h::ReadMemorySnapshot(ctx.cgroup); };
     steps.object_count = [&service]() { return service.HandoffObjectCount(); };
