@@ -925,7 +925,6 @@ class MasterService {
                             std::vector<handoff::OffloadPin>& pins,
                             handoff::WriterStats& stats) const;
     bool HandoffEnableOffload() const { return enable_offload_; }
-    WeightMetadataSnapshot ExportHandoffWeightMetadata() const;
     // Ranges still quarantined by a previous handoff restore (a roll that
     // follows a roll within put_start_release_timeout). They must stay
     // quarantined in the next master as well.

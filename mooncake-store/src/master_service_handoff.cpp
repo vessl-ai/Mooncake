@@ -12,8 +12,8 @@
 //   2. Per segment, in parallel: sort, import the live and quarantined ranges
 //      into the real allocator, and swap each placeholder buffer for the
 //      imported one, bound to the segment registration.
-//   3. Finalize: replica id floor, weight metadata, tenant quota, metrics,
-//      quarantine deadline, fresh liveness timestamps.
+//   3. Finalize: replica id floor, tenant quota, metrics, quarantine
+//      deadline, fresh liveness timestamps.
 // A remount by the owner with the same segment identity then only opens the
 // segment (see ConfirmPendingRestoredSegmentsLocked); a mismatch drops it
 // (see FindHandoffMismatchesLocked / DropPendingRestoredSegmentLocked).
@@ -285,10 +285,6 @@ void MasterService::ExportHandoffShard(
     }
 }
 
-WeightMetadataSnapshot MasterService::ExportHandoffWeightMetadata() const {
-    return weight_manager_.ExportSnapshot();
-}
-
 void MasterService::ExportHandoffPendingQuarantine(
     const std::vector<handoff::SegmentIdentity>& segments,
     std::vector<handoff::QuarantineRange>& quarantine,
@@ -454,19 +450,12 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
     if (auto invalid = handoff::ValidateSegments(manifest->segments)) {
         return tl::make_unexpected(*invalid);
     }
-    std::optional<WeightMetadataSnapshot> weight_metadata;
+    // This fork's master has no weight management, so its writer never
+    // writes weight metadata. A snapshot that carries some was written by
+    // another build; restoring it would silently drop that state.
     if (manifest->weight_metadata) {
-        auto bytes =
-            handoff::ReadVerifiedBlob(dir, manifest->weight_metadata->key,
-                                      manifest->weight_metadata->bytes,
-                                      manifest->weight_metadata->crc32c);
-        if (!bytes) return tl::make_unexpected(bytes.error());
-        auto decoded = DecodeBatchOpLogSnapshotWeightMetadata(*bytes);
-        if (!decoded) return tl::make_unexpected(decoded.error());
-        if (!ValidateWeightMetadataSnapshot(*decoded)) {
-            return tl::make_unexpected("invalid weight metadata");
-        }
-        weight_metadata = std::move(*decoded);
+        return tl::make_unexpected(
+            "weight metadata is not supported by this build");
     }
     std::vector<handoff::QuarantineRange> quarantine_ranges;
     {
@@ -945,11 +934,6 @@ MasterService::RestoreFromHandoffLocked(const std::string& dir,
         while (current_next_id < desired_next_id &&
                !Replica::next_id_.compare_exchange_weak(current_next_id,
                                                         desired_next_id)) {
-        }
-    }
-    if (weight_metadata) {
-        if (!weight_manager_.RestoreSnapshot(*weight_metadata)) {
-            return tl::make_unexpected("weight metadata restore failed");
         }
     }
     if (enable_multi_tenants_) {

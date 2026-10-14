@@ -317,19 +317,10 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
     // including ids of objects that were left out.
     manifest.next_replica_id = MasterService::HandoffNextReplicaId();
 
-    // ---- Small files: weight metadata, quarantine, upstream compatibility
-    // artifacts, then the handoff manifest last.
+    // ---- Small files: quarantine, upstream compatibility artifacts, then
+    // the handoff manifest last. This fork's master has no weight
+    // management, so no weight metadata is written.
     t = SteadyClock::now();
-    const auto weight = service.ExportHandoffWeightMetadata();
-    const auto weight_bytes = EncodeBatchOpLogSnapshotWeightMetadata(weight);
-    auto weight_blob =
-        WriteBlob(root,
-                  ha::BuildBatchOpLogSnapshotWeightMetadataKey(
-                      handoff::kHandoffSnapshotRoot, manifest.snapshot_id),
-                  weight_bytes.data(), weight_bytes.size(), options.durable);
-    if (!weight_blob) return tl::make_unexpected(weight_blob.error());
-    manifest.weight_metadata = *weight_blob;
-
     const auto quarantine_bytes = handoff::EncodeQuarantine(quarantine);
     auto quarantine_blob = WriteBlob(root, handoff::kHandoffQuarantineFile,
                                      quarantine_bytes.data(),
@@ -373,9 +364,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         segments_bytes.data(), segments_bytes.size(), options.durable);
     if (!segments_blob) return tl::make_unexpected(segments_blob.error());
     ha::BatchOpLogSnapshotManifest upstream_manifest;
-    upstream_manifest.schema_version =
-        ha::kBatchOpLogWeightSnapshotSchemaVersion;
-    upstream_manifest.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    upstream_manifest.schema_version = ha::kBatchOpLogSnapshotSchemaVersion;
+    upstream_manifest.snapshot_format = ha::kBatchOpLogSnapshotFormat;
     upstream_manifest.snapshot_id = manifest.snapshot_id;
     upstream_manifest.segments = {segments_blob->key, segments_blob->bytes,
                                   segments_blob->crc32c};
@@ -383,8 +373,6 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         upstream_manifest.object_chunks.push_back(
             {c.index, c.key, c.objects, c.bytes, c.crc32c});
     }
-    upstream_manifest.weight_metadata = ha::BatchOpLogSnapshotObjectDescriptor{
-        weight_blob->key, weight_blob->bytes, weight_blob->crc32c};
     const std::string upstream_manifest_json =
         ha::EncodeBatchOpLogSnapshotManifest(upstream_manifest);
     const std::string upstream_manifest_key =
@@ -397,8 +385,8 @@ tl::expected<HandoffWriteResult, std::string> WriteHandoffSnapshot(
         return tl::make_unexpected(upstream_manifest_blob.error());
     }
     ha::BatchOpLogSnapshotDescriptor descriptor;
-    descriptor.schema_version = ha::kBatchOpLogWeightSnapshotSchemaVersion;
-    descriptor.snapshot_format = ha::kBatchOpLogWeightSnapshotFormat;
+    descriptor.schema_version = ha::kBatchOpLogSnapshotSchemaVersion;
+    descriptor.snapshot_format = ha::kBatchOpLogSnapshotFormat;
     descriptor.snapshot_id = manifest.snapshot_id;
     descriptor.manifest_key = upstream_manifest_key;
     descriptor.manifest_size = upstream_manifest_json.size();
