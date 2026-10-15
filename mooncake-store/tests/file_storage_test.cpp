@@ -3,11 +3,14 @@
 
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -64,9 +67,53 @@ class FailingReadBackend : public BucketStorageBackend {
     int loads = 0;
     int offloads = 0;
 
-   private:
+   protected:
     int read_errno_;
     DiskErrorObserver observer_;
+};
+
+// Parks every offload write until Release(), the way a hung device parks the
+// heartbeat thread inside OffloadObjects with no errno; the write then fails
+// with EIO, as it does once the device errors out.
+class HangingWriteBackend : public FailingReadBackend {
+   public:
+    using FailingReadBackend::FailingReadBackend;
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>&,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>,
+        EvictionHandler = nullptr) override {
+        ++offloads;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            in_write_ = true;
+            cv_.notify_all();
+            cv_.wait(lock, [this] { return released_; });
+        }
+        observer_(EIO, "pwritev");
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    bool WaitForWrite() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(10),
+                            [this] { return in_write_; });
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool in_write_ = false;
+    bool released_ = false;
 };
 
 // Commit another offload after grouping but before this batch reaches the
@@ -507,6 +554,16 @@ class FileStorageTest : public ::testing::Test {
     // finished, get SEGMENT_NOT_FOUND, and re-mount the segment.
     tl::expected<void, ErrorCode> DrainWhileHeartbeatTickParked(
         FileStorage& fileStorage) {
+        return WhileHeartbeatTickParked(fileStorage, [&fileStorage] {
+            return fileStorage.DrainLocalDiskSegment(0);
+        });
+    }
+
+    // The same interleaving with any deregistering call (a drain, an
+    // external fence) in place of the drain.
+    tl::expected<void, ErrorCode> WhileHeartbeatTickParked(
+        FileStorage& fileStorage,
+        const std::function<tl::expected<void, ErrorCode>()>& deregister) {
         // The parked tick may win the lock and run a full pass, which is
         // only supported on an initialized backend (Init() is also what
         // starts the heartbeat thread in production).
@@ -524,9 +581,8 @@ class FileStorageTest : public ::testing::Test {
             // that has not reached the lock is caught by the entry check
             // instead -- the pause just pins the adversarial schedule.
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            drain_thread = std::thread([&fileStorage, &drain_result] {
-                drain_result = fileStorage.DrainLocalDiskSegment(0);
-            });
+            drain_thread = std::thread(
+                [&deregister, &drain_result] { drain_result = deregister(); });
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         heartbeat_thread.join();
@@ -555,9 +611,26 @@ class FileStorageTest : public ::testing::Test {
         bool fenced_offload_reached_backend = false;
         size_t carried_before_fence = 0;  // carry_before_fence only
         size_t carried_after_fence = 0;   // carried tasks + pooled keys
+        // ExternalFence only: FenceLocalDisk's result, the segment and the
+        // carried tasks (not pooled keys) right after it, and a second call
+        // after the heartbeats.
+        bool external_fence_ok = false;
+        bool mounted_after_external_fence = true;
+        size_t carried_after_external_fence = 0;
+        bool external_fence_again_ok = false;
     };
 
     static constexpr int kRealFilesystemCheck = -1;
+
+    // When RunDiskErrorScenario calls FenceLocalDisk, if at all.
+    // kWhileWriteHangs: a heartbeat takes the queued task and parks in its
+    // write (HangingWriteBackend); the fence and the reads run meanwhile.
+    enum class ExternalFence {
+        kNone,
+        kBeforeReads,
+        kAfterReads,
+        kWhileWriteHangs
+    };
 
     // True if a serialized metric text has a sample (not only # HELP/# TYPE)
     // for the metric.
@@ -572,10 +645,13 @@ class FileStorageTest : public ::testing::Test {
     // directory). One put leaves an offload task queued at the master for
     // this store. Runs two reads, then two heartbeats, and records what
     // happened. With carry_before_fence, one heartbeat first takes the task
-    // and defers its key to the backend's ungrouped pool (#3006 carry).
+    // and defers its key to the backend's ungrouped pool (#3006 carry). With
+    // external, FenceLocalDisk runs before the reads, after them or while a
+    // write hangs, and once more after the heartbeats.
     void RunDiskErrorScenario(const std::string& name, int read_errno,
                               int check_errno, DiskFenceOutcome& out,
-                              bool carry_before_fence = false) {
+                              bool carry_before_fence = false,
+                              ExternalFence external = ExternalFence::kNone) {
         testing::InProcMaster master;
         ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
                                      .set_enable_offload(true)
@@ -625,8 +701,16 @@ class FileStorageTest : public ::testing::Test {
             HasSample(metrics_text, "mooncake_ssd_disk_fenced");
         BucketBackendConfig bucket_config;
         bucket_config.bucket_keys_limit = carry_before_fence ? 2 : 1;
-        auto backend = std::make_shared<FailingReadBackend>(
-            config, bucket_config, read_errno);
+        std::shared_ptr<HangingWriteBackend> hanging;
+        std::shared_ptr<FailingReadBackend> backend;
+        if (external == ExternalFence::kWhileWriteHangs) {
+            hanging = std::make_shared<HangingWriteBackend>(
+                config, bucket_config, read_errno);
+            backend = hanging;
+        } else {
+            backend = std::make_shared<FailingReadBackend>(
+                config, bucket_config, read_errno);
+        }
         file_storage.storage_backend_ = backend;
         backend->SetDiskErrorObserver([&file_storage](int err, const char* op) {
             file_storage.OnDiskError(err, op);
@@ -649,15 +733,49 @@ class FileStorageTest : public ::testing::Test {
             out.carried_before_fence =
                 file_storage.deferred_task_by_storage_key_.size();
         }
+        auto fence_externally = [&] {
+            out.external_fence_ok =
+                file_storage.FenceLocalDisk("test verdict").has_value();
+            std::vector<OffloadTaskItem> items;
+            out.mounted_after_external_fence =
+                client->OffloadObjectHeartbeat(true, items).has_value();
+            out.carried_after_external_fence =
+                file_storage.deferred_task_by_storage_key_.size();
+        };
 
+        std::thread parked_heartbeat;
+        std::future<void> fence;
+        bool fence_returned = true;
+        if (external == ExternalFence::kWhileWriteHangs) {
+            parked_heartbeat = std::thread(
+                [&file_storage] { (void)file_storage.Heartbeat(); });
+            EXPECT_TRUE(hanging->WaitForWrite());
+            // Bounded, so a fence that waits for the parked heartbeat fails
+            // the test instead of hanging it.
+            fence = std::async(std::launch::async, fence_externally);
+            fence_returned = fence.wait_for(std::chrono::seconds(10)) ==
+                             std::future_status::ready;
+        }
+        if (external == ExternalFence::kBeforeReads) fence_externally();
         for (int i = 0; i < 2; ++i) {
             std::string read_buffer(64, '\0');
             std::unordered_map<std::string, Slice> batch{
                 {"key", Slice{read_buffer.data(), read_buffer.size()}}};
             EXPECT_FALSE(file_storage.BatchLoad(batch).has_value());
         }
+        if (external == ExternalFence::kAfterReads) fence_externally();
+        if (parked_heartbeat.joinable()) {
+            hanging->Release();
+            fence.wait();
+            parked_heartbeat.join();
+            out.external_fence_ok = out.external_fence_ok && fence_returned;
+        }
         for (int i = 0; i < 2; ++i) {
             (void)file_storage.Heartbeat();
+        }
+        if (external != ExternalFence::kNone) {
+            out.external_fence_again_ok =
+                file_storage.FenceLocalDisk("test verdict").has_value();
         }
 
         out.fenced = file_storage.disk_fenced_.load();
@@ -675,12 +793,14 @@ class FileStorageTest : public ::testing::Test {
             // Offload work already in hand must not reach a fenced disk. The
             // key has a memory replica on this store, so without the fence
             // this offload would reach the backend.
+            const int offloads_before = backend->offloads;
             auto offload = file_storage.OffloadObjects(
                 {OffloadTaskItem{.tenant_id = TenantId::Default().value(),
                                  .key = offload_key,
                                  .size = static_cast<int64_t>(value.size())}});
             EXPECT_FALSE(offload.has_value());
-            out.fenced_offload_reached_backend = backend->offloads > 0;
+            out.fenced_offload_reached_backend =
+                backend->offloads > offloads_before;
         }
         allocator.deallocate(buffer, value.size());
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
@@ -2414,6 +2534,198 @@ TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
         client.value()->OffloadObjectHeartbeat(true, offload_items);
     ASSERT_FALSE(heartbeat_rpc.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+// An external verdict fences an idle store: reads stop reaching the disk,
+// the queued offload task is handed back to the master before the unmount
+// (an unmount alone would leave it pinning the memory replica), and the call
+// itself unmounts the segment. Heartbeats never re-mount, and a repeated call
+// succeeds.
+TEST_F(FileStorageTest, ExternalFenceFencesIdleDiskTier) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("external_fence_idle", EIO, EIO, out,
+                         /*carry_before_fence=*/false,
+                         ExternalFence::kBeforeReads);
+    EXPECT_TRUE(out.external_fence_ok);
+    EXPECT_FALSE(out.mounted_after_external_fence);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_EQ(out.backend_loads, 0);
+    EXPECT_EQ(out.filesystem_checks, 0);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+    EXPECT_EQ(out.fenced_gauge, 1);
+    EXPECT_FALSE(out.fenced_offload_reached_backend);
+    EXPECT_TRUE(out.external_fence_again_ok);
+}
+
+// The tasks the heartbeat carries across a bucket deferral are heartbeat-
+// thread state: the external call leaves them alone, and the heartbeat still
+// NACKs them although the call already latched the drain.
+TEST_F(FileStorageTest, ExternalFenceLeavesCarriedTasksToTheHeartbeat) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("external_fence_carry", EIO, EIO, out,
+                         /*carry_before_fence=*/true,
+                         ExternalFence::kBeforeReads);
+    EXPECT_EQ(out.carried_before_fence, 1u);
+    EXPECT_TRUE(out.external_fence_ok);
+    EXPECT_EQ(out.carried_after_external_fence, 1u);
+    EXPECT_EQ(out.carried_after_fence, 0u);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+}
+
+// The heartbeat thread is parked in an offload write that hangs with no
+// errno, so it can neither apply a fence nor unmount. The external fence
+// unmounts from the calling thread meanwhile, and reads stop reaching the
+// disk. When the write finally fails, the fence is already in place: the
+// failure is not checked again, the tick NACKs its task, and no heartbeat
+// re-mounts.
+TEST_F(FileStorageTest, ExternalFenceUnmountsWhileHeartbeatIsStuckInAWrite) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("external_fence_hang", EIO, EIO, out,
+                         /*carry_before_fence=*/false,
+                         ExternalFence::kWhileWriteHangs);
+    EXPECT_TRUE(out.external_fence_ok);
+    EXPECT_FALSE(out.mounted_after_external_fence);
+    EXPECT_EQ(out.backend_loads, 0);
+    EXPECT_EQ(out.filesystem_checks, 0);
+    EXPECT_EQ(out.fenced_gauge, 1);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+    EXPECT_TRUE(out.external_fence_again_ok);
+}
+
+// A disk error fenced the store, but the heartbeat has not applied the fence
+// (here it has not run; in production it may be stuck). An external fence
+// then unmounts by itself instead of deferring to the heartbeat.
+TEST_F(FileStorageTest, ExternalFenceAfterDiskErrorFenceUnmounts) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("external_after_internal", ENODEV, 0, out,
+                         /*carry_before_fence=*/false,
+                         ExternalFence::kAfterReads);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_EQ(out.backend_loads, 1);
+    EXPECT_TRUE(out.external_fence_ok);
+    EXPECT_FALSE(out.mounted_after_external_fence);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+    EXPECT_EQ(out.fenced_gauge, 1);
+    EXPECT_TRUE(out.external_fence_again_ok);
+}
+
+// An external fence whose unmount RPC fails keeps the fence and the drain
+// latch, and the next call retries the unmount itself (the heartbeat may be
+// the thread that is stuck). The master is restarted and the segment
+// re-mounted behind the store's back, as in
+// DrainUnmountFailureKeepsLatchAndRetries.
+TEST_F(FileStorageTest, ExternalFenceRetriesUnmountUntilConfirmed) {
+    auto master_root = fs::path(data_path) / "external_retry_master";
+    fs::create_directories(master_root);
+    auto master_config = [&](int rpc, int metadata, int metrics) {
+        auto builder = InProcMasterConfigBuilder()
+                           .set_enable_offload(true)
+                           .set_root_fs_dir(master_root.string());
+        if (rpc > 0) {
+            builder.set_rpc_port(rpc)
+                .set_http_metadata_port(metadata)
+                .set_http_metrics_port(metrics);
+        }
+        return builder.build();
+    };
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(master_config(0, 0, 0)));
+    const int rpc_port = master.rpc_port();
+    const int metadata_port = master.http_metadata_port();
+    const int metrics_port = master.http_metrics_port();
+
+    const std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/external_retry";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    SsdMetric metric;
+    FileStorage file_storage(config, client.value(), local_rpc_addr, &metric);
+    ASSERT_TRUE(InitStorageBackend(file_storage).has_value());
+
+    master.Stop();
+    EXPECT_FALSE(file_storage.FenceLocalDisk("dead disk").has_value());
+    EXPECT_EQ(metric.ssd_disk_fenced.value(), 1);
+    EXPECT_TRUE(IsDraining(file_storage));
+
+    ASSERT_TRUE(
+        master.Start(master_config(rpc_port, metadata_port, metrics_port)));
+    bool remounted = false;
+    for (int i = 0; i < 100 && !remounted; ++i) {
+        remounted = client.value()->MountLocalDiskSegment(true).has_value();
+        if (!remounted) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    ASSERT_TRUE(remounted) << "client did not reach the restarted master";
+
+    // No heartbeat runs in between: the call retries on its own.
+    EXPECT_TRUE(file_storage.FenceLocalDisk("dead disk").has_value());
+    std::vector<OffloadTaskItem> offload_items;
+    auto heartbeat_rpc =
+        client.value()->OffloadObjectHeartbeat(true, offload_items);
+    ASSERT_FALSE(heartbeat_rpc.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+    EXPECT_TRUE(file_storage.FenceLocalDisk("dead disk").has_value());
+}
+
+// A heartbeat tick that passed its entry checks before the external fence
+// latched is parked on offloading_mutex_ while the fence runs (see the
+// fixture helper). It must not resume into the SEGMENT_NOT_FOUND recovery
+// branch and re-mount the segment the fence unmounted, and neither may a
+// later tick.
+TEST_F(FileStorageTest, ExternalFenceSurvivesParkedHeartbeatTick) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "external_race_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/external_race";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+
+    auto fence_result = WhileHeartbeatTickParked(file_storage, [&file_storage] {
+        return file_storage.FenceLocalDisk("dead disk");
+    });
+    ASSERT_TRUE(fence_result.has_value());
+
+    for (int tick = 0; tick < 2; ++tick) {
+        if (tick > 0) {
+            ASSERT_TRUE(FileStorageHeartbeat(file_storage).has_value());
+        }
+        std::vector<OffloadTaskItem> offload_items;
+        auto heartbeat_rpc =
+            client.value()->OffloadObjectHeartbeat(true, offload_items);
+        ASSERT_FALSE(heartbeat_rpc.has_value());
+        EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+    }
 }
 
 // A store whose LOCAL_DISK registration is new (here: re-mounted after the

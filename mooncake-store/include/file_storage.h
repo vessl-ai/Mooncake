@@ -50,6 +50,20 @@ class FileStorage {
         uint64_t grace_period_ms);
 
     /**
+     * @brief Fences this store's disk tier on another component's verdict
+     * (e.g. a node-level disk monitor), for failures no store I/O reports:
+     * an idle store, or a device that hangs without returning an errno.
+     *
+     * Latches the same fence as a disk error (reads short-circuit, offload
+     * stops, never undone), then unmounts from the calling thread: the
+     * heartbeat thread may be the one stuck in disk I/O. Idempotent; while
+     * the unmount is unconfirmed each call retries it, as the heartbeat does.
+     * @return OK once the master has dropped the LOCAL_DISK segment, else the
+     * unmount error (the fence holds either way).
+     */
+    tl::expected<void, ErrorCode> FenceLocalDisk(const std::string& reason);
+
+    /**
      * @brief Result of BatchGet operation containing batch_id and buffer
      * pointers.
      */
@@ -271,12 +285,18 @@ class FileStorage {
     int CheckFilesystem(bool sync_first) const;
     // Heartbeat: latch the drain and hand pending offload work back.
     void ApplyDiskFence();
+    // While the segment is mounted, hand the master's offload queue back:
+    // an unmount drops the queue but not the source-replica references its
+    // tasks hold.
+    void ReleaseOffloadQueueLocked() REQUIRES(offloading_mutex_);
     // Heartbeat thread: NACK the tasks carried for the backend's ungrouped
     // pool and drop the pool (see deferred_task_by_storage_key_).
     void NackCarriedOffloadTasks();
     // Heartbeat, while draining_: unmount until the master acknowledges it
     // (the master treats an already-unmounted segment as success).
     void UnmountLocalDiskIfPending();
+    tl::expected<void, ErrorCode> UnmountLocalDiskLocked()
+        REQUIRES(offloading_mutex_);
     void WakeHeartbeat();
 
     std::shared_ptr<Client> client_;
@@ -372,9 +392,14 @@ class FileStorage {
     std::atomic<bool> draining_{false};
     bool GUARDED_BY(offloading_mutex_) local_disk_unmounted_{false};
 
-    // Set on the first disk failure retry cannot fix; cleared only by a
-    // store restart. Reads and offload stop as soon as it is set.
+    // Set on the first disk failure retry cannot fix, or by FenceLocalDisk;
+    // cleared only by a store restart. Reads and offload stop as soon as it
+    // is set.
     std::atomic<bool> disk_fenced_{false};
+    // Heartbeat thread only: ApplyDiskFence has run. Not draining_, which
+    // FenceLocalDisk latches from another thread before the heartbeat has
+    // NACKed the tasks only it may touch.
+    bool disk_fence_applied_{false};
     int disk_dir_fd_{-1};  // offload dir, held open for CheckFilesystem
     std::atomic<bool> filesystem_check_running_{false};
     // Test-only replacement for CheckFilesystem; returns errno.

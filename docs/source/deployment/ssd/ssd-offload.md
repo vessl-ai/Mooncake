@@ -393,4 +393,6 @@ A client fences its SSD tier when a disk call fails in a way that retrying canno
 
 After a fence, the client stops reading from and offloading to that disk, hands its queued offload tasks back to the master, and unmounts its `LOCAL_DISK` segment so the master stops handing out its disk replicas. The memory segment and other clients keep working. The fence lasts until the client restarts; the gauge `mooncake_ssd_disk_fenced` is `1` while it holds. Fix or replace the disk, then restart the client.
 
-Only `bucket_storage_backend` (the default) reports disk errors; with the other backends the fence never triggers.
+A failure that no disk call reports, such as a device that hangs without returning an error, cannot fence this way. A node-level disk monitor can apply the same fence through the store service's `POST /api/fence_local_disk` (see the HTTP service reference).
+
+Only `bucket_storage_backend` (the default) reports disk errors; with the other backends a disk error never triggers the fence.
