@@ -516,3 +516,53 @@ curl -X POST http://localhost:8080/api/unmount_local_disk \
   -H "Content-Type: application/json" \
   -d '{"grace_period_seconds": 30}'
 ```
+
+### `/api/fence_local_disk`
+Fence this store's SSD offload tier because something outside the store has
+judged its disk dead — typically a node-level disk monitor that sees failures
+no store I/O reports: an idle store, a device that hangs without returning an
+error, one leg of a striped volume gone.
+
+This latches the same fence the store applies on its own when a disk call fails
+in a way retrying cannot fix (see `action=disk_fence` in the SSD offload
+troubleshooting): disk reads fail at once without touching the device,
+offloading stops, the queued offload tasks go back to the master, and the
+`LOCAL_DISK` segment is unmounted so the master stops handing out its disk
+replicas. The memory segment keeps serving. The fence holds until the store
+restarts, and the gauge `mooncake_ssd_disk_fenced` is `1` while it does. The
+unmount is sent from the request's own thread, so it works even when the
+store's offload thread is stuck in a hung write.
+
+Safe to call any number of times. A call made while the master has not yet
+confirmed the unmount retries it.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+
+**Request Body**:
+```json
+{
+  "reason": "nvme3n1 controller dead"
+}
+```
+
+`reason` is required: a non-empty printable string of at most 256 characters.
+The store logs it once, on the call that latches the fence
+(`action=disk_fence, op=external, reason=...`).
+
+**Responses**:
+
+| Status | Body | Meaning |
+| -- | -- | -- |
+| `200` | `{"status": "fenced", "unmounted": true}` | Fenced, and the master has dropped the segment. |
+| `503` | `{"status": "fenced", "unmounted": false, "error": ...}` | Fenced (reads and offload stopped), but the master has not confirmed the unmount; call again. Also returned at once, with `"status": "fencing"`, while another fence call is in progress. |
+| `409` | `{"error": ...}` | SSD offload is not enabled on this store; there is nothing to fence. |
+| `400` | `{"error": ...}` | Malformed body or invalid `reason`; the store is not touched. |
+| `500` | `{"error": ...}` | The store call raised an exception; call again. |
+
+**Example**:
+```bash
+curl -X POST http://localhost:8080/api/fence_local_disk \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "nvme3n1 controller dead"}'
+```

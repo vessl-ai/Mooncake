@@ -17,6 +17,13 @@ from mooncake.mooncake_config import MooncakeConfig
 # for minutes rather than hours.
 _MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS = 3600
 
+# Bounds the reason /api/fence_local_disk writes into the store's log.
+_MAX_FENCE_LOCAL_DISK_REASON_LENGTH = 256
+
+# ErrorCode::UNABLE_OFFLOAD: fence_local_disk returns it when the store has no
+# SSD offload tier.
+_NO_LOCAL_DISK_TIER = -1300
+
 
 def _timed_handler(operation_name, handler):
     async def wrapper(request):
@@ -102,6 +109,7 @@ class MooncakeStoreService:
         self._state_lock = (
             asyncio.Lock()
         )  # serialize reconfigure/mount/unmount state changes
+        self._fence_local_disk_in_flight = False
 
         try:
             if config_path:
@@ -261,6 +269,10 @@ class MooncakeStoreService:
                     _timed_handler(
                         "UNMOUNT_LOCAL_DISK", self.handle_unmount_local_disk
                     ),
+                ),
+                web.post(
+                    "/api/fence_local_disk",
+                    _timed_handler("FENCE_LOCAL_DISK", self.handle_fence_local_disk),
                 ),
                 web.put("/api/put", _timed_handler("PUT", self.handle_put)),
                 web.get("/api/get/{key}", _timed_handler("GET", self.handle_get)),
@@ -692,6 +704,105 @@ class MooncakeStoreService:
                 text=json.dumps({"error": str(e)}),
                 content_type="application/json",
             )
+
+    async def handle_fence_local_disk(self, request):
+        """Fence this store's SSD offload tier on an external verdict.
+
+        For a node-level disk monitor that has judged the disk under the
+        offload directory dead, including failures no store I/O reports (an
+        idle store, a device that hangs without an errno). Latches the same
+        fence as the store's own disk-error check: disk reads stop at once,
+        offloading stops, and the tier is unmounted from the master; it holds
+        until the store restarts. Idempotent: 503 means the fence holds but the
+        master has not confirmed the unmount yet, so the caller retries. Runs
+        off the event loop because the unmount waits for the master's sweep.
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "Malformed JSON body"}),
+                content_type="application/json",
+            )
+        if not isinstance(data, dict):
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "Request body must be a JSON object"}),
+                content_type="application/json",
+            )
+
+        reason = data.get("reason")
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or len(reason) > _MAX_FENCE_LOCAL_DISK_REASON_LENGTH
+            or not reason.isprintable()
+        ):
+            return web.Response(
+                status=400,
+                text=json.dumps(
+                    {
+                        "error": (
+                            "Invalid reason, must be a non-empty printable "
+                            "string of at most "
+                            f"{_MAX_FENCE_LOCAL_DISK_REASON_LENGTH} characters"
+                        )
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        # One call at a time: another one would only wait for this one's
+        # unmount while holding a worker thread.
+        if self._fence_local_disk_in_flight:
+            return web.Response(
+                status=503,
+                text=json.dumps(
+                    {
+                        "status": "fencing",
+                        "unmounted": False,
+                        "error": "A fence call is already in progress",
+                    }
+                ),
+                content_type="application/json",
+            )
+        self._fence_local_disk_in_flight = True
+        try:
+            ret = await asyncio.to_thread(self.store.fence_local_disk, reason)
+        except Exception as e:
+            logging.error("FENCE_LOCAL_DISK error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+            )
+        finally:
+            self._fence_local_disk_in_flight = False
+
+        if ret == 0:
+            return web.Response(
+                status=200,
+                text=json.dumps({"status": "fenced", "unmounted": True}),
+                content_type="application/json",
+            )
+        if ret == _NO_LOCAL_DISK_TIER:
+            return web.Response(
+                status=409,
+                text=json.dumps({"error": "SSD offload is not enabled on this store"}),
+                content_type="application/json",
+            )
+        return web.Response(
+            status=503,
+            text=json.dumps(
+                {
+                    "status": "fenced",
+                    "unmounted": False,
+                    "error": f"Unmount local disk not confirmed, ret={ret}",
+                }
+            ),
+            content_type="application/json",
+        )
 
     async def handle_put(self, request):
         try:

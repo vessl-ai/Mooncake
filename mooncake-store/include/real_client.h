@@ -905,6 +905,14 @@ class RealClient : public PyClient {
      */
     int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
 
+    /**
+     * @brief Fence this store's disk tier on an external verdict (see
+     * FileStorage::FenceLocalDisk). Returns 0 once the master has dropped the
+     * segment, UNABLE_OFFLOAD when SSD offload is not enabled on this client,
+     * otherwise the unmount error (the fence holds; call again to retry).
+     */
+    int fenceLocalDisk(const std::string &reason);
+
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
         size_t size = 0;

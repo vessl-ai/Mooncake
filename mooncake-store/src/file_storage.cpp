@@ -219,7 +219,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             heartbeat_wake_cv_.wait_for(
                 lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
                 [this] {
-                    return !heartbeat_running_ || (disk_fenced_ && !draining_);
+                    return !heartbeat_running_ ||
+                           (disk_fenced_ && !disk_fence_applied_);
                 });
         }
     });
@@ -1087,13 +1088,44 @@ void FileStorage::OnDiskError(int err, const char* op) {
     WakeHeartbeat();
 }
 
+tl::expected<void, ErrorCode> FileStorage::FenceLocalDisk(
+    const std::string& reason) {
+    if (!disk_fenced_.exchange(true)) {
+        LOG(ERROR) << "action=disk_fence, op=external, reason=" << reason
+                   << ", path=" << config_.storage_filepath;
+        if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(1);
+        // The heartbeat still NACKs its carried tasks (ApplyDiskFence).
+        WakeHeartbeat();
+    }
+    if (client_ == nullptr) {
+        LOG(ERROR) << "client is nullptr";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // The latch and order of ApplyDiskFence + UnmountLocalDiskIfPending, on
+    // this thread: the heartbeat holds offloading_mutex_ around master RPCs
+    // but not around offload writes, so this runs while the heartbeat is
+    // stuck in one (only a re-mount's DropUnregisteredFiles does disk I/O
+    // under it), and a tick that takes the lock after it sees draining_ and
+    // never re-mounts.
+    MutexLocker locker(&offloading_mutex_);
+    enable_offloading_ = false;
+    draining_.store(true);
+    ReleaseOffloadQueueLocked();
+    return UnmountLocalDiskLocked();
+}
+
 void FileStorage::ApplyDiskFence() {
-    if (!disk_fenced_.load() || draining_.load()) return;
+    if (!disk_fenced_.load() || disk_fence_applied_) return;
+    disk_fence_applied_ = true;
     MutexLocker locker(&offloading_mutex_);
     enable_offloading_ = false;
     draining_.store(true);
     NackCarriedOffloadTasks();
-    if (local_disk_unmounted_) return;  // a drain already deregistered
+    ReleaseOffloadQueueLocked();
+}
+
+void FileStorage::ReleaseOffloadQueueLocked() {
+    if (local_disk_unmounted_) return;  // the queue went with the segment
     // Unmounting drops the master's queue of offload tasks for this store but
     // not the source-replica references those tasks hold, which would pin the
     // memory replicas until the master's TTL reaper. A heartbeat with
@@ -1129,7 +1161,11 @@ void FileStorage::NackCarriedOffloadTasks() {
 
 void FileStorage::UnmountLocalDiskIfPending() {
     MutexLocker locker(&offloading_mutex_);
-    if (local_disk_unmounted_) return;
+    (void)UnmountLocalDiskLocked();
+}
+
+tl::expected<void, ErrorCode> FileStorage::UnmountLocalDiskLocked() {
+    if (local_disk_unmounted_) return {};
     auto result = client_->UnmountLocalDiskSegment();
     if (result) {
         LOG(INFO) << "action=unmount_local_disk_segment, result=OK";
@@ -1138,6 +1174,7 @@ void FileStorage::UnmountLocalDiskIfPending() {
                      << result.error();
     }
     local_disk_unmounted_ = result.has_value();
+    return result;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
