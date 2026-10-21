@@ -17,6 +17,7 @@
 #include "handoff/handoff_format.h"
 #include "handoff/handoff_writer.h"
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "tenant_quota_policy_store.h"
 
 namespace mooncake::test {
@@ -1655,6 +1656,109 @@ TEST_F(HandoffRestoreTest, RollCarriesNoOffloadStateAndRefusesOldReports) {
                     .has_value());
     for (int i = 1; i < 5; ++i) {
         EXPECT_TRUE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
+    }
+}
+
+TEST_F(HandoffRestoreTest, OffloadOnEvictTaskIsQueuedAgainAfterTheRoll) {
+    // offload_on_evict: eviction, not PutEnd, queues the offload. The store
+    // takes the tasks and is still copying when the old master stops. No
+    // offload state crosses the roll, so on the new master the objects are
+    // unpinned memory objects; the old takes' reports are refused, and the
+    // next eviction queues new tasks of the new master's epoch. If the store
+    // NACKs them (it keeps the file of the refused report and skips a key it
+    // already holds: the orphan), every cycle queues them again and their
+    // memory is never freed. A copy reported for the new task registers, and
+    // the cycle after frees the memory.
+    const auto config = [] {
+        MasterServiceConfig c = MakeL4Config();
+        c.offload_on_evict = true;
+        c.default_kv_lease_ttl = 0;
+        return c;
+    };
+    const auto evict = [](MasterService& service) {
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    };
+    const auto has_memory = [](MasterService& service, const std::string& key) {
+        for (const auto& d : Replicas(service, key)) {
+            if (d.is_memory_replica()) return true;
+        }
+        return false;
+    };
+    constexpr int kKeys = 3;
+    TempDir dir;
+    std::vector<OffloadTaskItem> old_taken;
+    uint64_t old_epoch = 0;
+    {
+        MasterService old_master(config());
+        old_epoch = old_master.L4TaskEpoch();
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        EnableL4(old_master, store);
+        for (int i = 0; i < kKeys; ++i) Put(old_master, store, Key(0, i));
+        auto at_put_end =
+            old_master.OffloadObjectHeartbeat(store.client_id, true);
+        ASSERT_TRUE(at_put_end.has_value());
+        ASSERT_TRUE(at_put_end->empty());
+        evict(old_master);
+        auto taken = old_master.OffloadObjectHeartbeat(store.client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys));
+        old_taken = *taken;
+        Write(old_master, dir.path());
+    }
+
+    MasterService master(config());
+    ASSERT_NE(master.L4TaskEpoch(), old_epoch);
+    auto restored = master.RestoreFromHandoff(dir.path(), {1});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    const UUID client = stores_[0].client_id;
+
+    for (const auto& item : old_taken) {
+        ASSERT_TRUE(
+            master.NotifyOffloadSuccess(client, {item}, {DiskMeta("disk-0")})
+                .has_value());
+    }
+    for (int i = 0; i < kKeys; ++i) {
+        EXPECT_FALSE(HasDisk(master, Key(0, i), client)) << i;
+        EXPECT_TRUE(has_memory(master, Key(0, i))) << i;
+    }
+
+    std::vector<OffloadTaskItem> previous;
+    for (int round = 0; round < 2; ++round) {
+        evict(master);
+        auto taken = master.OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(taken.has_value());
+        ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys)) << round;
+        for (const auto& item : *taken) {
+            ASSERT_TRUE(item.task_id.has_value());
+            EXPECT_EQ(item.task_id->epoch, master.L4TaskEpoch());
+            for (const auto& old : previous) {
+                if (old.key == item.key) EXPECT_NE(*old.task_id, *item.task_id);
+            }
+        }
+        previous = *taken;
+        StorageObjectMetadata nack;
+        nack.data_size = -1;
+        std::vector<StorageObjectMetadata> nacks(taken->size(), nack);
+        ASSERT_TRUE(master.NotifyOffloadSuccess(client, *taken, nacks));
+        for (int i = 0; i < kKeys; ++i) {
+            EXPECT_TRUE(has_memory(master, Key(0, i))) << i;
+        }
+    }
+
+    evict(master);
+    auto taken = master.OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(taken.has_value());
+    ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys));
+    std::vector<StorageObjectMetadata> metas(taken->size(), DiskMeta("disk-0"));
+    ASSERT_TRUE(master.NotifyOffloadSuccess(client, *taken, metas));
+    evict(master);
+    for (int i = 0; i < kKeys; ++i) {
+        EXPECT_TRUE(HasDisk(master, Key(0, i), client)) << i;
+        EXPECT_FALSE(has_memory(master, Key(0, i))) << i;
     }
 }
 
