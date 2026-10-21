@@ -1761,11 +1761,11 @@ class MasterService {
 
     // offload_admission_second_put: whether a PutEnd may queue its eager
     // offload. True when the mode is off. Otherwise records the put in the
-    // admission filter and answers whether the key was put before;
-    // `same_write_judged` (a later End of a write already judged) only reads
-    // the filter.
+    // admission filter, answers whether the key was put before and keeps the
+    // answer in `metadata`; `same_write_judged` (a later End of a write
+    // already judged) returns that kept answer.
     bool AdmitEagerOffload(const ObjectIdentity& object_id,
-                           bool same_write_judged);
+                           ObjectMetadata& metadata, bool same_write_judged);
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
@@ -1972,6 +1972,14 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // offload_admission_second_put: counters the eviction thread zeroes per
+    // iteration while preparing the next filter generation (a 256 MiB
+    // generation at the default window takes 8 iterations).
+    // Upper bound of offload_admission_window_puts (24 bytes per window put:
+    // 6 GiB).
+    static constexpr size_t kMaxOffloadAdmissionWindowPuts = 1ULL << 28;
+    static constexpr size_t kOffloadAdmissionPrepareBytesPerIteration =
+        32ULL * 1024 * 1024;
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk

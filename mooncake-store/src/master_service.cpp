@@ -481,6 +481,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
     // Second-put admission applies to the eager PutEnd offload only.
     if (config.offload_admission_second_put) {
         if (enable_offload_ && !offload_on_evict_) {
+            // A config file bypasses the flag validator, so check here.
+            if (config.offload_admission_window_puts == 0 ||
+                config.offload_admission_window_puts >
+                    kMaxOffloadAdmissionWindowPuts) {
+                LOG(ERROR) << "offload_admission_window_puts must be in [1, "
+                           << kMaxOffloadAdmissionWindowPuts << "], current "
+                           << config.offload_admission_window_puts;
+                throw std::invalid_argument(
+                    "Invalid offload_admission_window_puts");
+            }
             offload_admission_filter_ =
                 std::make_unique<OffloadAdmissionFilter>(
                     config.offload_admission_window_puts);
@@ -4625,6 +4635,11 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                 }
 
                 results.emplace(key, std::move(replica_list));
+                // Not a read for offload_admission_read_since_put: like the
+                // cache-hit counters, the unread mark follows the per-key
+                // Get paths only. A regex lookup is a bulk listing, and
+                // marking every match as read would offload whatever it
+                // happens to match.
                 metadata.GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
             }
@@ -5566,16 +5581,20 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 bool MasterService::AdmitEagerOffload(const ObjectIdentity& object_id,
+                                      ObjectMetadata& metadata,
                                       bool same_write_judged) {
     if (!offload_admission_filter_) {
         return true;
     }
+    // A later End of the same write follows the first End's answer. Asking
+    // the filter again would count that first End as an earlier put.
+    if (same_write_judged) {
+        return metadata.eager_offload_admitted;
+    }
     const std::string scoped_key =
         object_id.tenant_id.MakeScopedKey(object_id.user_key);
-    if (same_write_judged) {
-        return offload_admission_filter_->Seen(scoped_key);
-    }
     const bool admitted = offload_admission_filter_->ObservePut(scoped_key);
+    metadata.eager_offload_admitted = admitted;
     if (admitted) {
         MasterMetricManager::instance().inc_offload_admission_put_admitted();
     } else {
@@ -5697,7 +5716,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         }) &&
-        AdmitEagerOffload(object_id,
+        AdmitEagerOffload(object_id, metadata,
                           /*same_write_judged=*/had_completed_replica)) {
         auto& tenant_state = accessor.GetTenantState();
         // One marker covers every mirror pushed below, so the mirrors are
@@ -11266,6 +11285,14 @@ void MasterService::EvictionThreadFunc() {
         // state for this loop to carry.
         MaybeTrimHeap();
 
+        // offload_admission_second_put: zero the generation the last
+        // rotation retired, a slice per iteration, so that PutEnd never
+        // zeroes or allocates.
+        if (offload_admission_filter_) {
+            offload_admission_filter_->PrepareSpare(
+                kOffloadAdmissionPrepareBytesPerIteration);
+        }
+
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
     }
@@ -12565,6 +12592,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // offload_admission_read_since_put drops unread keys only in the first
     // pass's frontier, the oldest leases; the passes below clear this gate.
     bool unread_drop_allowed = true;
+    // Whether the key being tried is in the first pass's frontier.
+    bool offload_in_frontier = true;
+    // offload_evict_frontier_only: frontier keys whose push failed (kept in
+    // memory, unpinned), and keys past the frontier queued in their place.
+    long offload_frontier_push_failed = 0;
+    long offload_queued_past_frontier = 0;
     // #keys past the frontier kept in memory because they have no disk copy
     long offload_beyond_frontier_kept = 0;
     // #keys evicted without a disk copy because they were never read
@@ -12672,6 +12705,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (queued) {
             offload_queued_this_cycle++;
             offload_deferred_count++;
+            if (frontier_only && !offload_in_frontier) {
+                offload_queued_past_frontier++;
+            }
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
@@ -12697,6 +12733,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         if (push_failures.OnlyNoLocalDisk()) {
             offload_no_local_disk_skipped++;
+        }
+        if (frontier_only && offload_in_frontier) {
+            offload_frontier_push_failed++;
         }
         return 0;
     };
@@ -13190,37 +13229,111 @@ void MasterService::BatchEvict(double evict_ratio_target,
         const size_t frontier_size = compact_frontier_used
                                          ? candidates.size()
                                          : static_cast<size_t>(evict_num);
-        size_t queueable = candidates.size();
-        if (frontier_only) {
-            queueable = frontier_size;
-            std::sort(candidates.begin(), candidates.begin() + frontier_size,
-                      earlier_lease);
-        }
+
+        // offload_evict_frontier_only walks a batch in lease order, ordered
+        // lazily: a WalkOrder holds (lease, batch index) pairs of the part
+        // still to walk, and when the walk reaches the end of its ordered
+        // prefix the next slice is selected (nth_element) and sorted. Slices
+        // double from kFrontierOrderSlice. Ordering 16-byte pairs instead of
+        // the candidates themselves, and only as far as the walk goes, keeps
+        // a walk that stops early cheap (900K candidates: about 15 ms for 1%
+        // of the frontier, 85 ms for all of it, against 115 ms for sorting
+        // the whole frontier of candidates).
+        struct WalkOrder {
+            // (A local class cannot have static data members.)
+            enum : size_t { kFrontierOrderSlice = 4096 };
+            std::vector<std::pair<int64_t, uint32_t>> pairs;
+            size_t base = 0;         // batch position of pairs[0]
+            size_t ordered_end = 0;  // positions below it are ordered
+            size_t slice = kFrontierOrderSlice;
+            bool active = false;
+
+            // Order the batch positions [from, to) for the walk.
+            void Start(const std::vector<Candidate>& batch, size_t from,
+                       size_t to) {
+                pairs.clear();
+                pairs.reserve(to - from);
+                for (size_t j = from; j < to; ++j) {
+                    pairs.emplace_back(
+                        batch[j].lease_timeout.time_since_epoch().count(),
+                        static_cast<uint32_t>(j));
+                }
+                base = from;
+                ordered_end = from;
+                slice = kFrontierOrderSlice;
+                active = true;
+            }
+            bool Covers(size_t pos) const {
+                return active && pos >= base && pos - base < pairs.size();
+            }
+            // Make position `pos` hold the next oldest pair.
+            void OrderUpTo(size_t pos) {
+                if (pos < ordered_end) return;
+                const auto first = pairs.begin() + (pos - base);
+                const size_t left = pairs.size() - (pos - base);
+                const size_t take = std::min(left, slice);
+                if (take < left) {
+                    std::nth_element(first, first + (take - 1), pairs.end());
+                }
+                std::sort(first, first + take);
+                ordered_end = pos + take;
+                slice *= 2;
+            }
+            size_t BatchIndex(size_t pos) const {
+                return pairs[pos - base].second;
+            }
+        };
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
-        // Only the first `queueable` candidates of a batch may be queued for
-        // offload (all of them unless offload_evict_frontier_only is set),
-        // and only the first `droppable` may be dropped as unread
-        // (offload_admission_read_since_put).
+        // The first `frontier_end` candidates of a batch are its frontier:
+        // only they may be dropped as unread
+        // (offload_admission_read_since_put), and with
+        // offload_evict_frontier_only only they are queued, in lease order,
+        // except that each frontier key whose push failed (and so stays a
+        // candidate, unpinned) passes its slot to the next oldest key past
+        // the frontier. Otherwise a store whose keys cannot be queued (full
+        // mailbox, no local disk, fence) could fill the frontier every cycle
+        // and keep every other store from being evicted.
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch,
-                                         size_t queueable, size_t droppable) {
+                                         size_t frontier_end) {
+            WalkOrder order;
+            if (frontier_only && frontier_end > 0) {
+                order.Start(batch, 0, frontier_end);
+            }
             for (size_t i = 0; i < batch.size(); ++i) {
-                auto& c = batch[i];
                 if (stop_eviction_scan || stopping()) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
                 // evict_num by at most one group; using evict_num (rather than
                 // the per-object lease cutoff) bounds that overshoot and keeps
-                // the eviction ratio close to the target.
+                // the eviction ratio close to the target. (The rest of an
+                // ordered walk is not sorted for this.)
                 if (evicted_this_pass >= evict_num) {
-                    no_pin_objects.push_back(c.lease_timeout);
+                    no_pin_objects.push_back(
+                        batch[order.Covers(i) ? order.BatchIndex(i) : i]
+                            .lease_timeout);
                     continue;
                 }
-                offload_queue_allowed = i < queueable;
-                unread_drop_allowed = i < droppable;
+                offload_in_frontier = i < frontier_end;
+                unread_drop_allowed = offload_in_frontier;
+                offload_queue_allowed = true;
+                if (frontier_only && !offload_in_frontier) {
+                    offload_queue_allowed = offload_frontier_push_failed >
+                                            offload_queued_past_frontier;
+                    // The first slot passed on starts a lease-order walk of
+                    // the rest of the batch.
+                    if (offload_queue_allowed && !order.Covers(i)) {
+                        order.Start(batch, i, batch.size());
+                    }
+                }
+                const bool ordered = order.Covers(i);
+                if (ordered && offload_queue_allowed) {
+                    order.OrderUpTo(i);
+                }
+                auto& c = batch[ordered ? order.BatchIndex(i) : i];
                 auto evict_result = try_evict_group_or_object(
                     c.tenant_id, c.key, c.shard_idx,
                     /*allow_soft_pinned=*/false, deferred_replicas);
@@ -13243,7 +13356,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         };
 
-        evict_candidate_batch(candidates, queueable, frontier_size);
+        evict_candidate_batch(candidates, frontier_size);
 
         // Metadata may change after the frontier is materialized. If the
         // reserve is exhausted before the target is met, refill from the
@@ -13256,9 +13369,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
             // Every refill key is newer than the frontier.
-            evict_candidate_batch(refill_candidates,
-                                  frontier_only ? 0 : refill_candidates.size(),
-                                  /*droppable=*/0);
+            evict_candidate_batch(refill_candidates, /*frontier_end=*/0);
         }
         offload_queue_allowed = true;
     }
@@ -13283,6 +13394,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // evict_ratio_lowerbound. Its keys are not in the frontier.
     offload_queue_allowed = !frontier_only;
     unread_drop_allowed = false;
+    offload_in_frontier = false;
     if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
@@ -13352,6 +13464,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
                     std::vector<std::pair<TenantId, std::string>> to_evict;
+                    std::vector<bool> soft_pinned_to_evict;
                     {
                         MetadataShardAccessorRW shard(this, shard_idx);
                         for (auto tenant_it = shard->tenants.begin();
@@ -13364,17 +13477,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     !can_evict_replicas(it->second)) {
                                     continue;
                                 }
-                                if (!IsSoftPinActive(it->second, now) ||
+                                const bool soft_pinned =
+                                    IsSoftPinActive(it->second, now);
+                                if (!soft_pinned ||
                                     it->second.EvictionDeadline() <=
                                         soft_target_timeout) {
                                     to_evict.emplace_back(tenant_it->first,
                                                           it->first);
+                                    soft_pinned_to_evict.push_back(soft_pinned);
                                 }
                             }
                         }
                     }
-                    for (auto& c : to_evict) {
+                    for (size_t j = 0; j < to_evict.size(); ++j) {
+                        auto& c = to_evict[j];
                         if (target_evict_num <= 0 || stop_eviction_scan) break;
+                        // offload_evict_frontier_only: the first pass never
+                        // sees a soft-pinned key, so this pass is its only
+                        // chance to be queued. The soft-pinned keys here are
+                        // the oldest (deadline <= soft_target_timeout); the
+                        // others are of any age and are not queued.
+                        if (frontier_only) {
+                            offload_queue_allowed = soft_pinned_to_evict[j];
+                        }
                         auto evict_result = try_evict_group_or_object(
                             c.first, c.second, shard_idx,
                             /*allow_soft_pinned=*/true, deferred_replicas);

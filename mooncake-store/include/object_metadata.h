@@ -128,6 +128,10 @@ struct ObjectMetadata {
     // handoff or snapshot counts as read. Reads hold only the shard's shared
     // lock, hence the atomic. It sits in the padding after the bools above.
     mutable std::atomic<bool> unread_since_put{false};
+    // offload_admission_second_put: the first PutEnd of the current write
+    // was admitted to the eager offload. A later End of the same write
+    // follows it. Written under the shard's exclusive lock.
+    bool eager_offload_admitted{false};
     TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {

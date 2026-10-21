@@ -54,6 +54,15 @@ class MasterServiceTestPeer {
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
 
+    // offload_admission_second_put: zero the retired filter generation now
+    // (the eviction thread does it in slices). No-op when the mode is off.
+    void PrepareOffloadAdmissionSpareForTesting();
+
+    // offload_admission_second_put: AdmitEagerOffload for an existing key, as
+    // PutEnd calls it (`same_write_judged`: a later End of the same write).
+    bool AdmitEagerOffloadForTesting(const std::string& key,
+                                     bool same_write_judged);
+
     // The reuse sampler, or nullptr when enable_reuse_sampler is off.
     ReuseSampler* GetReuseSamplerForTesting() const;
 

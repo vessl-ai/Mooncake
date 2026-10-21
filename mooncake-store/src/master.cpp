@@ -249,7 +249,9 @@ DEFINE_bool(offload_evict_frontier_only, false,
             "asks for), walked from the oldest lease. Every other object the "
             "cycle visits is freed only if it already has a disk copy and is "
             "otherwise left in memory, instead of being queued in metadata "
-            "(hash) order until the offload queue is full");
+            "(hash) order until the offload queue is full. A frontier "
+            "object whose push fails (full queue, no local disk) passes its "
+            "slot to the next oldest object past the frontier");
 DEFINE_bool(offload_admission_second_put, false,
             "Eager offload admission (offload_on_evict=false): a PutEnd "
             "queues its disk offload only when the same key was put before "
@@ -259,14 +261,15 @@ DEFINE_bool(offload_admission_second_put, false,
 DEFINE_uint64(offload_admission_window_puts, 33554432,
               "With offload_admission_second_put, how many later puts (of "
               "any key) a put is remembered for: at least this many and at "
-              "most twice as many. The filter takes 16 bytes per window put "
-              "(512 MiB at the default) and briefly 24 bytes while it "
-              "rotates");
+              "most twice as many. The filter allocates 24 bytes per window "
+              "put once at start (768 MiB at the default)");
 DEFINE_validator(offload_admission_window_puts, [](const char* flagname,
                                                    uint64_t value) {
+    // Report and return false: gflags then names the flag and exits.
     if (value == 0 || value > (1ULL << 28)) {
-        LOG(FATAL) << "offload_admission_window_puts must be in "
-                      "[1, 268435456]";
+        LOG(ERROR) << "offload_admission_window_puts must be in "
+                      "[1, 268435456], current "
+                   << value;
         return false;
     }
     return true;

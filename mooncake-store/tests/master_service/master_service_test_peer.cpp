@@ -30,6 +30,24 @@ void MasterServiceTestPeer::RunBatchEvictForTesting(
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
+void MasterServiceTestPeer::PrepareOffloadAdmissionSpareForTesting() {
+    if (service_.offload_admission_filter_) {
+        service_.offload_admission_filter_->PrepareSpare(SIZE_MAX);
+    }
+}
+
+bool MasterServiceTestPeer::AdmitEagerOffloadForTesting(
+    const std::string& key, bool same_write_judged) {
+    const auto object_id =
+        service_.MakeObjectIdentity(key, TenantId::Default());
+    MasterService::MetadataAccessorRW accessor(&service_, object_id);
+    if (!accessor.Exists()) {
+        return false;
+    }
+    return service_.AdmitEagerOffload(object_id, accessor.Get(),
+                                      same_write_judged);
+}
+
 ReuseSampler* MasterServiceTestPeer::GetReuseSamplerForTesting() const {
     return service_.reuse_sampler_.get();
 }

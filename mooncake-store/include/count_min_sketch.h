@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -53,6 +54,30 @@ class CountMinSketch {
     void decay() {
         std::lock_guard<std::mutex> lock(mu_);
         decayLocked();
+    }
+
+    // Number of counters (width * depth).
+    size_t size() const { return width_ * depth_; }
+
+    // Zero up to |max_count| counters starting at counter |begin| (row-major
+    // order) and return the counter index where the next call continues.
+    // Once the last counter is zeroed the decay count restarts too, so a
+    // fully cleared sketch is the same as a new one. Lets a caller clear a
+    // large sketch in slices.
+    size_t clear_range(size_t begin, size_t max_count) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const size_t end = std::min(size(), begin + max_count);
+        for (size_t i = begin; i < end;) {
+            auto &row = table_[i / width_];
+            const size_t col = i % width_;
+            const size_t n = std::min(width_ - col, end - i);
+            std::fill_n(row.begin() + col, n, uint8_t{0});
+            i += n;
+        }
+        if (end == size()) {
+            total_increments_ = 0;
+        }
+        return end;
     }
 
    private:

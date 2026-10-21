@@ -1007,7 +1007,7 @@ TEST_F(OffloadFrontierTest, FrontierOnlyStillFreesDiskBackedKeysPastIt) {
 TEST(OffloadAdmissionFilterTest, RemembersAtLeastOneWindowAndAtMostTwo) {
     constexpr size_t kWindow = 1000;
     OffloadAdmissionFilter filter(kWindow);
-    EXPECT_EQ(filter.MemoryBytes(), 2u * 4u * 2u * kWindow);
+    EXPECT_EQ(filter.MemoryBytes(), 3u * 4u * 2u * kWindow);
 
     // The first window: nothing was put before (up to false positives).
     size_t false_seen = 0;
@@ -1021,10 +1021,12 @@ TEST(OffloadAdmissionFilterTest, RemembersAtLeastOneWindowAndAtMostTwo) {
         ASSERT_TRUE(filter.Seen("a" + std::to_string(i))) << i;
     }
     // A second window of other keys retires the first generation.
+    EXPECT_TRUE(filter.PrepareSpare(SIZE_MAX));
     for (size_t i = 0; i < kWindow; ++i) {
         filter.ObservePut("b" + std::to_string(i));
     }
     EXPECT_EQ(filter.rotations(), 2u);
+    EXPECT_EQ(filter.deferred_rotations(), 0u);
     size_t still_seen = 0;
     for (size_t i = 0; i < kWindow; ++i) {
         ASSERT_TRUE(filter.Seen("b" + std::to_string(i))) << i;
@@ -1032,6 +1034,44 @@ TEST(OffloadAdmissionFilterTest, RemembersAtLeastOneWindowAndAtMostTwo) {
     }
     // Only false positives of the half-full previous generation remain.
     EXPECT_LE(still_seen, kWindow * 5 / 100);
+}
+
+TEST(OffloadAdmissionFilterTest, RotationWaitsForAZeroedSpare) {
+    constexpr size_t kWindow = 100;
+    OffloadAdmissionFilter filter(kWindow);
+    // The spare made at construction serves the first rotation.
+    for (size_t i = 0; i < kWindow; ++i) {
+        filter.ObservePut("a" + std::to_string(i));
+    }
+    ASSERT_EQ(filter.rotations(), 1u);
+    // No spare until the retired generation is zeroed: the window is
+    // reached again but the rotation waits, and puts stay in the current
+    // generation.
+    for (size_t i = 0; i < kWindow + 50; ++i) {
+        filter.ObservePut("b" + std::to_string(i));
+    }
+    EXPECT_EQ(filter.rotations(), 1u);
+    EXPECT_EQ(filter.deferred_rotations(), 1u);
+    EXPECT_TRUE(filter.Seen("a0"));  // previous generation still held
+    // Zeroing in slices: 4 rows of 2 * kWindow counters, 150 per call.
+    int calls = 0;
+    while (!filter.PrepareSpare(/*max_bytes=*/150)) {
+        ASSERT_LT(++calls, 100);
+    }
+    EXPECT_EQ(calls, 5);  // 800 counters: 5 slices short, the 6th finishes
+    // The next put rotates: "b" keys move to previous, "a" keys drop out.
+    filter.ObservePut("c0");
+    EXPECT_EQ(filter.rotations(), 2u);
+    EXPECT_TRUE(filter.Seen("b0"));
+    size_t a_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        a_seen += filter.Seen("a" + std::to_string(i));
+    }
+    // Only false positives of "b", whose generation filled past half
+    // (150 puts in 200 counters per row) while the rotation waited.
+    EXPECT_LE(a_seen, kWindow * 20 / 100);
+    // The zeroed generation reads as empty.
+    EXPECT_FALSE(filter.Seen("never-put"));
 }
 
 class OffloadAdmissionTest : public OffloadOnEvictCycleTest {
@@ -1238,8 +1278,12 @@ TEST_F(OffloadAdmissionTest, SecondPutRemembersTheWindowAndForgetsAfterTwo) {
     RemoveAll(targets);
 
     // Two more retirements (206 + 256 puts) drop the generation holding the
-    // targets' second puts; only false positives can admit them now.
-    Put(a, "fill_b_", 2 * kWindow - kTargets, kSmallObject);
+    // targets' second puts; only false positives can admit them now. Each
+    // rotation needs a zeroed spare (the eviction thread prepares one too).
+    MasterServiceTestPeer(*service_).PrepareOffloadAdmissionSpareForTesting();
+    Put(a, "fill_b_", kWindow - kTargets, kSmallObject);
+    MasterServiceTestPeer(*service_).PrepareOffloadAdmissionSpareForTesting();
+    Put(a, "fill_c_", kWindow, kSmallObject);
     Drain(a);
     Put(a, "target_", kTargets, kSmallObject);
     EXPECT_LE(Drain(a).size(), static_cast<size_t>(kTargets * 10 / 100));
@@ -1283,6 +1327,30 @@ TEST_F(OffloadAdmissionTest, SecondPutKeepsPutOrderForQueueOrderBuckets) {
     }
     EXPECT_EQ(taken.back().task_id->seq - taken.front().task_id->seq,
               order.size() - 1);
+}
+
+TEST_F(OffloadAdmissionTest, SecondPutLaterEndOfTheSameWriteFollowsTheFirst) {
+    // A write can end with more than one PutEnd (one per replica type). The
+    // first End decides; a later End must not count the first one as an
+    // earlier put of the key.
+    Start(EagerConfig(/*second_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "two_ends_", 4, kSmallObject);  // first puts
+    MasterServiceTestPeer peer(*service_);
+    for (const auto& key : keys) {
+        EXPECT_FALSE(
+            peer.AdmitEagerOffloadForTesting(key, /*same_write_judged=*/true))
+            << key;
+    }
+    // The next write of each key is admitted, and so is its later End.
+    RemoveAll(keys);
+    Put(a, "two_ends_", 4, kSmallObject);
+    EXPECT_EQ(Drain(a).size(), keys.size());
+    for (const auto& key : keys) {
+        EXPECT_TRUE(
+            peer.AdmitEagerOffloadForTesting(key, /*same_write_judged=*/true))
+            << key;
+    }
 }
 
 // --- (b) read since put
@@ -1499,6 +1567,103 @@ TEST_F(OffloadAdmissionTest, ReadSincePutUnreadDoesNotUseTheForceCap) {
     Evict(/*ratio=*/1.0);
 
     EXPECT_EQ(Keys(Drain(a)), Sorted({keys[0], keys[1]}));
+}
+
+// unread_since_put and eager_offload_admitted sit in padding. On the
+// production toolchain (x86-64 libstdc++, no debug containers) the struct
+// stays at its size before the admission fields.
+#if defined(__x86_64__) && defined(__GLIBCXX__) && !defined(_GLIBCXX_DEBUG)
+static_assert(sizeof(ObjectMetadata) == 392,
+              "ObjectMetadata grew; the master metadata cost model "
+              "(handoff_admission.h) assumes its size");
+#endif
+
+// A store whose keys cannot be queued must not hold the frontier. Store a
+// holds the 1500 oldest leases, store b the 500 newest, so the compact
+// frontier (1124) is all a's.
+class OffloadFrontierSlotTest : public OffloadFrontierTest {
+   protected:
+    void PutRanks(const Store& store, int begin, int end) {
+        for (int i = begin; i < end; ++i) {
+            const std::string key = "lease_" + std::to_string(i);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = store.segment_name;
+            ASSERT_TRUE(service_->PutStart(store.client_id, key,
+                                           TenantId::Default(), kSmallObject,
+                                           config));
+            ASSERT_TRUE(service_->PutEnd(store.client_id, key,
+                                         TenantId::Default(),
+                                         ReplicaType::MEMORY));
+            SetLease(key, base_ + std::chrono::milliseconds(i));
+        }
+    }
+};
+
+TEST_F(OffloadFrontierSlotTest, FrontierOnlyPassesSlotsOfAFullMailbox) {
+    // Mailboxes hold 10. a's 10 oldest are queued and its other 1114
+    // frontier keys fail; their slots go to the oldest keys past the
+    // frontier: a's (fail again) and then b's, until b's mailbox is full.
+    MasterServiceConfig config = FrontierConfig(true);
+    config.offloading_queue_limit = 10;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const Store b = AddStore("store_b", /*with_disk=*/true);
+    PutRanks(a, 0, 1500);
+    PutRanks(b, 1500, 2000);
+
+    Evict(/*ratio=*/0.05);
+
+    EXPECT_EQ(RanksInQueueOrder(Drain(a)), Range(0, 10));
+    EXPECT_EQ(RanksInQueueOrder(Drain(b)), Range(1500, 1510));
+}
+
+TEST_F(OffloadFrontierSlotTest, FrontierOnlyPassesSlotsOfAStoreWithoutDisk) {
+    // a has no local disk (offload_evict_without_local_disk off): every
+    // frontier push fails and the keys stay in memory, unpinned, so they
+    // are the frontier again next cycle. b's keys take their slots, oldest
+    // first. Without that, b would never be queued and nothing evicted.
+    Start(FrontierConfig(true));
+    const Store a = AddStore("store_a", /*with_disk=*/false);
+    const Store b = AddStore("store_b", /*with_disk=*/true);
+    PutRanks(a, 0, 1500);
+    PutRanks(b, 1500, 2000);
+
+    Evict(/*ratio=*/0.05);
+
+    EXPECT_EQ(RanksInQueueOrder(Drain(b)), Range(1500, 2000));
+    EXPECT_EQ(CopiesOf("lease_0").memory, 1u);
+}
+
+TEST_F(OffloadFrontierSlotTest, FrontierOnlyQueuesSoftPinnedKeysInPassB) {
+    // Soft-pinned keys never enter the first pass; with
+    // allow_evict_soft_pinned_objects the second pass takes the oldest. It
+    // must queue them with frontier_only too, or they never leave memory.
+    for (const bool frontier_only : {false, true}) {
+        SCOPED_TRACE(frontier_only);
+        MasterServiceConfig config = FrontierConfig(frontier_only);
+        config.allow_evict_soft_pinned_objects = true;
+        Start(config);
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        for (int i = 0; i < 20; ++i) {
+            const std::string key = "lease_" + std::to_string(i);
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            replicate.preferred_segment = a.segment_name;
+            replicate.soft_pin_action = SoftPinAction::ENABLE;
+            ASSERT_TRUE(service_->PutStart(a.client_id, key,
+                                           TenantId::Default(), kSmallObject,
+                                           replicate));
+            ASSERT_TRUE(service_->PutEnd(a.client_id, key, TenantId::Default(),
+                                         ReplicaType::MEMORY));
+            SetLease(key, base_ + std::chrono::milliseconds(i));
+        }
+
+        Evict(/*ratio=*/0.05);
+
+        EXPECT_EQ(RanksInQueueOrder(Drain(a)), Range(0, 1));
+        service_->RemoveAll();
+    }
 }
 
 TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
