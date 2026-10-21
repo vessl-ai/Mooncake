@@ -478,8 +478,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     if (config.enable_reuse_sampler) {
-        reuse_sampler_ = std::make_unique<ReuseSampler>(
-            config.reuse_sampler_rate, config.reuse_sampler_max_entries);
+        try {
+            reuse_sampler_ = std::make_unique<ReuseSampler>(
+                config.reuse_sampler_rate, config.reuse_sampler_max_entries);
+        } catch (const std::invalid_argument& e) {
+            // A config file value skips the flag validators.
+            LOG(FATAL) << "Invalid reuse sampler config: " << e.what()
+                       << " (reuse_sampler_rate=" << config.reuse_sampler_rate
+                       << ", reuse_sampler_max_entries="
+                       << config.reuse_sampler_max_entries << ")";
+        }
         LOG(INFO) << "Reuse sampler enabled: sampling_rate="
                   << reuse_sampler_->sampling_rate()
                   << ", max_entries=" << reuse_sampler_->capacity();
@@ -837,7 +845,9 @@ void MasterService::QuiesceBackgroundWork() {
     // hidden on this master, and the handoff export drops them (their owner
     // is no longer registered).
     disk_unmount_sweep_stopping_.store(true, std::memory_order_release);
-    timed("disk_unmount_sweep", [&] { disk_unmount_sweep_worker_.Stop(); });
+    if (async_disk_unmount_sweep_) {
+        timed("disk_unmount_sweep", [&] { disk_unmount_sweep_worker_.Stop(); });
+    }
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -4618,6 +4628,11 @@ auto MasterService::GetReplicaList(const std::string& key,
                 })) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
+            if (OnlyReplicasOfSweepingOwners(metadata)) {
+                VLOG(1) << "key=" << key
+                        << ", info=object_not_found, reason=unmount_sweep";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
@@ -4700,6 +4715,11 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     auto replica_list = GetReadableReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
+        if (OnlyReplicasOfSweepingOwners(metadata)) {
+            VLOG(1) << "key=" << key
+                    << ", info=object_not_found, reason=unmount_sweep";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
@@ -4785,6 +4805,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     if (metadata.AllReplicas([](const Replica& replica) {
                             return replica.status() == ReplicaStatus::REMOVED;
                         })) {
+                        results[original_idx] =
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                        continue;
+                    }
+                    if (OnlyReplicasOfSweepingOwners(metadata)) {
+                        VLOG(1) << "key=" << key << ", info=object_not_found"
+                                << ", reason=unmount_sweep";
                         results[original_idx] =
                             tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                         continue;
@@ -8582,6 +8609,18 @@ bool MasterService::IsDiskReplicaOfSweepingOwner(const Replica& replica) const {
     return owner && DiskUnmountSweepPending(*owner);
 }
 
+bool MasterService::OnlyReplicasOfSweepingOwners(
+    const ObjectMetadata& metadata) const {
+    if (!async_disk_unmount_sweep_) {
+        return false;
+    }
+    // What the synchronous sweep leaves: no object (or only REMOVED ones).
+    return metadata.AllReplicas([this](const Replica& replica) {
+        return replica.status() == ReplicaStatus::REMOVED ||
+               IsDiskReplicaOfSweepingOwner(replica);
+    });
+}
+
 void MasterService::PublishDiskUnmountSweepProgressLocked() const {
     int64_t remaining_shards = 0;
     int64_t remaining_replicas = 0;
@@ -11980,8 +12019,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
         return metadata.HasReplica(is_evictable_memory_replica);
     };
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    // A disk replica hidden by a pending unmount sweep is no disk copy: the
+    // sweep erases it (as the synchronous sweep already would have).
+    auto has_local_disk_replica = [this](const ObjectMetadata& metadata) {
+        return metadata.HasReplica([this](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   !IsDiskReplicaOfSweepingOwner(replica);
+        });
     };
     auto evict_replicas =
         [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
@@ -12373,8 +12417,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    // A disk replica hidden by a pending unmount sweep is no disk copy: the
+    // sweep erases it (as the synchronous sweep already would have).
+    auto has_local_disk_replica = [this](const ObjectMetadata& metadata) {
+        return metadata.HasReplica([this](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   !IsDiskReplicaOfSweepingOwner(replica);
+        });
     };
 
     // Returns freed bytes. Returns 0 if offload-queued and no additional
@@ -13182,8 +13231,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced
-            << ", offload_no_local_disk_evicted="
-            << offload_no_local_disk_evicted
+            << (offload_evict_without_local_disk_
+                    ? ", offload_no_local_disk_evicted=" +
+                          std::to_string(offload_no_local_disk_evicted)
+                    : std::string())
             << ", total_freed_size=" << total_freed_size
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="

@@ -1834,6 +1834,10 @@ class MasterService {
     bool DiskUnmountSweepPending(const UUID& owner) const;
     // True for a LOCAL_DISK replica whose owner's unmount sweep is pending.
     bool IsDiskReplicaOfSweepingOwner(const Replica& replica) const;
+    // True when every replica of the object is REMOVED or hidden by a pending
+    // unmount sweep: readers then get OBJECT_NOT_FOUND, as after the
+    // synchronous sweep. Always false with the flag off.
+    bool OnlyReplicasOfSweepingOwners(const ObjectMetadata& metadata) const;
     // Worker body: visits shards until no sweep is pending or it stops.
     void RunDiskUnmountSweeps();
     void PublishDiskUnmountSweepProgressLocked() const;

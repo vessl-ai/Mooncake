@@ -696,7 +696,9 @@ TEST(MasterServiceOffloadScenarioTest,
         .When(PutStart(key(14), 3 * kLargeObject)
                   .By("node")
                   .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
-        .When(WaitFor(std::chrono::milliseconds(100)))
+        // One eviction cycle, driven directly rather than waited for: it
+        // queues the copies and frees nothing.
+        .When(EvictMemory(1.0))
         .When(PutStart(key(14), 3 * kLargeObject)
                   .By("node")
                   .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))

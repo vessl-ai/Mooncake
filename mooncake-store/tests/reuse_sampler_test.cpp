@@ -100,6 +100,24 @@ TEST(ReuseSamplerTest, RejectsInvalidSettings) {
 // Time calculation
 // ---------------------------------------------------------------------------
 
+// A config file value does not pass the flag validators: the master stops
+// with the cause instead of an uncaught invalid_argument.
+TEST(ReuseSamplerDeathTest, InvalidServiceConfigStopsWithTheCause) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MasterServiceConfig rate;
+    rate.enable_reuse_sampler = true;
+    rate.reuse_sampler_rate = 1.5;
+    EXPECT_DEATH(
+        { MasterService service(rate); },
+        "Invalid reuse sampler config.*reuse_sampler_rate=1.5");
+    MasterServiceConfig entries;
+    entries.enable_reuse_sampler = true;
+    entries.reuse_sampler_max_entries = 0;
+    EXPECT_DEATH(
+        { MasterService service(entries); },
+        "Invalid reuse sampler config.*reuse_sampler_max_entries=0");
+}
+
 TEST(ReuseSamplerTest, ReuseAgeIsTheTimeSinceTheMemoryEviction) {
     ReuseSampler sampler(1.0, 1024);
     const uint64_t fp = ReuseSampler::Fingerprint(TenantId::Default(), "k");

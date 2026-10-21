@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <random>
 #include <string>
@@ -287,12 +288,17 @@ TEST(DiskUnmountSweepTest, UnmountReturnsBeforeTheSweepAndHidesTheReplicas) {
     for (const auto& key : disk_only) {
         auto r = service.GetReplicaList(key, TenantId::Default());
         ASSERT_FALSE(r.has_value()) << key;
-        EXPECT_EQ(r.error(), ErrorCode::REPLICA_IS_NOT_READY);
+        // As after the synchronous sweep (and logged at VLOG only).
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
+        auto admin = service.GetReplicaListForAdmin(key, TenantId::Default());
+        ASSERT_FALSE(admin.has_value());
+        EXPECT_EQ(admin.error(), ErrorCode::OBJECT_NOT_FOUND);
         EXPECT_FALSE(Exists(service, key));
     }
     for (const auto& r :
          service.BatchGetReplicaList(disk_only, TenantId::Default())) {
-        EXPECT_FALSE(r.has_value());
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
     }
     for (const auto& r :
          service.BatchExistKey(disk_only, TenantId::Default())) {
@@ -528,12 +534,157 @@ TEST(DiskUnmountSweepTest, QuiesceStopsAPendingSweepAndKeepsItHidden) {
     }
 }
 
-// ---- Scale: a million disk-only objects, with readers and writers running.
+// ---- Readers see the same codes as after the synchronous sweep.
 
-TEST(DiskUnmountSweepTest,
-     AMillionDiskOnlyObjectsWithConcurrentReadersAndPuts) {
-    constexpr int kLeaving = 1000000;
-    constexpr int kStaying = 200000;
+// Error codes (OK = 0) a reader gets for each key: GetReplicaList,
+// GetReplicaListForAdmin, BatchGetReplicaList, ExistKey (1 = exists).
+std::vector<int> ReaderCodes(MasterService& service,
+                             const std::vector<std::string>& keys) {
+    std::vector<int> codes;
+    for (const auto& key : keys) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        codes.push_back(get ? 0 : static_cast<int>(get.error()));
+        auto admin = service.GetReplicaListForAdmin(key, TenantId::Default());
+        codes.push_back(admin ? 0 : static_cast<int>(admin.error()));
+        codes.push_back(Exists(service, key) ? 1 : 0);
+    }
+    for (const auto& r :
+         service.BatchGetReplicaList(keys, TenantId::Default())) {
+        codes.push_back(r ? 0 : static_cast<int>(r.error()));
+    }
+    return codes;
+}
+
+TEST(DiskUnmountSweepTest, ReadersGetTheSameCodesAsAfterTheSynchronousSweep) {
+    const std::vector<std::string> keys = {"codes-disk-only-0",
+                                           "codes-disk-only-1", "codes-both-0",
+                                           "codes-other-0"};
+    std::vector<int> sync_codes;
+    {
+        MasterService service(SweepConfig(false));
+        Store x = MountStore(service, 0);
+        Store y = MountStore(service, 1);
+        PutDiskOnly(service, x, {keys[0], keys[1]});
+        PutWithDiskCopy(service, x, {keys[2]});
+        PutDiskOnly(service, y, {keys[3]});
+        ASSERT_TRUE(service.UnmountLocalDiskSegment(x.client_id).has_value());
+        sync_codes = ReaderCodes(service, keys);
+    }
+    SweepGate gate(0);
+    MasterService service(SweepConfig(true));
+    ReleaseOnExit release_on_exit{gate};
+    InstallGate(service, gate);
+    Store x = MountStore(service, 0);
+    Store y = MountStore(service, 1);
+    PutDiskOnly(service, x, {keys[0], keys[1]});
+    PutWithDiskCopy(service, x, {keys[2]});
+    PutDiskOnly(service, y, {keys[3]});
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(x.client_id).has_value());
+    gate.WaitBlocked();  // the sweep has not erased anything
+    EXPECT_EQ(ReaderCodes(service, keys), sync_codes);
+    gate.Release();
+    ASSERT_TRUE(WaitForSweeps(service));
+    EXPECT_EQ(ReaderCodes(service, keys), sync_codes);
+    // Disk-only keys: OBJECT_NOT_FOUND from every get variant, no exists.
+    const std::vector<int> not_found = {
+        static_cast<int>(ErrorCode::OBJECT_NOT_FOUND),
+        static_cast<int>(ErrorCode::OBJECT_NOT_FOUND), 0};
+    EXPECT_EQ(std::vector<int>(sync_codes.begin(), sync_codes.begin() + 3),
+              not_found);
+}
+
+// ---- With offload_on_evict: a hidden disk replica is no disk copy.
+
+TEST(DiskUnmountSweepTest, OffloadOnEvictDoesNotCountAHiddenDiskCopy) {
+    // Memory and disk copy both on the unmounting store x; and an object in
+    // y's memory whose only disk copy is x's.
+    auto run = [](bool async, size_t* x_memory_left, bool* cross_on_y_disk) {
+        SweepGate gate(0);
+        MasterServiceConfig config = SweepConfig(async);
+        config.offload_on_evict = true;
+        MasterService service(config);
+        ReleaseOnExit release_on_exit{gate};
+        MasterServiceTestPeer peer(service);
+        InstallGate(service, gate);
+        Store x = MountStore(service, 0);
+        Store y = MountStore(service, 1);
+        const auto both = Keys("evict-both-", 5);
+        for (const auto& key : both) Put(service, x, key);
+        // offload_on_evict: PutEnd queues nothing; one eviction cycle queues
+        // the copies, which x completes.
+        peer.RunBatchEvictForTesting(1.0, 1.0);
+        auto tasks = service.OffloadObjectHeartbeat(x.client_id, true);
+        ASSERT_TRUE(tasks.has_value());
+        ASSERT_EQ(tasks->size(), both.size());
+        StorageObjectMetadata meta;
+        meta.data_size = kObjectSize;
+        meta.transport_endpoint = "x-disk";
+        ASSERT_TRUE(
+            service
+                .NotifyOffloadSuccess(
+                    x.client_id, *tasks,
+                    std::vector<StorageObjectMetadata>(tasks->size(), meta))
+                .has_value());
+        for (const auto& key : both) {
+            auto replicas = Replicas(service, key);
+            ASSERT_EQ(replicas.size(), 2u) << key;
+        }
+        Put(service, y, "evict-cross");
+        Replica x_copy(x.client_id, kObjectSize, "x-disk",
+                       ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(service
+                        .AddReplica(x.client_id, "evict-cross",
+                                    TenantId::Default(), x_copy)
+                        .has_value());
+
+        ASSERT_TRUE(service.UnmountLocalDiskSegment(x.client_id).has_value());
+        if (async) gate.WaitBlocked();
+        // Eviction: x's objects cannot be offloaded (x has no disk tier any
+        // more), so they keep their memory copy; the cross object is queued
+        // to y, which completes it.
+        peer.RunBatchEvictForTesting(1.0, 1.0);
+        auto y_tasks = service.OffloadObjectHeartbeat(y.client_id, true);
+        ASSERT_TRUE(y_tasks.has_value());
+        meta.transport_endpoint = "y-disk";
+        if (!y_tasks->empty()) {
+            ASSERT_TRUE(
+                service
+                    .NotifyOffloadSuccess(y.client_id, *y_tasks,
+                                          std::vector<StorageObjectMetadata>(
+                                              y_tasks->size(), meta))
+                    .has_value());
+        }
+        peer.RunBatchEvictForTesting(1.0, 1.0);
+        gate.Release();
+        ASSERT_TRUE(WaitForSweeps(service));
+
+        *x_memory_left = 0;
+        for (const auto& key : both) {
+            auto replicas = Replicas(service, key);
+            if (replicas.size() == 1 && replicas[0].is_memory_replica()) {
+                ++*x_memory_left;
+            }
+        }
+        *cross_on_y_disk =
+            HasDiskOf(Replicas(service, "evict-cross"), y.client_id);
+    };
+    size_t sync_left = 0, async_left = 0;
+    bool sync_cross = false, async_cross = false;
+    run(false, &sync_left, &sync_cross);
+    run(true, &async_left, &async_cross);
+    EXPECT_EQ(sync_left, 5u);
+    EXPECT_EQ(async_left, sync_left);
+    EXPECT_TRUE(sync_cross);
+    EXPECT_EQ(async_cross, sync_cross);
+}
+
+// ---- Scale: many disk-only objects, with readers and writers running.
+
+// `leaving` disk-only objects of the store that unmounts, `staying` of
+// another; four readers and one writer that puts `reputs` leaving keys again.
+void RunSweepAtScale(const int kLeaving, const int kStaying,
+                     const int kReputs) {
+    const int kStride = kLeaving / kReputs;
     MasterService service(SweepConfig(true));
     MasterServiceTestPeer peer(service);
     Store x = MountStore(service, 0);
@@ -562,7 +713,8 @@ TEST(DiskUnmountSweepTest,
             while (!done.load()) {
                 const int index = pick(rng);
                 // The writer below puts these again, so they may exist.
-                const bool reput = index % 499 == 0 && index / 499 < 2000;
+                const bool reput =
+                    index % kStride == 0 && index / kStride < kReputs;
                 const std::string key = "big-x-" + std::to_string(index);
                 // Only reads issued after the unmount returned must not see
                 // the unmounted store's disk.
@@ -582,11 +734,11 @@ TEST(DiskUnmountSweepTest,
     std::atomic<int> reputs_ok{0};
     std::thread writer([&] {
         while (!unmounted.load()) std::this_thread::yield();
-        for (int i = 0; i < 2000; ++i) {
+        for (int i = 0; i < kReputs; ++i) {
             ReplicateConfig config;
             config.replica_num = 1;
             config.preferred_segment = y.segment;
-            const std::string key = "big-x-" + std::to_string(i * 499);
+            const std::string key = "big-x-" + std::to_string(i * kStride);
             auto started = service.PutStart(
                 y.client_id, key, TenantId::Default(), kObjectSize, config);
             if (started && service
@@ -622,23 +774,40 @@ TEST(DiskUnmountSweepTest,
     EXPECT_GT(checked_reads.load(), 0u);
     EXPECT_EQ(violations.load(), 0u);
     // Every re-put succeeded: a hidden object never blocks a fresh put.
-    EXPECT_EQ(reputs_ok.load(), 2000);
-    EXPECT_EQ(service.GetKeyCount(), static_cast<size_t>(kStaying + 2000));
+    EXPECT_EQ(reputs_ok.load(), kReputs);
+    EXPECT_EQ(service.GetKeyCount(), static_cast<size_t>(kStaying + kReputs));
     // A re-put that reaches its key before the sweep erases the hidden
     // replica itself; the sweep counts only the rest.
     const int64_t swept =
         Metrics().get_disk_unmount_sweep_removed_replicas() - removed_before;
-    EXPECT_GE(swept, kLeaving - 2000);
+    EXPECT_GE(swept, kLeaving - kReputs);
     EXPECT_LE(swept, kLeaving);
-    for (int i = 0; i < kStaying; i += 997) {
+    for (int i = 0; i < kStaying; i += 97) {
         EXPECT_TRUE(HasDiskOf(Replicas(service, "big-y-" + std::to_string(i)),
                               y.client_id));
     }
-    for (int i = 0; i < 2000; ++i) {
-        auto replicas = Replicas(service, "big-x-" + std::to_string(i * 499));
+    for (int i = 0; i < kReputs; ++i) {
+        auto replicas =
+            Replicas(service, "big-x-" + std::to_string(i * kStride));
         ASSERT_EQ(replicas.size(), 1u);
         EXPECT_TRUE(replicas[0].is_memory_replica());
     }
+}
+
+TEST(DiskUnmountSweepTest,
+     AHundredThousandDiskOnlyObjectsWithConcurrentReadersAndPuts) {
+    RunSweepAtScale(100000, 20000, 2000);
+}
+
+// The million-object run takes a few seconds and about 1 GiB; it runs only
+// with MOONCAKE_SWEEP_SCALE_TEST=1. disk_unmount_sweep_bench covers 1M-36M.
+TEST(DiskUnmountSweepTest,
+     AMillionDiskOnlyObjectsWithConcurrentReadersAndPuts) {
+    const char* enabled = std::getenv("MOONCAKE_SWEEP_SCALE_TEST");
+    if (enabled == nullptr || std::string(enabled) != "1") {
+        GTEST_SKIP() << "set MOONCAKE_SWEEP_SCALE_TEST=1 to run";
+    }
+    RunSweepAtScale(1000000, 200000, 2000);
 }
 
 }  // namespace

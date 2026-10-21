@@ -11,6 +11,9 @@
 //               after the sweep)
 //   mode=async  the same with the flag on (the call returns at once; the
 //               sweep runs on the background thread)
+//               A checker thread reads the leaving store's objects after
+//               the unmount returns and fails the run if one is readable
+//               from that disk or exists.
 //   mode=stats  the owner sweep driven shard by shard with lock-hold timers
 //               (the same per-shard routine both modes run)
 
@@ -23,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <string>
@@ -220,15 +224,45 @@ void RunOne(const std::string& mode, uint64_t num_keys) {
     // Readers' baseline, then the window from the unmount to the sweep end.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     readers.Measure(true);
+    // A checker reads the leaving store's objects once the unmount has
+    // returned: none may come back readable from its disk, or exist.
+    std::atomic<bool> unmounted{false};
+    std::atomic<bool> stop_checker{false};
+    std::atomic<uint64_t> checked{0};
+    std::atomic<uint64_t> violations{0};
+    std::thread checker([&] {
+        std::mt19937_64 rng(99);
+        std::uniform_int_distribution<uint64_t> index(0, pop.per_owner - 1);
+        while (!unmounted.load()) std::this_thread::yield();
+        while (!stop_checker.load(std::memory_order_relaxed)) {
+            const std::string key = Key(0, index(rng));
+            auto r = service.GetReplicaList(key, TenantId::Default());
+            auto exists = service.ExistKey(key, TenantId::Default());
+            ++checked;
+            bool on_leaving_disk = false;
+            if (r) {
+                for (const auto& d : r->replicas) {
+                    on_leaving_disk |=
+                        d.is_local_disk_replica() &&
+                        d.get_local_disk_descriptor().client_id == leaving;
+                }
+            }
+            if (on_leaving_disk || (exists && *exists)) ++violations;
+        }
+    });
     const auto start = Clock::now();
     CHECK(service.UnmountLocalDiskSegment(leaving).has_value());
     const double call_ms = Ms(Clock::now() - start);
+    unmounted.store(true);
     if (async) {
         CHECK(peer.WaitForDiskUnmountSweepsForTesting(std::chrono::hours(1)));
     }
     const double sweep_ms = Ms(Clock::now() - start);
+    stop_checker.store(true);
+    checker.join();
     readers.Measure(false);
     readers.Stop();
+    CHECK_EQ(violations.load(), 0u);
     CHECK_EQ(service.GetKeyCount(), keys_before - pop.per_owner);
     std::cout << "mode=" << mode << ",num_keys=" << keys_before
               << ",removed=" << pop.per_owner << ",unmount_call_ms=" << call_ms
@@ -238,8 +272,11 @@ void RunOne(const std::string& mode, uint64_t num_keys) {
               << ",read_p50_us=" << readers.Quantile(0.50)
               << ",read_p99_us=" << readers.Quantile(0.99)
               << ",read_p999_us=" << readers.Quantile(0.999)
-              << ",read_max_us=" << readers.Max() << ",build_ms=" << build_ms
-              << ",rss_gib=" << rss_gib << std::endl;
+              << ",read_max_us=" << readers.Max()
+              << ",hidden_checks=" << checked.load()
+              << ",hidden_violations=" << violations.load()
+              << ",build_ms=" << build_ms << ",rss_gib=" << rss_gib
+              << std::endl;
 }
 
 }  // namespace
