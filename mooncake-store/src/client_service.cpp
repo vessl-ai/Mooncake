@@ -3949,6 +3949,9 @@ tl::expected<size_t, ErrorCode> Client::UnmountMemorySegmentsForDrain() {
         ++unmounted;
     }
 
+    if (metrics_) {
+        metrics_->ReportMemorySegmentsDrained(drained_segments_.size());
+    }
     LOG(INFO) << "action=drain_memory_segments, unmounted=" << unmounted
               << ", still_mounted=" << mounted_segments_.size()
               << ", drained_total=" << drained_segments_.size();

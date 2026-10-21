@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <random>
@@ -908,6 +909,170 @@ TEST(DiskUnmountSweepTest,
         }
         EXPECT_TRUE(
             service.MountLocalDiskSegment(leaving.client_id, true).has_value());
+    }
+}
+
+// A put that started before the drain (PutStart on the leaving segment) and
+// ends after it (PutEnd) never becomes readable from the drained segment:
+// its PutEnd fails or the object stays without a readable replica, so the
+// reader misses; a re-put of the key lands on the staying store and reads
+// back from there.
+TEST(DiskUnmountSweepTest, APutThatStraddlesTheMemoryDrainEndsAsAMiss) {
+    MasterService service(SweepConfig(true));
+    Store leaving = MountStore(service, 0);
+    Store staying = MountStore(service, 1);
+    const auto keys = Keys("straddle-", 20);
+    for (const auto& key : keys) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = leaving.segment;
+        auto started = service.PutStart(
+            leaving.client_id, key, TenantId::Default(), kObjectSize, config);
+        ASSERT_TRUE(started.has_value()) << key;
+        ASSERT_EQ(started->size(), 1u);
+        ASSERT_EQ(started->front()
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  leaving.segment);
+    }
+
+    ASSERT_TRUE(service.UnmountSegment(leaving.segment_id, leaving.client_id)
+                    .has_value());
+
+    for (const auto& key : keys) {
+        // Either outcome is safe; neither may hand out the drained segment.
+        (void)service.PutEnd(leaving.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY);
+        EXPECT_FALSE(Exists(service, key)) << key;
+        EXPECT_TRUE(Replicas(service, key).empty()) << key;
+    }
+
+    for (const auto& key : keys) {
+        Put(service, leaving, key);  // prefers the leaving segment: gone
+        auto replicas = Replicas(service, key);
+        ASSERT_EQ(replicas.size(), 1u) << key;
+        ASSERT_TRUE(replicas[0].is_memory_replica()) << key;
+        EXPECT_EQ(replicas[0]
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  staying.segment)
+            << key;
+    }
+}
+
+// An L4 offload the leaving store took before the memory drain and reports
+// after it: the completion is dropped or lands as an ordinary disk replica
+// of that store (served by the still-live process), and handing the disk
+// tier back hides it at once and the sweep erases it. With the synchronous
+// sweep (flag off) the unmount itself erases it. Objects whose only copy was
+// in the drained segment are gone by the time the report arrives (dropped);
+// objects with a second memory copy on the staying store take the disk
+// replica (registered), so both paths run.
+TEST(DiskUnmountSweepTest,
+     AnOffloadReportedAfterTheMemoryDrainIsSweptWithTheDisk) {
+    for (const bool async : {true, false}) {
+        SCOPED_TRACE(async ? "async sweep" : "sync sweep");
+        MasterService service(SweepConfig(async));
+        Store leaving = MountStore(service, 0);
+        Store staying = MountStore(service, 1);
+        const auto keys = Keys("late-offload-", 20);
+        const auto dual = Keys("late-offload-dual-", 10);
+        PutWithDiskCopy(service, staying, Keys("staying-", 5));
+        for (const auto& key : keys) Put(service, leaving, key);
+        for (const auto& key : dual) {
+            ReplicateConfig config;
+            config.replica_num = 2;
+            config.preferred_segments = {leaving.segment, staying.segment};
+            auto started =
+                service.PutStart(leaving.client_id, key, TenantId::Default(),
+                                 kObjectSize, config);
+            ASSERT_TRUE(started.has_value()) << key;
+            ASSERT_EQ(started->size(), 2u) << key;
+            ASSERT_TRUE(service
+                            .PutEnd(leaving.client_id, key, TenantId::Default(),
+                                    ReplicaType::MEMORY)
+                            .has_value());
+        }
+        auto tasks = service.OffloadObjectHeartbeat(leaving.client_id, true);
+        ASSERT_TRUE(tasks.has_value());
+        ASSERT_EQ(tasks->size(), keys.size() + dual.size());
+
+        ASSERT_TRUE(
+            service.UnmountSegment(leaving.segment_id, leaving.client_id)
+                .has_value());
+        for (const auto& key : keys) EXPECT_FALSE(Exists(service, key));
+
+        StorageObjectMetadata meta;
+        meta.data_size = kObjectSize;
+        meta.transport_endpoint = leaving.segment + "-disk";
+        std::vector<StorageObjectMetadata> metas(tasks->size(), meta);
+        const bool accepted =
+            service.NotifyOffloadSuccess(leaving.client_id, *tasks, metas)
+                .has_value();
+        size_t on_disk = 0;
+        for (const auto& key : keys) {
+            auto replicas = Replicas(service, key);
+            for (const auto& replica : replicas) {
+                // Never a memory replica of the drained segment.
+                ASSERT_TRUE(replica.is_local_disk_replica()) << key;
+                EXPECT_EQ(replica.get_local_disk_descriptor().client_id,
+                          leaving.client_id);
+            }
+            if (!replicas.empty()) ++on_disk;
+        }
+        if (!accepted) EXPECT_EQ(on_disk, 0u);
+        size_t dual_on_disk = 0;
+        for (const auto& key : dual) {
+            auto replicas = Replicas(service, key);
+            bool staying_memory = false;
+            for (const auto& replica : replicas) {
+                if (replica.is_memory_replica()) {
+                    // Only the staying store's memory copy is left.
+                    EXPECT_EQ(replica.get_memory_descriptor()
+                                  .buffer_descriptor.transport_endpoint_,
+                              staying.segment)
+                        << key;
+                    staying_memory = true;
+                } else {
+                    ASSERT_TRUE(replica.is_local_disk_replica()) << key;
+                    EXPECT_EQ(replica.get_local_disk_descriptor().client_id,
+                              leaving.client_id);
+                    ++dual_on_disk;
+                }
+            }
+            EXPECT_TRUE(staying_memory) << key;
+        }
+
+        ASSERT_TRUE(
+            service.UnmountLocalDiskSegment(leaving.client_id).has_value());
+        for (const auto& key : keys) {
+            EXPECT_FALSE(Exists(service, key)) << key;
+        }
+        // Handed back: its disk copies are no longer named, sweep or not.
+        for (const auto& key : dual) {
+            auto replicas = Replicas(service, key);
+            ASSERT_EQ(replicas.size(), 1u) << key;
+            EXPECT_TRUE(replicas[0].is_memory_replica()) << key;
+        }
+        if (async) ASSERT_TRUE(WaitForSweeps(service));
+        for (const auto& key : keys) {
+            EXPECT_FALSE(Exists(service, key)) << key;
+            EXPECT_TRUE(Replicas(service, key).empty()) << key;
+        }
+        // The disk copies of the leaving store are gone; the staying memory
+        // copy is all that is left of the two-copy objects.
+        for (const auto& key : dual) {
+            auto replicas = Replicas(service, key);
+            ASSERT_EQ(replicas.size(), 1u) << key;
+            EXPECT_TRUE(replicas[0].is_memory_replica()) << key;
+        }
+        for (const auto& key : Keys("staying-", 5)) {
+            EXPECT_EQ(Replicas(service, key).size(), 2u) << key;
+        }
+        std::printf(
+            "late offload (%s sweep): accepted=%d single_on_disk=%zu "
+            "dual_on_disk=%zu\n",
+            async ? "async" : "sync", accepted ? 1 : 0, on_disk, dual_on_disk);
     }
 }
 

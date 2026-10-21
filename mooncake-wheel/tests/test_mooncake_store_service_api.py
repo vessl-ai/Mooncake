@@ -123,9 +123,10 @@ class FakeStore:
 
 
 class FakeRequest:
-    def __init__(self, body, json_error=None):
+    def __init__(self, body, json_error=None, remote="127.0.0.1"):
         self.body = body
         self.json_error = json_error
+        self.remote = remote
 
     async def json(self):
         if self.json_error is not None:
@@ -599,6 +600,19 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.status, 200)
             self.assertEqual(json.loads(resp.text)["status"], "success")
         self.assertEqual(self.fake_store.unmount_memory_segments_calls, 2)
+
+    async def test_unmount_memory_segments_accepts_loopback_callers_only(self):
+        for remote in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            resp = await self.service.handle_unmount_memory_segments(
+                FakeRequest({}, remote=remote)
+            )
+            self.assertEqual(resp.status, 200, remote)
+        for remote in ("10.0.0.5", "198.18.25.19", None, ""):
+            resp = await self.service.handle_unmount_memory_segments(
+                FakeRequest({}, remote=remote)
+            )
+            self.assertEqual(resp.status, 403, remote)
+        self.assertEqual(self.fake_store.unmount_memory_segments_calls, 3)
 
     async def test_unmount_memory_segments_store_failure(self):
         self.fake_store.unmount_memory_segments_ret = -1

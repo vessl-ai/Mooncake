@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "allocator.h"
 #include "client_service.h"
 #include "common/client_buffer_allocation.h"
+#include "common/network.h"
 #include "default_config.h"
 #include "test_server_helpers.h"
 #include "types.h"
@@ -68,9 +70,15 @@ class SegmentDrainTest : public ::testing::Test {
    protected:
     void SetUp() override {
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
-        leaving_ = CreateClient(kLeaving, master_.master_address());
-        staying_ = CreateClient(kStaying, master_.master_address());
-        reader_ = CreateClient(kReader, master_.master_address());
+        const auto ports = getFreeTcpPorts(3);
+        ASSERT_EQ(ports.size(), 3u);
+        for (int port : ports) ASSERT_GE(port, 10000);
+        leaving_name_ = "127.0.0.1:" + std::to_string(ports[0]);
+        staying_name_ = "127.0.0.1:" + std::to_string(ports[1]);
+        reader_name_ = "127.0.0.1:" + std::to_string(ports[2]);
+        leaving_ = CreateClient(leaving_name_, master_.master_address());
+        staying_ = CreateClient(staying_name_, master_.master_address());
+        reader_ = CreateClient(reader_name_, master_.master_address());
         ASSERT_TRUE(leaving_ && staying_ && reader_);
 
         leaving_segment_ = allocate_buffer_allocator_memory(kSegmentSize);
@@ -141,9 +149,12 @@ class SegmentDrainTest : public ::testing::Test {
             .buffer_descriptor.transport_endpoint_;
     }
 
-    static constexpr const char* kLeaving = "127.0.0.1:18341";
-    static constexpr const char* kStaying = "127.0.0.1:18342";
-    static constexpr const char* kReader = "127.0.0.1:18343";
+    // Client names (and so segment names) on free ports, so parallel ctest
+    // runs do not collide. Ephemeral ports are all 5 digits, so no name is a
+    // substring of another (CheckSegmentVisible matches by substring).
+    std::string leaving_name_;
+    std::string staying_name_;
+    std::string reader_name_;
 
     InProcMaster master_;
     std::shared_ptr<Client> leaving_;
@@ -157,7 +168,7 @@ class SegmentDrainTest : public ::testing::Test {
 // Default path, pinned: without a drain the leaving store's replicas stay
 // readable until its client tears down, which unmounts them.
 TEST_F(SegmentDrainTest, WithoutADrainTheSegmentLeavesAtTeardown) {
-    for (int i = 0; i < kKeys; ++i) PutOn(kLeaving, Key(i), Value(i));
+    for (int i = 0; i < kKeys; ++i) PutOn(leaving_name_, Key(i), Value(i));
     std::this_thread::sleep_for(std::chrono::seconds(2));
     for (int i = 0; i < kKeys; ++i) {
         auto exists = reader_->IsExist(Key(i));
@@ -171,23 +182,49 @@ TEST_F(SegmentDrainTest, WithoutADrainTheSegmentLeavesAtTeardown) {
         ASSERT_TRUE(exists.has_value());
         EXPECT_FALSE(*exists) << Key(i);
     }
-    EXPECT_TRUE(WaitVisible(master_, kLeaving, false, std::chrono::seconds(5)));
+    EXPECT_TRUE(
+        WaitVisible(master_, leaving_name_, false, std::chrono::seconds(5)));
 }
 
 TEST_F(SegmentDrainTest, DrainHidesTheReplicasAtOnceAndHeldReadsFinish) {
     std::vector<QueryResult> held;
     for (int i = 0; i < kKeys; ++i) {
-        PutOn(kLeaving, Key(i), Value(i));
+        PutOn(leaving_name_, Key(i), Value(i));
         auto query = reader_->Query(Key(i));
         ASSERT_TRUE(query.has_value()) << Key(i);
         ASSERT_EQ(EndpointOf(*query), leaving_->GetTransportEndpoint());
         held.push_back(*query);
     }
-    PutOn(kStaying, "staying-key", Value(99));
+    PutOn(staying_name_, "staying-key", Value(99));
+
+    // The drained-segments gauge has no series until a drain is called.
+    const std::string gauge = "mooncake_client_memory_segments_drained";
+    auto metrics_before = leaving_->SerializeMetrics();
+    if (metrics_before.has_value()) {
+        EXPECT_EQ(metrics_before->find(gauge), std::string::npos);
+    }
 
     auto drained = leaving_->UnmountMemorySegmentsForDrain();
     ASSERT_TRUE(drained.has_value()) << toString(drained.error());
     EXPECT_EQ(*drained, 1u);
+
+    auto metrics_after = leaving_->SerializeMetrics();
+    if (metrics_after.has_value()) {
+        // The sample line: the name, optional labels, then the value 1.
+        bool sampled = false;
+        std::istringstream lines(*metrics_after);
+        for (std::string line; std::getline(lines, line);) {
+            if (line.rfind(gauge, 0) == 0 && line.size() > 2 &&
+                line.compare(line.size() - 2, 2, " 1") == 0) {
+                sampled = true;
+            }
+        }
+        EXPECT_TRUE(sampled) << *metrics_after;
+    }
+    auto staying_metrics = staying_->SerializeMetrics();
+    if (staying_metrics.has_value()) {
+        EXPECT_EQ(staying_metrics->find(gauge), std::string::npos);
+    }
 
     // Right away: no key of the leaving store exists or is handed out.
     std::vector<std::string> keys;
@@ -218,7 +255,7 @@ TEST_F(SegmentDrainTest, DrainHidesTheReplicasAtOnceAndHeldReadsFinish) {
     for (int i = 0; i < kKeys; ++i) ExpectRead(Key(i), held[i], Value(i));
 
     // The writer re-puts the missing key; it lands on the staying store.
-    PutOn(kLeaving, Key(0), Value(1000));
+    PutOn(leaving_name_, Key(0), Value(1000));
     auto requery = reader_->Query(Key(0));
     ASSERT_TRUE(requery.has_value());
     EXPECT_EQ(EndpointOf(*requery), staying_->GetTransportEndpoint());
@@ -226,8 +263,10 @@ TEST_F(SegmentDrainTest, DrainHidesTheReplicasAtOnceAndHeldReadsFinish) {
 
     // The master no longer lists the segment; a second drain has nothing
     // left; the leaving store takes no new segment.
-    EXPECT_TRUE(WaitVisible(master_, kLeaving, false, std::chrono::seconds(5)));
-    EXPECT_TRUE(WaitVisible(master_, kStaying, true, std::chrono::seconds(5)));
+    EXPECT_TRUE(
+        WaitVisible(master_, leaving_name_, false, std::chrono::seconds(5)));
+    EXPECT_TRUE(
+        WaitVisible(master_, staying_name_, true, std::chrono::seconds(5)));
     auto again = leaving_->UnmountMemorySegmentsForDrain();
     ASSERT_TRUE(again.has_value());
     EXPECT_EQ(*again, 0u);
@@ -243,7 +282,8 @@ TEST_F(SegmentDrainTest, DrainHidesTheReplicasAtOnceAndHeldReadsFinish) {
 // its heartbeat; the remount carries no drained segment.
 TEST_F(SegmentDrainTest, AHeartbeatRemountDoesNotBringADrainedSegmentBack) {
     ASSERT_TRUE(leaving_->UnmountMemorySegmentsForDrain().has_value());
-    ASSERT_TRUE(WaitVisible(master_, kLeaving, false, std::chrono::seconds(5)));
+    ASSERT_TRUE(
+        WaitVisible(master_, leaving_name_, false, std::chrono::seconds(5)));
 
     const int rpc_port = master_.rpc_port();
     const int metrics_port = master_.http_metrics_port();
@@ -256,14 +296,15 @@ TEST_F(SegmentDrainTest, AHeartbeatRemountDoesNotBringADrainedSegmentBack) {
 
     // The staying store remounts; then give the leaving store's heartbeat
     // the same time and more.
-    ASSERT_TRUE(WaitVisible(master_, kStaying, true, std::chrono::seconds(20)));
+    ASSERT_TRUE(
+        WaitVisible(master_, staying_name_, true, std::chrono::seconds(20)));
     std::this_thread::sleep_for(std::chrono::seconds(3));
-    auto leaving_visible = CheckSegmentVisible(master_, kLeaving);
+    auto leaving_visible = CheckSegmentVisible(master_, leaving_name_);
     ASSERT_TRUE(leaving_visible.has_value());
     EXPECT_FALSE(*leaving_visible);
 
     // New writes go to the staying store only.
-    PutOn(kLeaving, "after-restart", Value(7));
+    PutOn(leaving_name_, "after-restart", Value(7));
     auto query = reader_->Query("after-restart");
     ASSERT_TRUE(query.has_value());
     EXPECT_EQ(EndpointOf(*query), staying_->GetTransportEndpoint());
@@ -272,7 +313,7 @@ TEST_F(SegmentDrainTest, AHeartbeatRemountDoesNotBringADrainedSegmentBack) {
 // A master error leaves the segment mounted (and the store refusing new
 // mounts); calling again once the master answers finishes the drain.
 TEST_F(SegmentDrainTest, ADrainThatFailsIsRetriedByCallingAgain) {
-    PutOn(kLeaving, Key(0), Value(0));
+    PutOn(leaving_name_, Key(0), Value(0));
     const int rpc_port = master_.rpc_port();
     const int metrics_port = master_.http_metrics_port();
     master_.Stop();
@@ -285,12 +326,14 @@ TEST_F(SegmentDrainTest, ADrainThatFailsIsRetriedByCallingAgain) {
                                   .set_http_metrics_port(metrics_port)
                                   .build()));
     // The segment is still the store's own, so its heartbeat remounts it.
-    ASSERT_TRUE(WaitVisible(master_, kLeaving, true, std::chrono::seconds(20)));
+    ASSERT_TRUE(
+        WaitVisible(master_, leaving_name_, true, std::chrono::seconds(20)));
 
     auto retried = leaving_->UnmountMemorySegmentsForDrain();
     ASSERT_TRUE(retried.has_value()) << toString(retried.error());
     EXPECT_EQ(*retried, 1u);
-    EXPECT_TRUE(WaitVisible(master_, kLeaving, false, std::chrono::seconds(5)));
+    EXPECT_TRUE(
+        WaitVisible(master_, leaving_name_, false, std::chrono::seconds(5)));
 }
 
 }  // namespace

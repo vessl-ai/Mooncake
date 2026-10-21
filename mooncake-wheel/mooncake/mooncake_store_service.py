@@ -20,6 +20,10 @@ _MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS = 3600
 # Bounds the reason /api/fence_local_disk writes into the store's log.
 _MAX_FENCE_LOCAL_DISK_REASON_LENGTH = 256
 
+# Callers /api/unmount_memory_segments accepts: the drain cannot be undone in
+# this process, and the preStop hook that is meant to call it runs in the pod.
+_LOOPBACK_REMOTES = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
 # ErrorCode::UNABLE_OFFLOAD: fence_local_disk returns it when the store has no
 # SSD offload tier.
 _NO_LOCAL_DISK_TIER = -1300
@@ -721,8 +725,21 @@ class MooncakeStoreService:
         serving. The memory stays registered until the process tears down, so
         reads already handed a descriptor finish; the store refuses later
         mounts. The body is ignored. Calling it again
-        retries only what a master error left mounted.
+        retries only what a master error left mounted. Only a loopback
+        caller is accepted (403 otherwise): the drain cannot be undone until
+        the process restarts. The store's metrics show it as
+        mooncake_client_memory_segments_drained once called.
         """
+        remote = getattr(request, "remote", None)
+        if remote not in _LOOPBACK_REMOTES:
+            logging.warning(
+                "UNMOUNT_MEMORY_SEGMENTS refused for non-loopback caller %s", remote
+            )
+            return web.Response(
+                status=403,
+                text=json.dumps({"error": "Only a loopback caller may drain"}),
+                content_type="application/json",
+            )
         try:
             async with self._state_lock:
                 ret = await asyncio.to_thread(self.store.unmount_memory_segments)

@@ -12,6 +12,14 @@
 // flag off the entry is an ordinary preferred segment name that no segment
 // has, so the allocator skips it and places the put as before. No wire
 // format changes: the key travels in an existing string field.
+//
+// A placement key outranks locality on purpose: the expanded list holds every
+// serving segment, so the writer-host (LOCAL_FIRST) segments the master
+// appends after it are never reached, and ranked strategies' free-ratio order
+// is overridden too. A chain is written by many engines on many hosts over
+// time; ranking by writer host would scatter it again, which is what the key
+// is there to prevent. Name a local segment explicitly in front of the key
+// to prefer it anyway.
 
 #include <algorithm>
 #include <cstdint>
