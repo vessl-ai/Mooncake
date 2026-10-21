@@ -500,6 +500,19 @@ MasterMetricManager::MasterMetricManager()
           "master_offload_tasks_expired_total",
           "Offload tasks released because no completion arrived within "
           "put_start_release_timeout_sec"),
+      offload_admission_put_admitted_total_(
+          "master_offload_admission_put_admitted_total",
+          "offload_admission_second_put: PutEnds whose key was put before "
+          "within the admission window, so their disk offload was queued"),
+      offload_admission_put_skipped_total_(
+          "master_offload_admission_put_skipped_total",
+          "offload_admission_second_put: PutEnds whose key was not put "
+          "before within the admission window, so no disk offload was "
+          "queued"),
+      offload_admission_unread_evicted_total_(
+          "master_offload_admission_unread_evicted_total",
+          "offload_admission_read_since_put: objects evicted without a disk "
+          "copy because nobody read them from memory since their PutEnd"),
       disk_unmount_sweep_pending_owners_(
           "master_disk_unmount_sweep_pending_owners",
           "async_disk_unmount_sweep: stores whose LOCAL_DISK tier was "
@@ -1565,6 +1578,31 @@ int64_t MasterMetricManager::get_offload_tasks_expired() {
     return offload_tasks_expired_total_.value();
 }
 
+// Offload admission metrics
+void MasterMetricManager::inc_offload_admission_put_admitted(int64_t val) {
+    offload_admission_put_admitted_total_.inc(val);
+}
+
+void MasterMetricManager::inc_offload_admission_put_skipped(int64_t val) {
+    offload_admission_put_skipped_total_.inc(val);
+}
+
+void MasterMetricManager::inc_offload_admission_unread_evicted(int64_t val) {
+    offload_admission_unread_evicted_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_admission_put_admitted() {
+    return offload_admission_put_admitted_total_.value();
+}
+
+int64_t MasterMetricManager::get_offload_admission_put_skipped() {
+    return offload_admission_put_skipped_total_.value();
+}
+
+int64_t MasterMetricManager::get_offload_admission_unread_evicted() {
+    return offload_admission_unread_evicted_total_.value();
+}
+
 // Background LOCAL_DISK unmount sweep metrics
 void MasterMetricManager::set_disk_unmount_sweep_progress(
     int64_t pending_owners, int64_t remaining_shards,
@@ -2456,6 +2494,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_tasks_without_local_disk_);
     serialize_metric(offload_task_oldest_age_seconds_);
     serialize_metric(offload_tasks_expired_total_);
+    serialize_metric(offload_admission_put_admitted_total_);
+    serialize_metric(offload_admission_put_skipped_total_);
+    serialize_metric(offload_admission_unread_evicted_total_);
     serialize_metric(disk_unmount_sweep_pending_owners_);
     serialize_metric(disk_unmount_sweep_remaining_shards_);
     serialize_metric(disk_unmount_sweep_remaining_replicas_);

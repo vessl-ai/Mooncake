@@ -250,6 +250,33 @@ DEFINE_bool(offload_evict_frontier_only, false,
             "cycle visits is freed only if it already has a disk copy and is "
             "otherwise left in memory, instead of being queued in metadata "
             "(hash) order until the offload queue is full");
+DEFINE_bool(offload_admission_second_put, false,
+            "Eager offload admission (offload_on_evict=false): a PutEnd "
+            "queues its disk offload only when the same key was put before "
+            "within the last offload_admission_window_puts puts, as kept by "
+            "a two-generation CountMinSketch. A first put stays in memory "
+            "only and is dropped by eviction as before");
+DEFINE_uint64(offload_admission_window_puts, 33554432,
+              "With offload_admission_second_put, how many later puts (of "
+              "any key) a put is remembered for: at least this many and at "
+              "most twice as many. The filter takes 16 bytes per window put "
+              "(512 MiB at the default) and briefly 24 bytes while it "
+              "rotates");
+DEFINE_validator(offload_admission_window_puts, [](const char* flagname,
+                                                   uint64_t value) {
+    if (value == 0 || value > (1ULL << 28)) {
+        LOG(FATAL) << "offload_admission_window_puts must be in "
+                      "[1, 268435456]";
+        return false;
+    }
+    return true;
+});
+DEFINE_bool(offload_admission_read_since_put, false,
+            "With offload_on_evict, eviction queues a disk offload only for "
+            "an object that was read from memory since its PutEnd; an "
+            "object nobody read is evicted without a disk copy, as the "
+            "eager mode evicts. Objects restored by a handoff or snapshot "
+            "count as read");
 DEFINE_bool(enable_offload_stall_metrics, false,
             "Export metrics that show eviction waiting on offloads that "
             "cannot finish: pending offload tasks, tasks whose store has no "
@@ -725,6 +752,21 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_evict_frontier_only",
                            &master_config.offload_evict_frontier_only,
                            FLAGS_offload_evict_frontier_only);
+    default_config.GetBool("offload_admission_second_put",
+                           &master_config.offload_admission_second_put,
+                           FLAGS_offload_admission_second_put);
+    {
+        uint64_t tmp_offload_admission_window_puts =
+            FLAGS_offload_admission_window_puts;
+        default_config.GetUInt64("offload_admission_window_puts",
+                                 &tmp_offload_admission_window_puts,
+                                 FLAGS_offload_admission_window_puts);
+        master_config.offload_admission_window_puts =
+            static_cast<size_t>(tmp_offload_admission_window_puts);
+    }
+    default_config.GetBool("offload_admission_read_since_put",
+                           &master_config.offload_admission_read_since_put,
+                           FLAGS_offload_admission_read_since_put);
     default_config.GetBool("enable_offload_stall_metrics",
                            &master_config.enable_offload_stall_metrics,
                            FLAGS_enable_offload_stall_metrics);
@@ -1160,6 +1202,27 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_evict_frontier_only =
             FLAGS_offload_evict_frontier_only;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_second_put",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_second_put =
+            FLAGS_offload_admission_second_put;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_window_puts",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_window_puts =
+            static_cast<size_t>(FLAGS_offload_admission_window_puts);
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_read_since_put",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_read_since_put =
+            FLAGS_offload_admission_read_since_put;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload_stall_metrics",
                                         &info) &&

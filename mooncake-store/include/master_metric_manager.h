@@ -378,6 +378,16 @@ class MasterMetricManager {
     int64_t get_offload_task_oldest_age_seconds();
     int64_t get_offload_tasks_expired();
 
+    // Offload admission (offload_admission_second_put,
+    // offload_admission_read_since_put). Only moved while the mode is on, so
+    // no series exists with it off.
+    void inc_offload_admission_put_admitted(int64_t val = 1);
+    void inc_offload_admission_put_skipped(int64_t val = 1);
+    void inc_offload_admission_unread_evicted(int64_t val = 1);
+    int64_t get_offload_admission_put_admitted();
+    int64_t get_offload_admission_put_skipped();
+    int64_t get_offload_admission_unread_evicted();
+
     // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep). Only
     // set while that mode is on, so no series exists with it off.
     void set_disk_unmount_sweep_progress(int64_t pending_owners,
@@ -837,6 +847,12 @@ class MasterMetricManager {
     ylt::metric::gauge_t offload_tasks_without_local_disk_;
     ylt::metric::gauge_t offload_task_oldest_age_seconds_;
     ylt::metric::counter_t offload_tasks_expired_total_;
+
+    // Offload admission (offload_admission_second_put,
+    // offload_admission_read_since_put)
+    ylt::metric::counter_t offload_admission_put_admitted_total_;
+    ylt::metric::counter_t offload_admission_put_skipped_total_;
+    ylt::metric::counter_t offload_admission_unread_evicted_total_;
 
     // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep)
     ylt::metric::gauge_t disk_unmount_sweep_pending_owners_;

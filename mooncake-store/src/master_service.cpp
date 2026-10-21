@@ -463,6 +463,37 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "oldest first; other keys are freed only when they "
                          "have a disk copy";
         }
+        offload_admission_read_since_put_ =
+            config.offload_admission_read_since_put;
+        if (offload_admission_read_since_put_) {
+            LOG(INFO) << "Read-since-put offload admission enabled: eviction "
+                         "queues a disk offload only for an object read from "
+                         "memory since its PutEnd and evicts the others "
+                         "without a disk copy";
+        }
+    }
+    if (config.offload_admission_read_since_put &&
+        !offload_admission_read_since_put_) {
+        LOG(WARNING) << "offload_admission_read_since_put ignored: it needs "
+                        "enable_offload and offload_on_evict";
+    }
+
+    // Second-put admission applies to the eager PutEnd offload only.
+    if (config.offload_admission_second_put) {
+        if (enable_offload_ && !offload_on_evict_) {
+            offload_admission_filter_ =
+                std::make_unique<OffloadAdmissionFilter>(
+                    config.offload_admission_window_puts);
+            LOG(INFO) << "Second-put offload admission enabled: PutEnd "
+                         "queues a disk offload only for a key put before "
+                         "within the last "
+                      << offload_admission_filter_->window_puts()
+                      << " puts (filter "
+                      << offload_admission_filter_->MemoryBytes() << " bytes)";
+        } else {
+            LOG(WARNING) << "offload_admission_second_put ignored: it needs "
+                            "enable_offload and offload_on_evict=false";
+        }
     }
 
     // Same conditions as the memory segment's deferred sweep: HA, snapshot
@@ -4657,6 +4688,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
             MasterMetricManager::instance().inc_mem_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
+            if (offload_admission_read_since_put_) {
+                MarkReadFromMemory(metadata);
+            }
         } else if (replica_list[0].is_local_disk_replica() ||
                    replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -4842,6 +4876,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
                     MasterMetricManager::instance().inc_mem_cache_hit_bytes(
                         static_cast<int64_t>(metadata.size));
+                    if (offload_admission_read_since_put_) {
+                        MarkReadFromMemory(metadata);
+                    }
                 } else if (replica_list[0].is_local_disk_replica() ||
                            replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -5528,6 +5565,25 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+bool MasterService::AdmitEagerOffload(const ObjectIdentity& object_id,
+                                      bool same_write_judged) {
+    if (!offload_admission_filter_) {
+        return true;
+    }
+    const std::string scoped_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+    if (same_write_judged) {
+        return offload_admission_filter_->Seen(scoped_key);
+    }
+    const bool admitted = offload_admission_filter_->ObservePut(scoped_key);
+    if (admitted) {
+        MasterMetricManager::instance().inc_offload_admission_put_admitted();
+    } else {
+        MasterMetricManager::instance().inc_offload_admission_put_skipped();
+    }
+    return admitted;
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -5631,13 +5687,18 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     // A key has at most one offload task: a second push would replace the
     // queued item of the current task with one whose id no task has.
+    // With offload_admission_second_put the key must also have been put
+    // before (AdmitEagerOffload); a later End of the same write reuses the
+    // first End's answer.
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ &&
         !accessor.GetTenantState().offloading_tasks.contains(
             object_id.user_key) &&
         !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
-        })) {
+        }) &&
+        AdmitEagerOffload(object_id,
+                          /*same_write_judged=*/had_completed_replica)) {
         auto& tenant_state = accessor.GetTenantState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
@@ -5677,6 +5738,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
+    }
+
+    // offload_admission_read_since_put: a new write is unread until a read
+    // is served from memory.
+    if (offload_admission_read_since_put_ && !had_completed_replica) {
+        metadata.unread_since_put.store(true, std::memory_order_relaxed);
     }
 
     SyncCacheTotalAccounting(metadata);
@@ -12120,6 +12187,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     long offload_cap_forced_count = 0;
     long offload_push_failed_forced = 0;
     long offload_no_local_disk_evicted = 0;
+    // #objects evicted without a disk copy because they were never read
+    // (offload_admission_read_since_put)
+    long offload_unread_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -12142,6 +12212,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         // push a second item, which would pin another replica that no task
         // releases.
         if (tenant_state.offloading_tasks.contains(key)) {
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
+        // offload_admission_read_since_put: nobody read it from memory since
+        // its PutEnd, so evict it without a disk copy as eager mode would.
+        if (offload_admission_read_since_put_ &&
+            metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            ++offload_unread_evicted;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
@@ -12382,6 +12460,12 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      << "; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload.";
     }
+    if (offload_unread_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_admission_unread_evicted(
+            offload_unread_evicted);
+        VLOG(1) << "[TENANT-EVICT] tenant=" << normalized_tenant
+                << ", offload_unread_evicted=" << offload_unread_evicted;
+    }
     if (offload_stall_metrics_ && offload_no_local_disk_evicted > 0) {
         MasterMetricManager::instance().inc_offload_no_local_disk_evicted(
             offload_no_local_disk_evicted);
@@ -12478,8 +12562,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // this gate; the passes below clear it for every key past the frontier.
     const bool frontier_only = offload_evict_frontier_only_;
     bool offload_queue_allowed = true;
+    // offload_admission_read_since_put drops unread keys only in the first
+    // pass's frontier, the oldest leases; the passes below clear this gate.
+    bool unread_drop_allowed = true;
     // #keys past the frontier kept in memory because they have no disk copy
     long offload_beyond_frontier_kept = 0;
+    // #keys evicted without a disk copy because they were never read
+    // (offload_admission_read_since_put)
+    long offload_unread_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -12527,6 +12617,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (!offload_queue_allowed) {
             offload_beyond_frontier_kept++;
             return 0;
+        }
+
+        // offload_admission_read_since_put: nobody read it from memory since
+        // its PutEnd, so evict it without a disk copy as eager mode would.
+        // Only in the frontier: past it a key is newer than keys the cycle
+        // has not freed, so it is not dropped ahead of them (it stays in
+        // memory with frontier_only, and is queued as before without it).
+        if (offload_admission_read_since_put_ && unread_drop_allowed &&
+            metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            offload_unread_evicted++;
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -13081,15 +13182,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
                          candidates.begin() + (evict_num - 1), candidates.end(),
                          earlier_lease);
 
-        // offload_evict_frontier_only: the frontier is every candidate of the
-        // compact path (the reserve cutoff bounds them) and otherwise the
-        // evict_num oldest, which nth_element just put first. Walk it from
-        // the oldest lease, so the offload queue receives keys in lease order.
-        size_t frontier_size = candidates.size();
+        // The frontier is every candidate of the compact path (the reserve
+        // cutoff bounds them) and otherwise the evict_num oldest, which
+        // nth_element just put first. offload_evict_frontier_only walks it
+        // from the oldest lease, so the offload queue receives keys in lease
+        // order, and queues offloads only for it.
+        const size_t frontier_size = compact_frontier_used
+                                         ? candidates.size()
+                                         : static_cast<size_t>(evict_num);
+        size_t queueable = candidates.size();
         if (frontier_only) {
-            if (!compact_frontier_used) {
-                frontier_size = static_cast<size_t>(evict_num);
-            }
+            queueable = frontier_size;
             std::sort(candidates.begin(), candidates.begin() + frontier_size,
                       earlier_lease);
         }
@@ -13098,10 +13201,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         // Only the first `queueable` candidates of a batch may be queued for
-        // offload (all of them unless offload_evict_frontier_only is set).
+        // offload (all of them unless offload_evict_frontier_only is set),
+        // and only the first `droppable` may be dropped as unread
+        // (offload_admission_read_since_put).
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch,
-                                         size_t queueable) {
+                                         size_t queueable, size_t droppable) {
             for (size_t i = 0; i < batch.size(); ++i) {
                 auto& c = batch[i];
                 if (stop_eviction_scan || stopping()) break;
@@ -13115,6 +13220,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 offload_queue_allowed = i < queueable;
+                unread_drop_allowed = i < droppable;
                 auto evict_result = try_evict_group_or_object(
                     c.tenant_id, c.key, c.shard_idx,
                     /*allow_soft_pinned=*/false, deferred_replicas);
@@ -13137,7 +13243,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         };
 
-        evict_candidate_batch(candidates, frontier_size);
+        evict_candidate_batch(candidates, queueable, frontier_size);
 
         // Metadata may change after the frontier is materialized. If the
         // reserve is exhausted before the target is met, refill from the
@@ -13151,7 +13257,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 /*collect_older_or_equal=*/false);
             // Every refill key is newer than the frontier.
             evict_candidate_batch(refill_candidates,
-                                  frontier_only ? 0 : refill_candidates.size());
+                                  frontier_only ? 0 : refill_candidates.size(),
+                                  /*droppable=*/0);
         }
         offload_queue_allowed = true;
     }
@@ -13175,6 +13282,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound. Its keys are not in the frontier.
     offload_queue_allowed = !frontier_only;
+    unread_drop_allowed = false;
     if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
@@ -13337,6 +13445,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << (frontier_only ? ", offload_beyond_frontier_kept=" +
                                     std::to_string(offload_beyond_frontier_kept)
                               : std::string())
+            << (offload_admission_read_since_put_
+                    ? ", offload_unread_evicted=" +
+                          std::to_string(offload_unread_evicted)
+                    : std::string())
             << ", total_freed_size=" << total_freed_size
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="
@@ -13384,6 +13496,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
+    }
+    if (offload_unread_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_admission_unread_evicted(
+            offload_unread_evicted);
     }
     if (offload_stall_metrics_ && offload_on_evict_) {
         const long second_pass_no_local_disk_skipped =

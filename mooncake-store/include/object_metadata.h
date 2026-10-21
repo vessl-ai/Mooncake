@@ -13,6 +13,7 @@
 // the envelope can read either without them tearing.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -121,6 +122,12 @@ struct ObjectMetadata {
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
+    // offload_admission_read_since_put: set by PutEnd, cleared by the first
+    // read served from memory. Eviction drops an object that is still set
+    // without a disk copy. It defaults to false, so an object restored from a
+    // handoff or snapshot counts as read. Reads hold only the shard's shared
+    // lock, hence the atomic. It sits in the padding after the bools above.
+    mutable std::atomic<bool> unread_since_put{false};
     TenantQuotaLedger quota_ledger;
 
     struct DynamicReplicaRecord {

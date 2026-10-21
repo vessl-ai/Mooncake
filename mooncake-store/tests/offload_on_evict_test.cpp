@@ -991,8 +991,521 @@ TEST_F(OffloadFrontierTest, FrontierOnlyStillFreesDiskBackedKeysPastIt) {
     }
 }
 
+// =============================================================================
+// Offload admission (INF-651 C4-1).
+//
+// (a) offload_admission_second_put: eager mode, PutEnd queues the offload
+//     only for a key put before within the admission window.
+// (b) offload_admission_read_since_put: offload_on_evict, eviction queues an
+//     offload only for an object read from memory since its PutEnd; others
+//     are evicted without a disk copy.
+//
+// Inspection here goes through the metadata accessor (Peek, Unread), not
+// GetReplicaList, because a GetReplicaList is itself a read for (b).
+// =============================================================================
+
+TEST(OffloadAdmissionFilterTest, RemembersAtLeastOneWindowAndAtMostTwo) {
+    constexpr size_t kWindow = 1000;
+    OffloadAdmissionFilter filter(kWindow);
+    EXPECT_EQ(filter.MemoryBytes(), 2u * 4u * 2u * kWindow);
+
+    // The first window: nothing was put before (up to false positives).
+    size_t false_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        false_seen += filter.ObservePut("a" + std::to_string(i));
+    }
+    EXPECT_EQ(filter.rotations(), 1u);
+    EXPECT_LE(false_seen, kWindow * 2 / 100);
+    // One window later every key is still remembered: no false negatives.
+    for (size_t i = 0; i < kWindow; ++i) {
+        ASSERT_TRUE(filter.Seen("a" + std::to_string(i))) << i;
+    }
+    // A second window of other keys retires the first generation.
+    for (size_t i = 0; i < kWindow; ++i) {
+        filter.ObservePut("b" + std::to_string(i));
+    }
+    EXPECT_EQ(filter.rotations(), 2u);
+    size_t still_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        ASSERT_TRUE(filter.Seen("b" + std::to_string(i))) << i;
+        still_seen += filter.Seen("a" + std::to_string(i));
+    }
+    // Only false positives of the half-full previous generation remain.
+    EXPECT_LE(still_seen, kWindow * 5 / 100);
+}
+
+class OffloadAdmissionTest : public OffloadOnEvictCycleTest {
+   protected:
+    static constexpr size_t kSmallObject = 4096;
+
+    static MasterServiceConfig EagerConfig(bool second_put,
+                                           size_t window_puts = 1024) {
+        MasterServiceConfig config = Config();
+        config.offload_on_evict = false;
+        config.offload_admission_second_put = second_put;
+        config.offload_admission_window_puts = window_puts;
+        return config;
+    }
+
+    static MasterServiceConfig ExclusiveConfig(bool read_since_put) {
+        MasterServiceConfig config = Config();
+        config.offload_admission_read_since_put = read_since_put;
+        return config;
+    }
+
+    // Replicas of a key, without counting as a read.
+    Copies Peek(const std::string& key) {
+        Copies copies;
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        if (!accessor.Exists()) return copies;
+        copies.exists = true;
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            if (replica.is_memory_replica()) ++copies.memory;
+            if (replica.is_local_disk_replica()) ++copies.local_disk;
+        }
+        return copies;
+    }
+
+    bool Unread(const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists()) << key;
+        return accessor.Exists() &&
+               accessor.Get().unread_since_put.load(std::memory_order_relaxed);
+    }
+
+    void RemoveAll(const std::vector<std::string>& keys) {
+        for (const auto& key : keys) {
+            EXPECT_TRUE(service_->Remove(key, TenantId::Default(),
+                                         /*force=*/true))
+                << key;
+        }
+    }
+
+    static std::vector<std::string> Keys(
+        const std::vector<OffloadTaskItem>& items) {
+        std::vector<std::string> keys;
+        for (const auto& item : items) keys.push_back(item.key);
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
+    static std::vector<std::string> Sorted(std::vector<std::string> keys) {
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
+    struct AdmissionCounters {
+        int64_t admitted;
+        int64_t skipped;
+        int64_t unread_evicted;
+    };
+
+    static AdmissionCounters Counters() {
+        auto& metrics = MasterMetricManager::instance();
+        return {metrics.get_offload_admission_put_admitted(),
+                metrics.get_offload_admission_put_skipped(),
+                metrics.get_offload_admission_unread_evicted()};
+    }
+};
+
+// --- Defaults
+// -----------------------------------------------------------------
+
+TEST_F(OffloadAdmissionTest, ByDefaultEagerQueuesEveryPutEnd) {
+    Start(EagerConfig(/*second_put=*/false));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+
+    const auto keys = Put(a, "eager_", 20, kSmallObject);
+    EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+    RemoveAll(keys);
+    // A second put is queued the same way.
+    Put(a, "eager_", 20, kSmallObject);
+    EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+
+    const auto after = Counters();
+    EXPECT_EQ(after.admitted, before.admitted);
+    EXPECT_EQ(after.skipped, before.skipped);
+    for (const auto& key : keys) EXPECT_FALSE(Unread(key)) << key;
+}
+
+TEST_F(OffloadAdmissionTest, ByDefaultExclusiveQueuesUnreadObjects) {
+    Start(ExclusiveConfig(/*read_since_put=*/false));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+    const auto keys = Put(a, "unread_", 20, kSmallObject);
+    for (const auto& key : keys) EXPECT_FALSE(Unread(key)) << key;
+
+    Evict(/*ratio=*/1.0);
+
+    EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+    for (const auto& key : keys) EXPECT_EQ(Peek(key).memory, 1u) << key;
+    EXPECT_EQ(Counters().unread_evicted, before.unread_evicted);
+}
+
+TEST_F(OffloadAdmissionTest, EachAdmissionIsIgnoredInTheOtherMode) {
+    // (a) needs eager mode, (b) needs offload_on_evict.
+    {
+        MasterServiceConfig config = ExclusiveConfig(false);
+        config.offload_admission_second_put = true;
+        Start(config);
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const auto keys = Put(a, "x_", 10, kSmallObject);
+        EXPECT_TRUE(Drain(a).empty());  // PutEnd never queues here
+        Evict(/*ratio=*/1.0);
+        EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+        service_->RemoveAll();
+    }
+    {
+        MasterServiceConfig config = EagerConfig(false);
+        config.offload_admission_read_since_put = true;
+        Start(config);
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const auto keys = Put(a, "y_", 10, kSmallObject);
+        EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+        for (const auto& key : keys) EXPECT_FALSE(Unread(key)) << key;
+    }
+}
+
+// --- (a) second put
+// -------------------------------------------------------------
+
+TEST_F(OffloadAdmissionTest, SecondPutSkipsTheFirstPutAndQueuesTheSecond) {
+    Start(EagerConfig(/*second_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+
+    const auto keys = Put(a, "page_", 20, kSmallObject);
+    EXPECT_TRUE(Drain(a).empty());
+    for (const auto& key : keys) {
+        EXPECT_EQ(Peek(key).memory, 1u) << key;  // the put itself is kept
+    }
+    auto mid = Counters();
+    EXPECT_EQ(mid.skipped - before.skipped, 20);
+    EXPECT_EQ(mid.admitted, before.admitted);
+
+    // The key leaves memory and comes back: that put is written to disk.
+    RemoveAll(keys);
+    Put(a, "page_", 20, kSmallObject);
+    const auto taken = Drain(a);
+    EXPECT_EQ(Keys(taken), Sorted(keys));
+    Report(a, taken, static_cast<int64_t>(kSmallObject));
+    for (const auto& key : keys) {
+        EXPECT_EQ(Peek(key).local_disk, 1u) << key;
+        EXPECT_EQ(Peek(key).memory, 1u) << key;
+    }
+    const auto after = Counters();
+    EXPECT_EQ(after.admitted - mid.admitted, 20);
+    EXPECT_EQ(after.skipped, mid.skipped);
+}
+
+TEST_F(OffloadAdmissionTest, SecondPutFalseAdmissionsStayWithinTheSketchBound) {
+    // 2 windows of distinct first puts: the first fills one generation to
+    // half its width, the second also meets the full previous generation.
+    constexpr size_t kWindow = 4096;
+    Start(EagerConfig(/*second_put=*/true, kWindow));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+
+    Put(a, "first_", static_cast<int>(kWindow), kSmallObject);
+    const size_t first_window = Drain(a).size();
+    Put(a, "second_", static_cast<int>(kWindow), kSmallObject);
+    const size_t second_window = Drain(a).size();
+
+    EXPECT_LE(first_window, kWindow * 2 / 100);
+    EXPECT_LE(second_window, kWindow * 5 / 100);
+}
+
+TEST_F(OffloadAdmissionTest, SecondPutRemembersTheWindowAndForgetsAfterTwo) {
+    constexpr int kWindow = 256;
+    constexpr int kTargets = 50;
+    Start(EagerConfig(/*second_put=*/true, kWindow));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+
+    // 50 targets and 206 fillers: the 256th put retires the generation.
+    const auto targets = Put(a, "target_", kTargets, kSmallObject);
+    const auto fillers = Put(a, "fill_a_", kWindow - kTargets, kSmallObject);
+    Drain(a);
+    RemoveAll(targets);
+    RemoveAll(fillers);
+
+    // One window later the targets are remembered: all are admitted.
+    Put(a, "target_", kTargets, kSmallObject);
+    EXPECT_EQ(Keys(Drain(a)), Sorted(targets));
+    RemoveAll(targets);
+
+    // Two more retirements (206 + 256 puts) drop the generation holding the
+    // targets' second puts; only false positives can admit them now.
+    Put(a, "fill_b_", 2 * kWindow - kTargets, kSmallObject);
+    Drain(a);
+    Put(a, "target_", kTargets, kSmallObject);
+    EXPECT_LE(Drain(a).size(), static_cast<size_t>(kTargets * 10 / 100));
+}
+
+TEST_F(OffloadAdmissionTest, SecondPutKeepsPutOrderForQueueOrderBuckets) {
+    // MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER (store side) fills buckets in
+    // task id order. Admission only removes pushes, so the admitted items
+    // still carry ids in put order, and skipped puts take no id.
+    Start(EagerConfig(/*second_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    std::vector<std::string> order;
+    for (int i = 0; i < 10; ++i) {
+        for (const char* half : {"_k", "_v"}) {
+            order.push_back("p" + std::to_string(i) + half);
+        }
+    }
+    auto put_in_order = [&] {
+        for (const auto& key : order) {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.preferred_segment = a.segment_name;
+            ASSERT_TRUE(service_->PutStart(
+                a.client_id, key, TenantId::Default(), kSmallObject, config));
+            ASSERT_TRUE(service_->PutEnd(a.client_id, key, TenantId::Default(),
+                                         ReplicaType::MEMORY));
+        }
+    };
+    put_in_order();
+    EXPECT_TRUE(Drain(a).empty());
+    RemoveAll(order);
+    put_in_order();
+
+    auto taken = Drain(a);
+    ASSERT_EQ(taken.size(), order.size());
+    std::sort(taken.begin(), taken.end(), [](const auto& x, const auto& y) {
+        return x.task_id->seq < y.task_id->seq;
+    });
+    for (size_t i = 0; i < order.size(); ++i) {
+        EXPECT_EQ(taken[i].key, order[i]) << i;
+    }
+    EXPECT_EQ(taken.back().task_id->seq - taken.front().task_id->seq,
+              order.size() - 1);
+}
+
+// --- (b) read since put
+// -------------------------------------------------------
+
+TEST_F(OffloadAdmissionTest, ReadSincePutEvictsUnreadAndQueuesRead) {
+    Start(ExclusiveConfig(/*read_since_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+    const auto keys = Put(a, "obj_", 20, kSmallObject);
+    for (const auto& key : keys) EXPECT_TRUE(Unread(key)) << key;
+
+    // Keys 0..4 are read by GetReplicaList, 5..9 by BatchGetReplicaList;
+    // 10..19 only answer exists queries, which are not reads.
+    std::vector<std::string> read(keys.begin(), keys.begin() + 10);
+    std::vector<std::string> unread(keys.begin() + 10, keys.end());
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(service_->GetReplicaList(keys[i], TenantId::Default()));
+    }
+    for (const auto& r : service_->BatchGetReplicaList(
+             std::vector<std::string>(keys.begin() + 5, keys.begin() + 10),
+             TenantId::Default())) {
+        ASSERT_TRUE(r.has_value());
+    }
+    for (const auto& r : service_->BatchExistKey(unread, TenantId::Default())) {
+        ASSERT_TRUE(r.has_value() && *r);
+    }
+    for (const auto& key : read) EXPECT_FALSE(Unread(key)) << key;
+    for (const auto& key : unread) EXPECT_TRUE(Unread(key)) << key;
+
+    Evict(/*ratio=*/1.0);
+
+    const auto taken = Drain(a);
+    EXPECT_EQ(Keys(taken), Sorted(read));
+    for (const auto& key : unread) EXPECT_FALSE(Peek(key).exists) << key;
+    EXPECT_EQ(Counters().unread_evicted - before.unread_evicted, 10);
+
+    // The read keys follow the usual exclusive path.
+    Report(a, taken, static_cast<int64_t>(kSmallObject));
+    Evict(/*ratio=*/1.0);
+    for (const auto& key : read) {
+        EXPECT_EQ(Peek(key).memory, 0u) << key;
+        EXPECT_EQ(Peek(key).local_disk, 1u) << key;
+    }
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutMarkIsResetByTheNextPut) {
+    Start(ExclusiveConfig(/*read_since_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "again_", 4, kSmallObject);
+    for (const auto& key : keys) {
+        ASSERT_TRUE(service_->GetReplicaList(key, TenantId::Default()));
+        EXPECT_FALSE(Unread(key));
+    }
+    RemoveAll(keys);
+    Put(a, "again_", 4, kSmallObject);
+    for (const auto& key : keys) EXPECT_TRUE(Unread(key)) << key;
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutWithFrontierOnlyKeepsLeaseOrder) {
+    // 2000 keys, key i holds the i-th oldest lease; the odd ones are read.
+    // With the 5% target (evict_num 100) the cycle walks the frontier from
+    // the oldest: even keys are evicted, odd keys are queued, and it stops
+    // once 100 objects are evicted. Nothing past that is touched.
+    constexpr int kKeys = 2000;
+    MasterServiceConfig config = ExclusiveConfig(/*read_since_put=*/true);
+    config.offload_evict_frontier_only = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "lease_", kKeys, kSmallObject);
+    for (int i = 1; i < kKeys; i += 2) {
+        ASSERT_TRUE(service_->GetReplicaList(keys[i], TenantId::Default()));
+    }
+    const auto base = std::chrono::system_clock::now() - std::chrono::hours(1);
+    for (int i = 0; i < kKeys; ++i) {
+        SetLease(keys[i], base + std::chrono::milliseconds(i));
+    }
+
+    Evict(/*ratio=*/0.05);
+
+    auto taken = Drain(a);
+    std::sort(taken.begin(), taken.end(), [](const auto& x, const auto& y) {
+        return x.task_id->seq < y.task_id->seq;
+    });
+    std::vector<int> queued;
+    for (const auto& item : taken)
+        queued.push_back(std::stoi(item.key.substr(6)));
+    std::vector<int> expected;
+    for (int i = 1; i < 199; i += 2) expected.push_back(i);
+    EXPECT_EQ(queued, expected);
+    for (int i = 0; i < 200; i += 2) {
+        EXPECT_FALSE(Peek(keys[i]).exists) << keys[i];
+    }
+    for (int i = 199; i < kKeys; ++i) {
+        ASSERT_EQ(Peek(keys[i]).memory, 1u) << keys[i];
+    }
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutWithDefaultOrderDropsOnlyUnread) {
+    // Same keys without frontier_only: the frontier is walked in nth_element
+    // order, so which keys are visited is not fixed, but every evicted key is
+    // unread and every queued key was read.
+    constexpr int kKeys = 2000;
+    Start(ExclusiveConfig(/*read_since_put=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "lease_", kKeys, kSmallObject);
+    for (int i = 1; i < kKeys; i += 2) {
+        ASSERT_TRUE(service_->GetReplicaList(keys[i], TenantId::Default()));
+    }
+
+    Evict(/*ratio=*/0.05);
+
+    for (const auto& item : Drain(a)) {
+        EXPECT_EQ(std::stoi(item.key.substr(6)) % 2, 1) << item.key;
+    }
+    int evicted = 0;
+    for (int i = 0; i < kKeys; ++i) {
+        if (!Peek(keys[i]).exists) {
+            ++evicted;
+            EXPECT_EQ(i % 2, 0) << keys[i];
+        }
+    }
+    EXPECT_EQ(evicted, 100);
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutDropsNothingPastTheFrontier) {
+    // The 1124 oldest keys (the compact frontier) were read, the 876 newer
+    // ones were not. The frontier only queues, so the cycle goes on past it.
+    // There an unread key is never dropped: without frontier_only it is
+    // queued as before, with it it stays in memory.
+    constexpr int kKeys = 2000;
+    constexpr int kFrontier = 1124;
+    for (const bool frontier_only : {false, true}) {
+        SCOPED_TRACE(frontier_only);
+        MasterServiceConfig config = ExclusiveConfig(/*read_since_put=*/true);
+        config.offload_evict_frontier_only = frontier_only;
+        Start(config);
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const auto keys = Put(a, "lease_", kKeys, kSmallObject);
+        for (int i = 0; i < kFrontier; ++i) {
+            ASSERT_TRUE(service_->GetReplicaList(keys[i], TenantId::Default()));
+        }
+        const auto base =
+            std::chrono::system_clock::now() - std::chrono::hours(1);
+        for (int i = 0; i < kKeys; ++i) {
+            SetLease(keys[i], base + std::chrono::milliseconds(i));
+        }
+        const auto before = Counters();
+
+        Evict(/*ratio=*/0.05);
+
+        EXPECT_EQ(Drain(a).size(),
+                  static_cast<size_t>(frontier_only ? kFrontier : kKeys));
+        for (int i = kFrontier; i < kKeys; ++i) {
+            ASSERT_EQ(Peek(keys[i]).memory, 1u) << keys[i];
+        }
+        EXPECT_EQ(Counters().unread_evicted, before.unread_evicted);
+        service_->RemoveAll();
+    }
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutOnStoresWithoutLocalDisk) {
+    // Store b has no LOCAL_DISK tier. Unread objects are evicted on both
+    // stores. A read object of b stays in memory by default and is evicted
+    // when offload_evict_without_local_disk is set.
+    for (const bool without_local_disk : {false, true}) {
+        SCOPED_TRACE(without_local_disk);
+        MasterServiceConfig config = ExclusiveConfig(/*read_since_put=*/true);
+        config.offload_evict_without_local_disk = without_local_disk;
+        Start(config);
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const Store b = AddStore("store_b", /*with_disk=*/false);
+        const auto a_keys = Put(a, "a_", 10, kSmallObject);
+        const auto b_keys = Put(b, "b_", 10, kSmallObject);
+        for (int i = 0; i < 5; ++i) {
+            ASSERT_TRUE(
+                service_->GetReplicaList(a_keys[i], TenantId::Default()));
+            ASSERT_TRUE(
+                service_->GetReplicaList(b_keys[i], TenantId::Default()));
+        }
+        const auto before = Counters();
+
+        Evict(/*ratio=*/1.0);
+
+        EXPECT_EQ(Keys(Drain(a)), Sorted(std::vector<std::string>(
+                                      a_keys.begin(), a_keys.begin() + 5)));
+        for (int i = 5; i < 10; ++i) {
+            EXPECT_FALSE(Peek(a_keys[i]).exists) << a_keys[i];
+            EXPECT_FALSE(Peek(b_keys[i]).exists) << b_keys[i];
+        }
+        for (int i = 0; i < 5; ++i) {
+            EXPECT_EQ(Peek(b_keys[i]).exists, !without_local_disk) << b_keys[i];
+        }
+        EXPECT_EQ(Counters().unread_evicted - before.unread_evicted, 10);
+        service_->RemoveAll();
+    }
+}
+
+TEST_F(OffloadAdmissionTest, ReadSincePutUnreadDoesNotUseTheForceCap) {
+    // With force_evict and a cap of 2, unread objects are evicted by
+    // admission before the cap is counted, so the read ones still get
+    // the two queue slots.
+    MasterServiceConfig config = ExclusiveConfig(/*read_since_put=*/true);
+    config.offload_force_evict = true;
+    config.offloading_queue_limit = 4;
+    config.offload_cap_ratio = 0.5;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "cap_", 10, kSmallObject);
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(service_->GetReplicaList(keys[i], TenantId::Default()));
+    }
+
+    Evict(/*ratio=*/1.0);
+
+    EXPECT_EQ(Keys(Drain(a)), Sorted({keys[0], keys[1]}));
+}
+
 TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
     MasterServiceConfig config;
+    EXPECT_FALSE(config.offload_admission_second_put);
+    EXPECT_FALSE(config.offload_admission_read_since_put);
+    EXPECT_EQ(config.offload_admission_window_puts, 33554432u);
     EXPECT_FALSE(config.offload_evict_without_local_disk);
     EXPECT_FALSE(config.offload_evict_frontier_only);
     EXPECT_FALSE(config.offload_force_evict);

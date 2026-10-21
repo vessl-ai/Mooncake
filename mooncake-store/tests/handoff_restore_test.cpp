@@ -948,6 +948,77 @@ TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
     ExpectEmpty(master);
 }
 
+// Offload admission state (INF-651 C4-1) is not in the snapshot. A restored
+// object counts as read, so offload_admission_read_since_put offloads it at
+// eviction as plain offload_on_evict would. The second-put filter starts
+// empty, so a key put once before the roll is a first put again.
+TEST_F(HandoffRestoreTest, OffloadAdmissionStateIsNotCarried) {
+    auto unread = [](MasterService& service, const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists()) << key;
+        return accessor.Exists() &&
+               accessor.Get().unread_since_put.load(std::memory_order_relaxed);
+    };
+    {
+        auto config = MakeL4Config();
+        config.offload_on_evict = true;
+        config.offload_admission_read_since_put = true;
+        TempDir dir;
+        {
+            MasterService old_master(config);
+            Populate(old_master, 1, 20);
+            for (int i = 0; i < 20; ++i) {
+                EXPECT_TRUE(unread(old_master, Key(0, i)));
+            }
+            Write(old_master, dir.path());
+        }
+        MasterService master(config);
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+        ASSERT_TRUE(Remount(master, stores_[0]));
+        for (int i = 0; i < 20; ++i) {
+            EXPECT_FALSE(unread(master, Key(0, i)));
+        }
+        Put(master, stores_[0], "after-roll");
+        EXPECT_TRUE(unread(master, "after-roll"));
+    }
+    stores_.clear();
+    {
+        auto config = MakeL4Config();
+        config.offload_admission_second_put = true;
+        config.offload_admission_window_puts = 1024;
+        TempDir dir;
+        {
+            MasterService old_master(config);
+            Populate(old_master, 1, 20);  // first puts: nothing queued
+            Write(old_master, dir.path());
+        }
+        MasterService master(config);
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+        ASSERT_TRUE(Remount(master, stores_[0]));
+        EnableL4(master, stores_[0]);
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE(master.Remove(Key(0, i), TenantId::Default(),
+                                      /*force=*/true));
+            Put(master, stores_[0], Key(0, i));
+        }
+        // The new master never saw the old puts: these are first puts.
+        auto taken = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_TRUE(taken->empty());
+        // The next put of each key is written.
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE(master.Remove(Key(0, i), TenantId::Default(),
+                                      /*force=*/true));
+            Put(master, stores_[0], Key(0, i));
+        }
+        taken = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_EQ(taken->size(), 20u);
+    }
+}
+
 TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
     // Schema 1 and 2 snapshots lack the held-back ranges of discarded
     // replicas and DRAINING segments, so restoring them could hand out a

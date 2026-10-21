@@ -197,6 +197,9 @@ struct MasterConfig {
     bool offload_force_evict = false;
     bool offload_evict_without_local_disk = false;
     bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
     bool placement_key_hrw = false;
@@ -334,6 +337,9 @@ class MasterServiceSupervisorConfig {
     bool offload_force_evict = false;
     bool offload_evict_without_local_disk = false;
     bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
     bool placement_key_hrw = false;
@@ -407,6 +413,10 @@ class MasterServiceSupervisorConfig {
         offload_evict_without_local_disk =
             config.offload_evict_without_local_disk;
         offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
         placement_key_hrw = config.placement_key_hrw;
@@ -620,6 +630,9 @@ class WrappedMasterServiceConfig {
     bool offload_force_evict = false;
     bool offload_evict_without_local_disk = false;
     bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
     bool placement_key_hrw = false;
@@ -729,6 +742,10 @@ class WrappedMasterServiceConfig {
         offload_evict_without_local_disk =
             config.offload_evict_without_local_disk;
         offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
         placement_key_hrw = config.placement_key_hrw;
@@ -868,6 +885,10 @@ class WrappedMasterServiceConfig {
         offload_evict_without_local_disk =
             config.offload_evict_without_local_disk;
         offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
         placement_key_hrw = config.placement_key_hrw;
@@ -1378,6 +1399,9 @@ class MasterServiceConfig {
     bool offload_force_evict = false;
     bool offload_evict_without_local_disk = false;
     bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
     bool placement_key_hrw = false;
@@ -1483,6 +1507,10 @@ class MasterServiceConfig {
         offload_evict_without_local_disk =
             config.offload_evict_without_local_disk;
         offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
         placement_key_hrw = config.placement_key_hrw;

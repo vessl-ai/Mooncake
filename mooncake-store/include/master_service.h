@@ -44,6 +44,7 @@
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
+#include "offload_admission_filter.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "reuse_sampler.h"
@@ -1749,6 +1750,23 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
+    // offload_admission_read_since_put: a read served from memory clears the
+    // object's unread mark. Loads first so that a hot object's cache line is
+    // not written on every read.
+    static void MarkReadFromMemory(const ObjectMetadata& metadata) {
+        if (metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            metadata.unread_since_put.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // offload_admission_second_put: whether a PutEnd may queue its eager
+    // offload. True when the mode is off. Otherwise records the put in the
+    // admission filter and answers whether the key was put before;
+    // `same_write_judged` (a later End of a write already judged) only reads
+    // the filter.
+    bool AdmitEagerOffload(const ObjectIdentity& object_id,
+                           bool same_write_judged);
+
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
@@ -2385,6 +2403,15 @@ class MasterService {
     // visits are freed only when they already have a disk copy. (config:
     // offload_evict_frontier_only, only effective when offload_on_evict_=true)
     bool offload_evict_frontier_only_{false};
+    // Second-put admission: in eager mode PutEnd queues an offload only for a
+    // key the filter has seen put before. Null when off. (config:
+    // offload_admission_second_put, offload_admission_window_puts; only with
+    // enable_offload_ and offload_on_evict_=false)
+    std::unique_ptr<OffloadAdmissionFilter> offload_admission_filter_;
+    // Read-since-put admission: with offload_on_evict, eviction drops
+    // without a disk copy an object marked unread_since_put. (config:
+    // offload_admission_read_since_put, only with offload_on_evict_=true)
+    bool offload_admission_read_since_put_{false};
 
     // Offload stall metrics (config: enable_offload_stall_metrics).
     bool offload_stall_metrics_{false};
