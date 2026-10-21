@@ -107,6 +107,26 @@ constexpr size_t kStaleHandleCleanupBatchSize = 64;
 // until a store's mailbox holds `offloading_queue_limit_` items, and a push
 // beyond that fails with KEYS_ULTRA_LIMIT and leaves the object in memory.
 
+// Why the offload pushes for one eviction candidate failed. A push fails with
+// UNABLE_OFFLOADING only when no LOCAL_DISK tier can take the item: the
+// owning store has none registered (never mounted, or unmounted after a fence
+// or a drain), its mailbox has offloading disabled (a fence), or the replica
+// names no source segment. Other failures (a full mailbox, an owner that is
+// not serving) can clear on their own, so they keep the candidate in memory.
+struct OffloadPushFailures {
+    bool any = false;
+    bool other_than_no_local_disk = false;
+
+    void Record(ErrorCode error) {
+        any = true;
+        if (error != ErrorCode::UNABLE_OFFLOADING) {
+            other_than_no_local_disk = true;
+        }
+    }
+
+    bool OnlyNoLocalDisk() const { return any && !other_than_no_local_disk; }
+};
+
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
     kRedis,
@@ -423,6 +443,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         if (offload_force_evict_) {
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
+        }
+        offload_evict_without_local_disk_ =
+            config.offload_evict_without_local_disk;
+        if (offload_evict_without_local_disk_) {
+            LOG(INFO) << "Evict-without-local-disk enabled: objects on a "
+                         "store with no LOCAL_DISK tier taking offloads will "
+                         "be evicted without disk offload";
         }
     }
 
@@ -11542,6 +11569,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;
     long offload_push_failed_forced = 0;
+    long offload_no_local_disk_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -11573,10 +11601,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         }
 
         bool queued = false;
+        OffloadPushFailures push_failures;
         metadata.VisitReplicas(
             is_evictable_memory_replica,
             [this, &key, &normalized_tenant, &tenant_state, &queued,
-             &now](Replica& replica) {
+             &push_failures, &now](Replica& replica) {
                 if (queued) {
                     return;
                 }
@@ -11598,6 +11627,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                  .source_clients = std::move(source_clients),
                                  .task_id = task_id});
                     queued = true;
+                } else {
+                    push_failures.Record(result.error());
                 }
             });
 
@@ -11607,6 +11638,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
+        if (offload_evict_without_local_disk_ &&
+            push_failures.OnlyNoLocalDisk()) {
+            ++offload_no_local_disk_evicted;
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
         if (offload_force_evict_) {
             ++offload_push_failed_forced;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
@@ -11789,6 +11825,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      << "; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload.";
     }
+    if (offload_no_local_disk_evicted > 0) {
+        LOG(INFO) << "[TENANT-EVICT] Evicted " << offload_no_local_disk_evicted
+                  << " object(s) of tenant " << normalized_tenant
+                  << " without disk offload: their store has no LOCAL_DISK "
+                     "tier taking offloads "
+                     "(offload_evict_without_local_disk=true).";
+    }
     if (offload_push_failed_forced > 0) {
         LOG(WARNING) << "[TENANT-EVICT] PushOffloadingQueue failed for tenant "
                      << normalized_tenant << " on "
@@ -11863,6 +11906,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    // #keys evicted because no LOCAL_DISK tier takes their offload
+    long offload_no_local_disk_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -11909,9 +11954,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
+        OffloadPushFailures push_failures;
         metadata.VisitReplicas(
-            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
-                                          &queued, &now](Replica& replica) {
+            is_evictable_memory_replica,
+            [this, &tenant_id, &key, &tenant_state, &queued, &push_failures,
+             &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 std::vector<UUID> mirror_clients;
                 const L4TaskId task_id = NextL4TaskId();
@@ -11931,6 +11978,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                  .source_clients = std::move(source_clients),
                                  .task_id = task_id});
                     queued = true;
+                } else {
+                    push_failures.Record(result.error());
                 }
             });
 
@@ -11940,6 +11989,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
+        // Every push failed because no LOCAL_DISK tier takes the offload
+        // (none registered, fenced, unmounted, offloading disabled). Waiting
+        // cannot help, so when opted in evict as the eager mode would.
+        if (offload_evict_without_local_disk_ &&
+            push_failures.OnlyNoLocalDisk()) {
+            offload_no_local_disk_evicted++;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
@@ -12653,6 +12711,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced
+            << ", offload_no_local_disk_evicted="
+            << offload_no_local_disk_evicted
             << ", total_freed_size=" << total_freed_size
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="
@@ -12688,6 +12748,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         LOG(WARNING) << "[EVICT] Offload cap (" << offload_cap
                      << ") reached; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload this cycle.";
+    }
+    if (offload_no_local_disk_evicted > 0) {
+        LOG(INFO) << "[EVICT] Evicted " << offload_no_local_disk_evicted
+                  << " object(s) without disk offload: their store has no "
+                     "LOCAL_DISK tier taking offloads "
+                     "(offload_evict_without_local_disk=true).";
     }
     if (offload_push_failed_forced > 0) {
         LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "

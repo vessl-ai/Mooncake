@@ -809,6 +809,7 @@ Flags for controlling data movement between DRAM and SSD.
 | `--enable_offload` | `false` | Enable offload from DRAM to SSD |
 | `--offload_on_evict` | `false` | Defer offload to eviction time rather than at `Put` |
 | `--offload_force_evict` | `false` | With `--offload_on_evict`, evict without offload the objects beyond the per-cycle offload cap and the objects whose offload push fails |
+| `--offload_evict_without_local_disk` | `false` | With `--offload_on_evict`, evict without offload (as eager mode does) an object whose client has no local disk segment taking offloads (none mounted, fenced, unmounted, or offloading disabled). A full offload queue still keeps the object in memory |
 | `--offloading_queue_limit` | `50000` | Max number of objects allowed in the offloading queue per local disk segment. Increase to allow more objects to be offloaded to SSD before force-eviction kicks in |
 | `--offload_cap_ratio` | `0.5` | Per-cycle offload cap as a fraction of `offloading_queue_limit` (range `[0.0, 1.0]`). Used only with `--offload_force_evict=true`: controls how many objects can be queued for offload in a single eviction cycle before falling back to force-evict |
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |

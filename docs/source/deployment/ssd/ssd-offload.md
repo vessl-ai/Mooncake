@@ -113,6 +113,7 @@ These flags control when the master asks clients to persist objects to SSD, whet
 | `--enable_offload` | `false` | Enables the master-side SSD offload control plane. Set this on the master and on every real client that owns SSD storage |
 | `--offload_on_evict` | `false` | Defer SSD persistence until memory eviction selects an object. When `false`, successful `Put` completion queues eager SSD persistence |
 | `--offload_force_evict` | `false` | With offload-on-evict, evict without an SSD copy the objects beyond the per-cycle offload cap and the objects whose offload push fails, instead of leaving them in DRAM |
+| `--offload_evict_without_local_disk` | `false` | With offload-on-evict, evict without an SSD copy (as eager mode does) an object whose offload push fails because its client has no local disk segment taking offloads: none mounted, fenced, unmounted, or offloading disabled. A full offload queue still leaves the object in DRAM |
 | `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
 | `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle. Used only with `--offload_force_evict=true` |
 | `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
@@ -122,7 +123,7 @@ These flags control when the master asks clients to persist objects to SSD, whet
 
 Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict with `--offload_force_evict=true` is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
 
-Without `--offload_force_evict`, the per-cycle cap is not applied: an eviction cycle queues candidates until a client's queue holds `offloading_queue_limit` objects, and an object that cannot be queued stays in DRAM until a later cycle queues it. Memory is freed only by the eviction cycle after the SSD copy completes. An object on a client with no local disk segment taking offloads is never queued, so with offload-on-evict that client's DRAM is not reclaimed by eviction unless `--offload_force_evict=true` is set.
+Without `--offload_force_evict`, the per-cycle cap is not applied: an eviction cycle queues candidates until a client's queue holds `offloading_queue_limit` objects, and an object that cannot be queued stays in DRAM until a later cycle queues it. Memory is freed only by the eviction cycle after the SSD copy completes. An object on a client with no local disk segment taking offloads is never queued, so with offload-on-evict that client's DRAM is not reclaimed by eviction unless `--offload_evict_without_local_disk=true` (or `--offload_force_evict=true`) is set.
 
 ---
 

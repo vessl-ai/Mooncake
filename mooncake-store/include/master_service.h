@@ -2261,6 +2261,12 @@ class MasterService {
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
+    // Evict-without-disk: with offload_on_evict, evict a key at once (no
+    // disk copy, as the eager mode does) when its offload push fails because
+    // the owning store has no LOCAL_DISK tier taking offloads. Other push
+    // failures still skip the key. (config: offload_evict_without_local_disk,
+    // only effective when offload_on_evict_=true)
+    bool offload_evict_without_local_disk_{false};
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

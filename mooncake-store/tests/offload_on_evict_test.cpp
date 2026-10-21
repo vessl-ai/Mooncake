@@ -542,6 +542,52 @@ TEST_F(OffloadOnEvictCycleTest, MixedStoresFreezeOnlyTheStoreWithoutLocalDisk) {
         ClientCounter("master_offload_enqueue_rejected_total", b.client_id), 0);
 }
 
+TEST_F(OffloadOnEvictCycleTest, MixedStoresEvictWithoutLocalDiskWhenOptedIn) {
+    MasterServiceConfig config = Config();
+    config.offload_evict_without_local_disk = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const Store b = AddStore("store_b", /*with_disk=*/false);
+    const auto keys_a = Put(a, "optin_a_", 4);
+    const auto keys_b = Put(b, "optin_b_", 4);
+
+    Evict();
+
+    for (const auto& key : keys_b) {
+        EXPECT_FALSE(CopiesOf(key).exists) << key;
+    }
+    // The store with a disk tier is unchanged: queued, not freed.
+    const auto taken = Drain(a);
+    EXPECT_EQ(taken.size(), keys_a.size());
+    for (const auto& key : keys_a) {
+        EXPECT_EQ(CopiesOf(key).memory, 1u) << key;
+    }
+    Complete(a, taken);
+    Evict();
+    for (const auto& key : keys_a) {
+        EXPECT_EQ(CopiesOf(key).memory, 0u) << key;
+        EXPECT_EQ(CopiesOf(key).local_disk, 1u) << key;
+    }
+}
+
+TEST_F(OffloadOnEvictCycleTest, OptInStillSkipsWhenTheQueueIsFull) {
+    // A full mailbox is not "no disk tier": the opt-in leaves those objects
+    // in memory, as the default does.
+    MasterServiceConfig config = Config();
+    config.offload_evict_without_local_disk = true;
+    config.offloading_queue_limit = 2;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "full_q_", 5);
+
+    Evict();
+
+    for (const auto& key : keys) {
+        EXPECT_TRUE(CopiesOf(key).exists) << key;
+    }
+    EXPECT_EQ(Drain(a).size(), 2u);
+}
+
 TEST_F(OffloadOnEvictCycleTest, FenceReleasesQueuedTasksAndFreezesMemory) {
     // A disk fence first sends OffloadObjectHeartbeat(false): the queued
     // tasks end and their sources are unpinned, and the store takes no new
@@ -564,6 +610,49 @@ TEST_F(OffloadOnEvictCycleTest, FenceReleasesQueuedTasksAndFreezesMemory) {
     EXPECT_TRUE(Drain(a).empty());
     Evict();
     EXPECT_EQ(Drain(a).size(), keys.size());
+}
+
+TEST_F(OffloadOnEvictCycleTest, FenceEvictsQueuedObjectsWhenOptedIn) {
+    MasterServiceConfig config = Config();
+    config.offload_evict_without_local_disk = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "fence_optin_", 4);
+
+    Evict();
+    ASSERT_TRUE(service_->OffloadObjectHeartbeat(a.client_id, false));
+    Evict();
+
+    for (const auto& key : keys) {
+        EXPECT_FALSE(CopiesOf(key).exists) << key;
+    }
+}
+
+TEST_F(OffloadOnEvictCycleTest, FenceKeepsTasksTheStoreAlreadyTook) {
+    // OffloadObjectHeartbeat(false) ends only tasks still in the mailbox.
+    // A task the store already took keeps its source pinned until the store
+    // reports it (a fenced store NACKs its carried tasks) or the task
+    // expires; the opt-in cannot evict a pinned source either.
+    MasterServiceConfig config = Config();
+    config.offload_evict_without_local_disk = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "fence_taken_", 3);
+
+    Evict();
+    const auto taken = Drain(a);
+    ASSERT_EQ(taken.size(), keys.size());
+    ASSERT_TRUE(service_->OffloadObjectHeartbeat(a.client_id, false));
+    Evict();
+    for (const auto& key : keys) {
+        EXPECT_EQ(CopiesOf(key).memory, 1u) << key;
+    }
+
+    Nack(a, taken);
+    Evict();
+    for (const auto& key : keys) {
+        EXPECT_FALSE(CopiesOf(key).exists) << key;
+    }
 }
 
 TEST_F(OffloadOnEvictCycleTest, UnmountSweepsDiskOnlyObjectsAndFreezesTheRest) {
@@ -595,6 +684,27 @@ TEST_F(OffloadOnEvictCycleTest, UnmountSweepsDiskOnlyObjectsAndFreezesTheRest) {
     }
 }
 
+TEST_F(OffloadOnEvictCycleTest, UnmountedStoreIsEvictedWhenOptedIn) {
+    // With the opt-in, a memory-only object of the unmounted store is
+    // evicted. One whose task was outstanding at the unmount stays pinned.
+    MasterServiceConfig config = Config();
+    config.offload_evict_without_local_disk = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "unmount_optin_", 3);
+
+    Evict();
+    const auto taken = Drain(a);
+    ASSERT_EQ(taken.size(), keys.size());
+    Nack(a, Select(taken, {keys[0]}));  // keys[0] is back in memory only
+    ASSERT_TRUE(service_->UnmountLocalDiskSegment(a.client_id));
+    Evict();
+
+    EXPECT_FALSE(CopiesOf(keys[0]).exists);
+    EXPECT_EQ(CopiesOf(keys[1]).memory, 1u);
+    EXPECT_EQ(CopiesOf(keys[2]).memory, 1u);
+}
+
 TEST_F(OffloadOnEvictCycleTest, DiskCopyEvictedByTheStoreIsWrittenAgain) {
     // An object whose disk copy the store's bucket eviction removed while it
     // was still in memory goes back to the queue on its next eviction.
@@ -617,6 +727,13 @@ TEST_F(OffloadOnEvictCycleTest, DiskCopyEvictedByTheStoreIsWrittenAgain) {
     ASSERT_EQ(again.size(), 1u);
     ASSERT_TRUE(again[0].task_id.has_value());
     EXPECT_NE(*again[0].task_id, *taken[0].task_id);
+}
+
+TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
+    MasterServiceConfig config;
+    EXPECT_FALSE(config.offload_evict_without_local_disk);
+    EXPECT_FALSE(config.offload_force_evict);
+    EXPECT_FALSE(config.offload_on_evict);
 }
 
 }  // namespace mooncake::test

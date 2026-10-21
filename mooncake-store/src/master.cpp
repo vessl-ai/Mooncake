@@ -236,6 +236,13 @@ DEFINE_bool(offload_force_evict, false,
             "With offload_on_evict, evict without a disk copy the objects "
             "beyond the per-cycle offload cap and the objects whose offload "
             "push fails");
+DEFINE_bool(offload_evict_without_local_disk, false,
+            "With offload_on_evict, evict without a disk copy, as the eager "
+            "mode does, an object whose offload push fails because the store "
+            "holding it has no LOCAL_DISK tier taking offloads (none "
+            "registered, fenced, unmounted, or offloading disabled). A full "
+            "offload queue and other push failures still keep the object in "
+            "memory");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -657,6 +664,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("offload_evict_without_local_disk",
+                           &master_config.offload_evict_without_local_disk,
+                           FLAGS_offload_evict_without_local_disk);
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -1055,6 +1065,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_evict_without_local_disk",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_evict_without_local_disk =
+            FLAGS_offload_evict_without_local_disk;
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1994,6 +2011,8 @@ int main(int argc, char* argv[]) {
         << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", offload_evict_without_local_disk="
+        << master_config.offload_evict_without_local_disk
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type

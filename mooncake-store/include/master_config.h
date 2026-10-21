@@ -195,6 +195,7 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
@@ -324,6 +325,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -388,6 +390,8 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -593,6 +597,7 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -693,6 +698,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -823,6 +830,8 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -1325,6 +1334,7 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -1421,6 +1431,8 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
