@@ -98,6 +98,9 @@ namespace {
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
 
+// How often the eviction thread recomputes the offload stall gauges.
+constexpr auto kOffloadStallMetricsInterval = std::chrono::seconds(10);
+
 // Per-cycle offload cap: `offloading_queue_limit_ * offload_cap_ratio_`
 // (--offloading_queue_limit, --offload_cap_ratio). Used only in
 // offload-on-evict mode with `offload_force_evict_` set: once a BatchEvict
@@ -451,6 +454,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "store with no LOCAL_DISK tier taking offloads will "
                          "be evicted without disk offload";
         }
+    }
+
+    offload_stall_metrics_ =
+        enable_offload_ && config.enable_offload_stall_metrics;
+    if (offload_stall_metrics_) {
+        LOG(INFO) << "Offload stall metrics enabled";
+    }
+
+    if (config.enable_reuse_sampler) {
+        reuse_sampler_ = std::make_unique<ReuseSampler>(
+            config.reuse_sampler_rate, config.reuse_sampler_max_entries);
+        LOG(INFO) << "Reuse sampler enabled: sampling_rate="
+                  << reuse_sampler_->sampling_rate()
+                  << ", max_entries=" << reuse_sampler_->capacity();
     }
 
     // Growth-triggered heap trimming (see MaybeTrimHeap()). On unless the
@@ -3389,9 +3406,13 @@ auto MasterService::ProbeKey(const std::string& key, const TenantId& tenant_id)
 auto MasterService::ExistKeyImpl(const std::string& key,
                                  const TenantId& tenant_id, bool grant_lease)
     -> tl::expected<bool, ErrorCode> {
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    // A probe (no lease) is not a use of the object.
+    if (reuse_sampler_ && grant_lease) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "exist");
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this,
-                                MakeObjectIdentityForRequest(key, tenant_id));
+    MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
@@ -3429,6 +3450,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
         return results;
+    }
+
+    if (reuse_sampler_ && grant_lease) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "exist");
+        }
     }
 
     std::vector<std::vector<size_t>> indices_by_shard(kNumShards);
@@ -4485,6 +4512,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "get");
+    }
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
@@ -4622,6 +4652,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    if (reuse_sampler_) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "get");
+        }
+    }
     constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
@@ -5148,6 +5183,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key,
+                             "put_start");
+    }
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -6505,6 +6544,10 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (!metadata.IsValid()) {
+        if (reuse_sampler_) {
+            SampleDiskEviction(object_id.tenant_id, object_id.user_key,
+                               metadata);
+        }
         accessor.Erase();
     }
     return {};
@@ -8896,6 +8939,129 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     return {};
 }
 
+void MasterService::UpdateOffloadStallMetrics() {
+    const auto now = std::chrono::system_clock::now();
+    int64_t pending = 0;
+    int64_t without_local_disk = 0;
+    std::optional<std::chrono::system_clock::time_point> oldest;
+    // Each store's registration is looked up once per walk.
+    std::unordered_map<UUID, bool, boost::hash<UUID>> registered;
+    auto has_local_disk = [&](const UUID& client_id) {
+        auto [it, inserted] = registered.try_emplace(client_id, false);
+        if (inserted) {
+            it->second = HasMountedLocalDiskSegment(client_id);
+        }
+        return it->second;
+    };
+
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (const auto& [key, task] : tenant_state.offloading_tasks) {
+                    ++pending;
+                    if (!oldest || task.start_time < *oldest) {
+                        oldest = task.start_time;
+                    }
+                    // No target store can take or report it any more: the
+                    // pinned source is freed only when the task expires.
+                    if (std::none_of(task.mirror_clients.begin(),
+                                     task.mirror_clients.end(),
+                                     has_local_disk)) {
+                        ++without_local_disk;
+                    }
+                }
+            }
+        }
+    }
+
+    int64_t oldest_age_seconds = 0;
+    if (oldest) {
+        oldest_age_seconds = std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::seconds>(now - *oldest)
+                   .count());
+    }
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_offload_tasks_pending(pending);
+    metrics.set_offload_tasks_without_local_disk(without_local_disk);
+    metrics.set_offload_task_oldest_age_seconds(oldest_age_seconds);
+}
+
+namespace {
+
+double ToSeconds(std::chrono::nanoseconds duration) {
+    return std::max(0.0, std::chrono::duration<double>(duration).count());
+}
+
+double SecondsSincePutStart(const ObjectMetadata& metadata) {
+    return ToSeconds(std::chrono::system_clock::now() -
+                     metadata.put_start_time);
+}
+
+}  // namespace
+
+void MasterService::SampleReuseReference(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const char* op) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const auto reuse = reuse_sampler_->RecordReference(
+        fingerprint, ReuseSampler::Clock::now());
+    if (!reuse) {
+        return;
+    }
+    auto& metrics = MasterMetricManager::instance();
+    if (reuse->since_memory_eviction) {
+        metrics.observe_reuse_sampler_memory_reuse_age(
+            reuse->disk_copy_present ? "disk" : "none", op,
+            ToSeconds(*reuse->since_memory_eviction));
+    }
+    if (reuse->since_disk_eviction) {
+        metrics.observe_reuse_sampler_disk_reuse_age(
+            op, ToSeconds(*reuse->since_disk_eviction));
+    }
+}
+
+void MasterService::SampleMemoryEviction(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const ObjectMetadata& metadata) {
+    // A memory replica that survived (pinned for offload, or being
+    // written) keeps the key in memory: nothing left the cache yet.
+    if (metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.status() != ReplicaStatus::REMOVED;
+        })) {
+        return;
+    }
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const bool disk_copy_kept = metadata.HasReplica([](const Replica& replica) {
+        return !replica.is_memory_replica() &&
+               replica.status() != ReplicaStatus::REMOVED;
+    });
+    reuse_sampler_->RecordMemoryEviction(fingerprint, disk_copy_kept,
+                                         ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "memory", SecondsSincePutStart(metadata));
+}
+
+void MasterService::SampleDiskEviction(const TenantId& tenant_id,
+                                       const std::string& user_key,
+                                       const ObjectMetadata& metadata) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    reuse_sampler_->RecordDiskEviction(fingerprint, ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "disk", SecondsSincePutStart(metadata));
+}
+
 bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
                                             ObjectMetadata& metadata,
                                             const ObjectIdentity& object_id) {
@@ -10575,6 +10741,7 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
+    auto next_offload_stall_metrics_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10606,6 +10773,15 @@ void MasterService::EvictionThreadFunc() {
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
+        }
+
+        if (offload_stall_metrics_) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_offload_stall_metrics_time) {
+                UpdateOffloadStallMetrics();
+                next_offload_stall_metrics_time =
+                    steady_now + kOffloadStallMetricsInterval;
+            }
         }
 
         // Tenant-scoped watermark. Intentionally outside the branch above:
@@ -11093,6 +11269,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
             auto metadata_it = tenant_state.metadata.find(task_it->first);
             LOG(WARNING) << "Offloading task expired for key: "
                          << task_it->first << " tenant=" << tenant_it->first;
+            if (offload_stall_metrics_) {
+                MasterMetricManager::instance().inc_offload_tasks_expired();
+            }
             auto expired_it = task_it++;
             ReleaseOffloadingTask(tenant_state,
                                   metadata_it != tenant_state.metadata.end()
@@ -11681,6 +11860,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             if (!metadata.IsGrouped()) {
                 uint64_t freed = try_evict_or_offload(
                     key, metadata, tenant_state, deferred_replicas);
+                if (reuse_sampler_ && freed > 0) {
+                    SampleMemoryEviction(normalized_tenant, key, metadata);
+                }
                 TenantQuotaEvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
@@ -11715,6 +11897,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                       MetadataShardAccessorRW& accessor) -> EvictMemberOutcome {
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
+            if (reuse_sampler_ && freed > 0) {
+                SampleMemoryEviction(normalized_tenant, member_key,
+                                     member_metadata);
+            }
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0) {
@@ -11825,6 +12011,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      << "; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload.";
     }
+    if (offload_stall_metrics_ && offload_no_local_disk_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_no_local_disk_evicted(
+            offload_no_local_disk_evicted);
+    }
     if (offload_no_local_disk_evicted > 0) {
         LOG(INFO) << "[TENANT-EVICT] Evicted " << offload_no_local_disk_evicted
                   << " object(s) of tenant " << normalized_tenant
@@ -11908,6 +12098,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
     // #keys evicted because no LOCAL_DISK tier takes their offload
     long offload_no_local_disk_evicted = 0;
+    // #keys kept in memory for the same reason (opt-in off). A pass tries a
+    // key at most once, but the second pass may retry a key the first pass
+    // kept, so the stall gauge reports the larger of the two passes.
+    long offload_no_local_disk_skipped = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -12008,6 +12202,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (offload_force_evict_) {
             offload_push_failed_forced++;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+        if (push_failures.OnlyNoLocalDisk()) {
+            offload_no_local_disk_skipped++;
         }
         return 0;
     };
@@ -12132,6 +12329,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
                 uint64_t freed = try_evict_or_offload(
                     tenant_id, key, metadata, tenant_state, deferred_replicas);
+                if (reuse_sampler_ && freed > 0) {
+                    SampleMemoryEviction(tenant_id, key, metadata);
+                }
                 EvictionResult result{.freed_bytes = freed,
                                       .evicted_objects = freed > 0 ? 1 : 0};
                 if (!enable_oplog_ && freed > 0) {
@@ -12173,6 +12373,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             const uint64_t freed =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
                                      state, deferred_replicas);
+            if (reuse_sampler_ && freed > 0) {
+                SampleMemoryEviction(tenant_id, member_key, member_metadata);
+            }
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
@@ -12540,6 +12743,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
+    const long first_pass_no_local_disk_skipped = offload_no_local_disk_skipped;
+
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
     uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
@@ -12760,6 +12965,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
+    }
+    if (offload_stall_metrics_ && offload_on_evict_) {
+        const long second_pass_no_local_disk_skipped =
+            offload_no_local_disk_skipped - first_pass_no_local_disk_skipped;
+        MasterMetricManager::instance()
+            .set_offload_no_local_disk_skipped_objects(
+                std::max(first_pass_no_local_disk_skipped,
+                         second_pass_no_local_disk_skipped));
+        if (offload_no_local_disk_evicted > 0) {
+            MasterMetricManager::instance().inc_offload_no_local_disk_evicted(
+                offload_no_local_disk_evicted);
+        }
     }
 }
 

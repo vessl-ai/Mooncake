@@ -1,6 +1,8 @@
 #include "master_metric_manager.h"
 
 #include <glog/logging.h>
+#include <algorithm>
+#include <array>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <limits>   // For std::numeric_limits
 #include <sstream>  // For string building during serialization
@@ -12,6 +14,18 @@
 #include "version.h"
 
 namespace mooncake {
+
+namespace {
+
+// Bucket bounds shared by the reuse sampler histograms, in seconds.
+const std::vector<double>& ReuseAgeBucketsSeconds() {
+    static const std::vector<double> buckets = {
+        1,   2,    5,    10,   30,   60,    120,   300,
+        600, 1200, 1800, 3600, 7200, 14400, 28800, 86400};
+    return buckets;
+}
+
+}  // namespace
 
 // --- Singleton Instance ---
 MasterMetricManager& MasterMetricManager::instance() {
@@ -461,6 +475,68 @@ MasterMetricManager::MasterMetricManager()
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
           "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
+      offload_no_local_disk_skipped_objects_(
+          "master_offload_no_local_disk_skipped_objects",
+          "offload_on_evict: eviction candidates the last pool eviction cycle "
+          "kept in memory because their store has no LOCAL_DISK tier taking "
+          "offloads (max over the cycle's passes)"),
+      offload_no_local_disk_evicted_total_(
+          "master_offload_no_local_disk_evicted_total",
+          "offload_on_evict: objects evicted without a disk copy because "
+          "their store has no LOCAL_DISK tier taking offloads "
+          "(offload_evict_without_local_disk)"),
+      offload_tasks_pending_(
+          "master_offload_tasks_pending",
+          "Offload tasks waiting for a store to copy them; each pins its "
+          "source memory replica"),
+      offload_tasks_without_local_disk_(
+          "master_offload_tasks_without_local_disk",
+          "Pending offload tasks none of whose target stores still has a "
+          "LOCAL_DISK registration (e.g. unmounted); they end only by expiry"),
+      offload_task_oldest_age_seconds_(
+          "master_offload_task_oldest_age_seconds",
+          "Age of the oldest pending offload task"),
+      offload_tasks_expired_total_(
+          "master_offload_tasks_expired_total",
+          "Offload tasks released because no completion arrived within "
+          "put_start_release_timeout_sec"),
+      reuse_sampler_memory_reuse_age_seconds_(
+          "master_reuse_sampler_memory_reuse_age_seconds",
+          "Sampled keys: time from the eviction of the last memory copy to "
+          "the first later reference. state=disk: a disk copy was still "
+          "there; state=none: the reference missed",
+          ReuseAgeBucketsSeconds(), {"state", "op"},
+          {{"disk", "exist"},
+           {"disk", "get"},
+           {"disk", "put_start"},
+           {"none", "exist"},
+           {"none", "get"},
+           {"none", "put_start"}}),
+      reuse_sampler_disk_reuse_age_seconds_(
+          "master_reuse_sampler_disk_reuse_age_seconds",
+          "Sampled keys: time from the eviction of the last disk copy to the "
+          "first later reference",
+          ReuseAgeBucketsSeconds(), {"op"},
+          {{"exist"}, {"get"}, {"put_start"}}),
+      reuse_sampler_evicted_age_seconds_(
+          "master_reuse_sampler_evicted_age_seconds",
+          "Sampled keys: time from PutStart to the eviction of the last "
+          "memory copy (tier=memory) or of the last disk copy (tier=disk)",
+          ReuseAgeBucketsSeconds(), {"tier"}, {{"memory"}, {"disk"}}),
+      reuse_sampler_ghost_overflow_total_(
+          "master_reuse_sampler_ghost_overflow_total",
+          "Ghosts overwritten before any reference: their reuse age, if any, "
+          "exceeds the table window"),
+      reuse_sampler_ghost_entries_("master_reuse_sampler_ghost_entries",
+                                   "Ghosts currently held"),
+      reuse_sampler_window_seconds_(
+          "master_reuse_sampler_window_seconds",
+          "Age of the ghost last overwritten when the table was full: the "
+          "longest reuse age the table can still observe (0 until it fills)"),
+      reuse_sampler_sampling_rate_("master_reuse_sampler_sampling_rate",
+                                   "Fraction of keys the sampler tracks"),
+      reuse_sampler_capacity_entries_("master_reuse_sampler_capacity_entries",
+                                      "Ghost table capacity"),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
@@ -1407,6 +1483,123 @@ void MasterMetricManager::inc_offload_enqueue_rejected(
     offload_enqueue_rejected_total_.inc({client_id}, val);
 }
 
+// Offload stall metrics
+void MasterMetricManager::set_offload_no_local_disk_skipped_objects(
+    int64_t val) {
+    offload_no_local_disk_skipped_objects_.update(val);
+}
+
+void MasterMetricManager::inc_offload_no_local_disk_evicted(int64_t val) {
+    offload_no_local_disk_evicted_total_.inc(val);
+}
+
+void MasterMetricManager::set_offload_tasks_pending(int64_t val) {
+    offload_tasks_pending_.update(val);
+}
+
+void MasterMetricManager::set_offload_tasks_without_local_disk(int64_t val) {
+    offload_tasks_without_local_disk_.update(val);
+}
+
+void MasterMetricManager::set_offload_task_oldest_age_seconds(int64_t val) {
+    offload_task_oldest_age_seconds_.update(val);
+}
+
+void MasterMetricManager::inc_offload_tasks_expired(int64_t val) {
+    offload_tasks_expired_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_offload_no_local_disk_skipped_objects() {
+    return offload_no_local_disk_skipped_objects_.value();
+}
+
+int64_t MasterMetricManager::get_offload_no_local_disk_evicted() {
+    return offload_no_local_disk_evicted_total_.value();
+}
+
+int64_t MasterMetricManager::get_offload_tasks_pending() {
+    return offload_tasks_pending_.value();
+}
+
+int64_t MasterMetricManager::get_offload_tasks_without_local_disk() {
+    return offload_tasks_without_local_disk_.value();
+}
+
+int64_t MasterMetricManager::get_offload_task_oldest_age_seconds() {
+    return offload_task_oldest_age_seconds_.value();
+}
+
+int64_t MasterMetricManager::get_offload_tasks_expired() {
+    return offload_tasks_expired_total_.value();
+}
+
+// Ghost-key reuse-age sampler metrics
+void MasterMetricManager::observe_reuse_sampler_memory_reuse_age(
+    const std::string& state, const std::string& op, double seconds) {
+    reuse_sampler_memory_reuse_age_seconds_.observe({state, op}, seconds);
+}
+
+void MasterMetricManager::observe_reuse_sampler_disk_reuse_age(
+    const std::string& op, double seconds) {
+    reuse_sampler_disk_reuse_age_seconds_.observe({op}, seconds);
+}
+
+void MasterMetricManager::observe_reuse_sampler_evicted_age(
+    const std::string& tier, double seconds) {
+    reuse_sampler_evicted_age_seconds_.observe({tier}, seconds);
+}
+
+void MasterMetricManager::inc_reuse_sampler_ghost_overflow(int64_t val) {
+    reuse_sampler_ghost_overflow_total_.inc(val);
+}
+
+void MasterMetricManager::set_reuse_sampler_ghost_entries(int64_t val) {
+    reuse_sampler_ghost_entries_.update(val);
+}
+
+void MasterMetricManager::set_reuse_sampler_window_seconds(int64_t val) {
+    reuse_sampler_window_seconds_.update(val);
+}
+
+void MasterMetricManager::set_reuse_sampler_config(double sampling_rate,
+                                                   int64_t capacity) {
+    reuse_sampler_sampling_rate_.update(sampling_rate);
+    reuse_sampler_capacity_entries_.update(capacity);
+    // Make the counters and gauges visible from the start, so dashboards see
+    // 0 rather than a missing series while the sampler warms up.
+    reuse_sampler_ghost_overflow_total_.inc(0);
+    reuse_sampler_ghost_entries_.update(0);
+    reuse_sampler_window_seconds_.update(0);
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_memory_reuse_age_count(
+    const std::string& state, const std::string& op, double le) {
+    return reuse_sampler_memory_reuse_age_seconds_.count_at_or_below(
+        {state, op}, le);
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_disk_reuse_age_count(
+    const std::string& op, double le) {
+    return reuse_sampler_disk_reuse_age_seconds_.count_at_or_below({op}, le);
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_evicted_age_count(
+    const std::string& tier, double le) {
+    return reuse_sampler_evicted_age_seconds_.count_at_or_below({tier}, le);
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_ghost_overflow() {
+    return reuse_sampler_ghost_overflow_total_.value();
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_ghost_entries() {
+    return reuse_sampler_ghost_entries_.value();
+}
+
+int64_t MasterMetricManager::get_reuse_sampler_window_seconds() {
+    return reuse_sampler_window_seconds_.value();
+}
+
 void MasterMetricManager::set_snapshot_duration_ms(int64_t size) {
     snapshot_duration_ms_.observe(size);
 }
@@ -2178,6 +2371,20 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_failed_total_);
     serialize_metric(offload_cancelled_total_);
     serialize_metric(offload_enqueue_rejected_total_);
+    serialize_metric(offload_no_local_disk_skipped_objects_);
+    serialize_metric(offload_no_local_disk_evicted_total_);
+    serialize_metric(offload_tasks_pending_);
+    serialize_metric(offload_tasks_without_local_disk_);
+    serialize_metric(offload_task_oldest_age_seconds_);
+    serialize_metric(offload_tasks_expired_total_);
+    serialize_metric(reuse_sampler_memory_reuse_age_seconds_);
+    serialize_metric(reuse_sampler_disk_reuse_age_seconds_);
+    serialize_metric(reuse_sampler_evicted_age_seconds_);
+    serialize_metric(reuse_sampler_ghost_overflow_total_);
+    serialize_metric(reuse_sampler_ghost_entries_);
+    serialize_metric(reuse_sampler_window_seconds_);
+    serialize_metric(reuse_sampler_sampling_rate_);
+    serialize_metric(reuse_sampler_capacity_entries_);
     serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics

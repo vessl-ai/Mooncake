@@ -51,6 +51,16 @@ class MasterServiceTestPeer {
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
 
+    // The reuse sampler, or nullptr when enable_reuse_sampler is off.
+    ReuseSampler* GetReuseSamplerForTesting() const;
+
+    // Recompute the offload stall gauges synchronously.
+    void RunOffloadStallMetricsUpdateForTesting();
+
+    // Drive the expiry sweep of every shard, as the eviction thread does once
+    // put_start_release_timeout_sec has passed, at the given time.
+    void RunDiscardExpiredForTesting(std::chrono::system_clock::time_point now);
+
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
 

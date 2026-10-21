@@ -46,6 +46,7 @@
 #include "object_runtime_state.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "reuse_sampler.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
@@ -1138,6 +1139,30 @@ class MasterService {
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
+
+    // Ghost-key reuse-age sampler hooks (enable_reuse_sampler). Callers
+    // check reuse_sampler_ first, so with the sampler off each hook costs one
+    // branch. The sampler's own locks are leaf locks, so the eviction hooks
+    // may run while a metadata shard lock is held.
+    //
+    // A reference (ExistKey with lease, GetReplicaList, PutStart) of `key`.
+    // `op` is the metric label: "exist", "get" or "put_start".
+    void SampleReuseReference(const TenantId& tenant_id,
+                              const std::string& user_key, const char* op);
+    // An eviction just freed memory replicas of `metadata`. Records a ghost
+    // when no memory replica is left.
+    void SampleMemoryEviction(const TenantId& tenant_id,
+                              const std::string& user_key,
+                              const ObjectMetadata& metadata);
+    // A disk eviction removed the last replica of `metadata`.
+    void SampleDiskEviction(const TenantId& tenant_id,
+                            const std::string& user_key,
+                            const ObjectMetadata& metadata);
+
+    // Recomputes the offload stall gauges by walking every shard's offload
+    // tasks (enable_offload_stall_metrics). Takes snapshot_mutex_ shared and
+    // each metadata shard lock in turn.
+    void UpdateOffloadStallMetrics();
 
     // Background pass: evict any tenant that is over its own watermark down to
     // (watermark - eviction_ratio) of its effective quota. Called from
@@ -2267,6 +2292,13 @@ class MasterService {
     // failures still skip the key. (config: offload_evict_without_local_disk,
     // only effective when offload_on_evict_=true)
     bool offload_evict_without_local_disk_{false};
+
+    // Offload stall metrics (config: enable_offload_stall_metrics).
+    bool offload_stall_metrics_{false};
+
+    // Ghost-key reuse-age sampler (config: enable_reuse_sampler). Null when
+    // off; set once in the constructor and never changed.
+    std::unique_ptr<ReuseSampler> reuse_sampler_;
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

@@ -243,6 +243,37 @@ DEFINE_bool(offload_evict_without_local_disk, false,
             "registered, fenced, unmounted, or offloading disabled). A full "
             "offload queue and other push failures still keep the object in "
             "memory");
+DEFINE_bool(enable_offload_stall_metrics, false,
+            "Export metrics that show eviction waiting on offloads that "
+            "cannot finish: pending offload tasks, tasks whose store has no "
+            "LOCAL_DISK registration left, the oldest task's age, expired "
+            "tasks, and (with offload_on_evict) eviction candidates kept in "
+            "memory because their store has no LOCAL_DISK tier");
+DEFINE_bool(enable_reuse_sampler, false,
+            "Track a hash-sampled fraction of keys after eviction and export "
+            "the time until each is referenced again (reuse age) and its "
+            "age at eviction as histograms");
+DEFINE_double(reuse_sampler_rate, 0.01,
+              "Fraction of keys the reuse sampler tracks, in (0, 1]");
+DEFINE_validator(reuse_sampler_rate, [](const char* flagname, double value) {
+    if (!(value > 0.0 && value <= 1.0)) {
+        LOG(FATAL) << "reuse_sampler_rate must be in (0, 1]";
+        return false;
+    }
+    return true;
+});
+DEFINE_uint64(reuse_sampler_max_entries, 1000000,
+              "Maximum number of evicted keys (ghosts) the reuse sampler "
+              "holds, about 40 bytes each. When full, the oldest ghost is "
+              "dropped");
+DEFINE_validator(reuse_sampler_max_entries, [](const char* flagname,
+                                               uint64_t value) {
+    if (value == 0 || value > 100'000'000ULL) {
+        LOG(FATAL) << "reuse_sampler_max_entries must be in [1, 100000000]";
+        return false;
+    }
+    return true;
+});
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -667,6 +698,24 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_evict_without_local_disk",
                            &master_config.offload_evict_without_local_disk,
                            FLAGS_offload_evict_without_local_disk);
+    default_config.GetBool("enable_offload_stall_metrics",
+                           &master_config.enable_offload_stall_metrics,
+                           FLAGS_enable_offload_stall_metrics);
+    default_config.GetBool("enable_reuse_sampler",
+                           &master_config.enable_reuse_sampler,
+                           FLAGS_enable_reuse_sampler);
+    default_config.GetDouble("reuse_sampler_rate",
+                             &master_config.reuse_sampler_rate,
+                             FLAGS_reuse_sampler_rate);
+    {
+        uint64_t tmp_reuse_sampler_max_entries =
+            FLAGS_reuse_sampler_max_entries;
+        default_config.GetUInt64("reuse_sampler_max_entries",
+                                 &tmp_reuse_sampler_max_entries,
+                                 FLAGS_reuse_sampler_max_entries);
+        master_config.reuse_sampler_max_entries =
+            static_cast<size_t>(tmp_reuse_sampler_max_entries);
+    }
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -1072,6 +1121,29 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_evict_without_local_disk =
             FLAGS_offload_evict_without_local_disk;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_offload_stall_metrics",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_offload_stall_metrics =
+            FLAGS_enable_offload_stall_metrics;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_reuse_sampler", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_reuse_sampler = FLAGS_enable_reuse_sampler;
+    }
+    if ((google::GetCommandLineFlagInfo("reuse_sampler_rate", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.reuse_sampler_rate = FLAGS_reuse_sampler_rate;
+    }
+    if ((google::GetCommandLineFlagInfo("reuse_sampler_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.reuse_sampler_max_entries =
+            static_cast<size_t>(FLAGS_reuse_sampler_max_entries);
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -2013,6 +2085,12 @@ int main(int argc, char* argv[]) {
         << ", offload_force_evict=" << master_config.offload_force_evict
         << ", offload_evict_without_local_disk="
         << master_config.offload_evict_without_local_disk
+        << ", enable_offload_stall_metrics="
+        << master_config.enable_offload_stall_metrics
+        << ", enable_reuse_sampler=" << master_config.enable_reuse_sampler
+        << ", reuse_sampler_rate=" << master_config.reuse_sampler_rate
+        << ", reuse_sampler_max_entries="
+        << master_config.reuse_sampler_max_entries
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type

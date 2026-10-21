@@ -729,11 +729,110 @@ TEST_F(OffloadOnEvictCycleTest, DiskCopyEvictedByTheStoreIsWrittenAgain) {
     EXPECT_NE(*again[0].task_id, *taken[0].task_id);
 }
 
+// --- Offload stall metrics (enable_offload_stall_metrics) ---------------
+//
+// The metric manager is process-wide, so these tests compare gauges after
+// the action they cause and counters as deltas.
+
+TEST_F(OffloadOnEvictCycleTest, StallGaugeCountsObjectsKeptForNoLocalDisk) {
+    MasterServiceConfig config = Config();
+    config.enable_offload_stall_metrics = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const Store b = AddStore("store_b", /*with_disk=*/false);
+    Put(a, "stall_a_", 4);
+    Put(b, "stall_b_", 6);
+    auto& metrics = MasterMetricManager::instance();
+
+    Evict();
+    // Only store_b's objects are kept for lack of a disk tier; store_a's are
+    // queued. The gauge is per cycle, not cumulative.
+    EXPECT_EQ(metrics.get_offload_no_local_disk_skipped_objects(), 6);
+    Evict();
+    EXPECT_EQ(metrics.get_offload_no_local_disk_skipped_objects(), 6);
+}
+
+TEST_F(OffloadOnEvictCycleTest, StallCounterCountsOptInEvictions) {
+    MasterServiceConfig config = Config();
+    config.enable_offload_stall_metrics = true;
+    config.offload_evict_without_local_disk = true;
+    Start(config);
+    const Store b = AddStore("store_b", /*with_disk=*/false);
+    Put(b, "optin_metric_", 5);
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t evicted_before = metrics.get_offload_no_local_disk_evicted();
+
+    Evict();
+    EXPECT_EQ(metrics.get_offload_no_local_disk_evicted() - evicted_before, 5);
+    EXPECT_EQ(metrics.get_offload_no_local_disk_skipped_objects(), 0);
+}
+
+TEST_F(OffloadOnEvictCycleTest, StallGaugesShowTasksLeftByAnUnmount) {
+    MasterServiceConfig config = Config();
+    config.enable_offload_stall_metrics = true;
+    Start(config);
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = Put(a, "unmount_metric_", 5);
+    auto& metrics = MasterMetricManager::instance();
+    MasterServiceTestPeer peer(*service_);
+
+    Evict();
+    const auto taken = Drain(a);
+    ASSERT_EQ(taken.size(), keys.size());
+    peer.RunOffloadStallMetricsUpdateForTesting();
+    EXPECT_EQ(metrics.get_offload_tasks_pending(), 5);
+    EXPECT_EQ(metrics.get_offload_tasks_without_local_disk(), 0);
+    EXPECT_GE(metrics.get_offload_task_oldest_age_seconds(), 0);
+
+    // The unmount leaves the tasks (and the pinned sources) in place, and
+    // no store can finish them any more.
+    ASSERT_TRUE(service_->UnmountLocalDiskSegment(a.client_id));
+    peer.RunOffloadStallMetricsUpdateForTesting();
+    EXPECT_EQ(metrics.get_offload_tasks_pending(), 5);
+    EXPECT_EQ(metrics.get_offload_tasks_without_local_disk(), 5);
+
+    // Only the expiry sweep releases them.
+    const int64_t expired_before = metrics.get_offload_tasks_expired();
+    peer.RunDiscardExpiredForTesting(std::chrono::system_clock::now() +
+                                     std::chrono::hours(24));
+    EXPECT_EQ(metrics.get_offload_tasks_expired() - expired_before, 5);
+    peer.RunOffloadStallMetricsUpdateForTesting();
+    EXPECT_EQ(metrics.get_offload_tasks_pending(), 0);
+    EXPECT_EQ(metrics.get_offload_tasks_without_local_disk(), 0);
+    EXPECT_EQ(metrics.get_offload_task_oldest_age_seconds(), 0);
+}
+
+TEST_F(OffloadOnEvictCycleTest, StallMetricsStayUntouchedByDefault) {
+    Start(Config());
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const Store b = AddStore("store_b", /*with_disk=*/false);
+    Put(a, "quiet_a_", 3);
+    Put(b, "quiet_b_", 3);
+    auto& metrics = MasterMetricManager::instance();
+    // Park the gauges on values the default path would never write.
+    metrics.set_offload_no_local_disk_skipped_objects(-7);
+    metrics.set_offload_tasks_pending(-7);
+    const int64_t expired_before = metrics.get_offload_tasks_expired();
+    const int64_t evicted_before = metrics.get_offload_no_local_disk_evicted();
+
+    Evict();
+    Drain(a);
+    ASSERT_TRUE(service_->UnmountLocalDiskSegment(a.client_id));
+    MasterServiceTestPeer(*service_).RunDiscardExpiredForTesting(
+        std::chrono::system_clock::now() + std::chrono::hours(24));
+
+    EXPECT_EQ(metrics.get_offload_no_local_disk_skipped_objects(), -7);
+    EXPECT_EQ(metrics.get_offload_tasks_pending(), -7);
+    EXPECT_EQ(metrics.get_offload_tasks_expired(), expired_before);
+    EXPECT_EQ(metrics.get_offload_no_local_disk_evicted(), evicted_before);
+}
+
 TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
     MasterServiceConfig config;
     EXPECT_FALSE(config.offload_evict_without_local_disk);
     EXPECT_FALSE(config.offload_force_evict);
     EXPECT_FALSE(config.offload_on_evict);
+    EXPECT_FALSE(config.enable_offload_stall_metrics);
 }
 
 }  // namespace mooncake::test

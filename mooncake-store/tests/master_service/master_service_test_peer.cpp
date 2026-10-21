@@ -30,6 +30,23 @@ void MasterServiceTestPeer::RunBatchEvictForTesting(
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
+ReuseSampler* MasterServiceTestPeer::GetReuseSamplerForTesting() const {
+    return service_.reuse_sampler_.get();
+}
+
+void MasterServiceTestPeer::RunOffloadStallMetricsUpdateForTesting() {
+    service_.UpdateOffloadStallMetrics();
+}
+
+void MasterServiceTestPeer::RunDiscardExpiredForTesting(
+    std::chrono::system_clock::time_point now) {
+    std::shared_lock<std::shared_mutex> shared_lock(service_.snapshot_mutex_);
+    for (size_t i = 0; i < MasterService::kNumShards; i++) {
+        MasterService::MetadataShardAccessorRW shard(&service_, i);
+        service_.DiscardExpiredProcessingReplicas(shard, now);
+    }
+}
+
 void MasterServiceTestPeer::RunNoFBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
