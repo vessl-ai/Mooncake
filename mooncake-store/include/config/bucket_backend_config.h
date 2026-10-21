@@ -71,6 +71,14 @@ struct BucketBackendConfig {
     // unchanged.
     bool read_pending_eviction = false;
 
+    // Fill offload buckets in the order the master queued the objects (the
+    // sequence number of their task id) instead of hash order. Objects queued
+    // together (one request's pages, a page's K and V) then share a bucket,
+    // and FIFO bucket eviction drops the oldest-queued objects first instead
+    // of a few objects of many prefix chains. Off by default: the default
+    // grouping is unchanged.
+    bool keep_queue_order = false;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();

@@ -50,6 +50,10 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_BUCKET_READ_PENDING_EVICTION,
         config.read_pending_eviction);
 
+    config.keep_queue_order =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER,
+                        config.keep_queue_order);
+
     const std::string policy = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY,
         Environ::ReadOr(Variables::MOONCAKE_BUCKET_EVICTION_POLICY,

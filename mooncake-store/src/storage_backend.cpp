@@ -1519,6 +1519,10 @@ BucketStorageBackend::BucketStorageBackend(
                      "keys stay readable until the master acknowledges "
                      "their eviction";
     }
+    if (bucket_backend_config_.keep_queue_order) {
+        LOG(INFO) << "BucketStorageBackend: keep_queue_order enabled; "
+                     "offload buckets are filled in the master's queue order";
+    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -2296,6 +2300,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
                                        deferred_keys);
 }
 
+tl::expected<void, ErrorCode>
+BucketStorageBackend::AllocateOffloadingBucketsInOrder(
+    const std::vector<std::pair<std::string, int64_t>>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysInIterationOrder(offloading_objects, buckets_keys,
+                                               deferred_keys);
+}
+
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
@@ -2314,6 +2327,16 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysInIterationOrder(offloading_objects, buckets_keys,
+                                               deferred_keys);
+}
+
+template <typename Objects>
+tl::expected<void, ErrorCode>
+BucketStorageBackend::GroupOffloadingKeysInIterationOrder(
+    const Objects& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
     std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);

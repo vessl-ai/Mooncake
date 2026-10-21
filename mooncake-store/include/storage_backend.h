@@ -865,6 +865,23 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::vector<std::string>>& buckets_keys,
         std::vector<std::string>* deferred_keys = nullptr);
 
+    /**
+     * @brief Same grouping as AllocateOffloadingBuckets, but buckets are
+     * filled in the order of `offloading_objects` (keep_queue_order): each
+     * bucket takes the next keys of the list, and each bucket's keys keep
+     * that order. Keys must be unique. The ungrouped pool still leads the
+     * first bucket, as it holds the tail of the previous call.
+     */
+    tl::expected<void, ErrorCode> AllocateOffloadingBucketsInOrder(
+        const std::vector<std::pair<std::string, int64_t>>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
+
+    // MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER.
+    bool KeepsQueueOrder() const {
+        return bucket_backend_config_.keep_queue_order;
+    }
+
     void ClearUngroupedOffloadingObjects();
 
     /**
@@ -957,6 +974,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys,
         std::vector<std::string>* deferred_keys = nullptr);
+
+    // The grouping itself, walking `offloading_objects` (a map or an ordered
+    // list of key/size pairs) in its iteration order. Defined and
+    // instantiated in storage_backend.cpp only.
+    template <typename Objects>
+    tl::expected<void, ErrorCode> GroupOffloadingKeysInIterationOrder(
+        const Objects& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys);
 
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<

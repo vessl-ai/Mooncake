@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -11,6 +12,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -294,6 +296,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
@@ -378,6 +381,20 @@ class FileStorageTest : public ::testing::Test {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         return bucket_backend->AllocateOffloadingBuckets(
+            offloading_objects, buckets_keys, deferred_keys);
+    }
+
+    tl::expected<void, ErrorCode> FileStorageGroupOffloadingKeysInOrder(
+        FileStorage& fileStorage,
+        const std::vector<std::pair<std::string, int64_t>>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr) {
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
+        if (!bucket_backend) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return bucket_backend->AllocateOffloadingBucketsInOrder(
             offloading_objects, buckets_keys, deferred_keys);
     }
 
@@ -1957,6 +1974,195 @@ TEST_F(FileStorageTest, CarriedTasksOfAnotherMasterAreDropped) {
                                                      {make_task("next", 8)});
     EXPECT_TRUE(GetDeferredTaskByStorageKey(fileStorage).empty());
     EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0u);
+}
+
+// keep_queue_order: buckets take consecutive keys of the given list, each
+// bucket in list order; the tail waits in the pool and leads the next call's
+// first bucket, as with the default grouping.
+TEST_F(FileStorageTest,
+       GroupOffloadingKeysInOrder_fills_buckets_in_list_order) {
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "4");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage fileStorage(config, nullptr, "localhost:9003");
+
+    // Names in reverse, so list order is neither name nor hash order.
+    std::vector<std::pair<std::string, int64_t>> ordered;
+    for (int i = 9; i >= 0; --i) {
+        ordered.emplace_back("q" + std::to_string(i), 1);
+    }
+    std::vector<std::vector<std::string>> buckets_keys;
+    std::vector<std::string> deferred;
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysInOrder(fileStorage, ordered,
+                                                      buckets_keys, &deferred));
+    ASSERT_EQ(buckets_keys.size(), 2u);
+    EXPECT_EQ(buckets_keys[0],
+              (std::vector<std::string>{"q9", "q8", "q7", "q6"}));
+    EXPECT_EQ(buckets_keys[1],
+              (std::vector<std::string>{"q5", "q4", "q3", "q2"}));
+    EXPECT_EQ(std::unordered_set<std::string>(deferred.begin(), deferred.end()),
+              (std::unordered_set<std::string>{"q1", "q0"}));
+
+    buckets_keys.clear();
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysInOrder(
+        fileStorage, {{"x0", 1}, {"x1", 1}, {"x2", 1}}, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1u);
+    const auto& first = buckets_keys[0];
+    ASSERT_EQ(first.size(), 4u);
+    EXPECT_EQ(std::unordered_set<std::string>(first.begin(), first.begin() + 2),
+              (std::unordered_set<std::string>{"q1", "q0"}));
+    EXPECT_EQ(first[2], "x0");
+    EXPECT_EQ(first[3], "x1");
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1u);
+}
+
+// The size limit closes a bucket at the same key in list order.
+TEST_F(FileStorageTest, GroupOffloadingKeysInOrder_honors_the_size_limit) {
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "10");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage fileStorage(config, nullptr, "localhost:9003");
+
+    std::vector<std::vector<std::string>> buckets_keys;
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysInOrder(
+        fileStorage,
+        {{"a", 4}, {"b", 4}, {"c", 4}, {"d", 6}, {"big", 11}, {"e", 10}},
+        buckets_keys));
+    // "c" does not fit after a and b; "big" exceeds the limit and is skipped.
+    ASSERT_EQ(buckets_keys.size(), 3u);
+    EXPECT_EQ(buckets_keys[0], (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(buckets_keys[1], (std::vector<std::string>{"c", "d"}));
+    EXPECT_EQ(buckets_keys[2], (std::vector<std::string>{"e"}));
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0u);
+}
+
+// End to end on an eager master: pages put as K/V pairs ("pI_k", "pI_v") get
+// consecutive task ids. The drained items arrive in the mailbox's hash order
+// (shuffled again here). Four keys per bucket.
+class FileStorageQueueOrderTest : public FileStorageTest {
+   protected:
+    static constexpr int kPages = 10;
+
+    // Offloads the pages and returns the user keys of each written bucket,
+    // in write (bucket id) order. `queue_order` gets the put order.
+    std::vector<std::vector<std::string>> OffloadPages(
+        bool keep_queue_order, std::vector<std::string>& queue_order,
+        std::vector<OffloadTaskItem>& drained) {
+        rig_ = std::make_unique<OffloadRig>();
+        rig_->Start();
+        for (int i = 0; i < kPages; ++i) {
+            for (const char* half : {"_k", "_v"}) {
+                const std::string key = "p" + std::to_string(i) + half;
+                rig_->Put(key, std::string(128, half[1]));
+                queue_order.push_back(key);
+            }
+        }
+        drained = rig_->Drain();
+        EXPECT_EQ(drained.size(), queue_order.size());
+        std::mt19937 rng(651);
+        std::shuffle(drained.begin(), drained.end(), rng);
+
+        SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "4");
+        if (keep_queue_order) {
+            SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER", "true");
+        }
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/queue_order_ssd";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        file_storage_ =
+            std::make_unique<FileStorage>(config, rig_->client, rig_->endpoint);
+        EXPECT_TRUE(InitStorageBackend(*file_storage_));
+        std::vector<std::vector<std::string>> buckets;
+        SetOffloadCompletionRpc(
+            *file_storage_,
+            [this, &buckets](const std::vector<OffloadTaskItem>& tasks,
+                             const std::vector<StorageObjectMetadata>& metas)
+                -> tl::expected<void, ErrorCode> {
+                std::vector<std::string> keys;
+                for (const auto& task : tasks) keys.push_back(task.key);
+                buckets.push_back(std::move(keys));
+                return rig_->client->NotifyOffloadTaskSuccess(tasks, metas);
+            });
+        EXPECT_TRUE(FileStorageProcessDrainedOffloads(*file_storage_, drained));
+        return buckets;
+    }
+
+    void TearDown() override {
+        file_storage_.reset();
+        if (rig_) {
+            rig_->Stop();
+            rig_.reset();
+        }
+        FileStorageTest::TearDown();
+    }
+
+    static std::unordered_set<std::string> AsSet(
+        const std::vector<std::string>& keys) {
+        return {keys.begin(), keys.end()};
+    }
+
+    std::unique_ptr<OffloadRig> rig_;
+    std::unique_ptr<FileStorage> file_storage_;
+};
+
+TEST_F(FileStorageQueueOrderTest, KeepQueueOrderFillsBucketsInTaskIdOrder) {
+    std::vector<std::string> queue_order;
+    std::vector<OffloadTaskItem> drained;
+    const auto buckets = OffloadPages(true, queue_order, drained);
+
+    ASSERT_EQ(buckets.size(), queue_order.size() / 4);
+    for (size_t b = 0; b < buckets.size(); ++b) {
+        const std::vector<std::string> expected(
+            queue_order.begin() + 4 * b, queue_order.begin() + 4 * (b + 1));
+        EXPECT_EQ(AsSet(buckets[b]), AsSet(expected)) << "bucket " << b;
+    }
+    // A page's K and V share a bucket, and every copy was registered.
+    for (int i = 0; i < kPages; ++i) {
+        const std::string k = "p" + std::to_string(i) + "_k";
+        const std::string v = "p" + std::to_string(i) + "_v";
+        const auto holds = [&](const std::string& key) {
+            return std::find_if(buckets.begin(), buckets.end(),
+                                [&](const auto& bucket) {
+                                    return AsSet(bucket).count(key) != 0;
+                                }) -
+                   buckets.begin();
+        };
+        EXPECT_EQ(holds(k), holds(v)) << "page " << i;
+        EXPECT_EQ(rig_->DiskReplicas(k), 1u);
+        EXPECT_EQ(rig_->DiskReplicas(v), 1u);
+    }
+}
+
+TEST_F(FileStorageQueueOrderTest, ByDefaultBucketsFollowTheSizeMapHashOrder) {
+    std::vector<std::string> queue_order;
+    std::vector<OffloadTaskItem> drained;
+    const auto buckets = OffloadPages(false, queue_order, drained);
+
+    // The default grouping walks the key -> size map that OffloadObjects
+    // builds from the drained items, whatever their task ids.
+    std::unordered_map<std::string, int64_t> sizes;
+    sizes.reserve(drained.size());
+    for (const auto& item : drained) {
+        sizes.emplace(TenantId(item.tenant_id).MakeScopedKey(item.key),
+                      item.size);
+    }
+    std::vector<std::string> walk;
+    for (const auto& [storage_key, _] : sizes) {
+        for (const auto& item : drained) {
+            if (TenantId(item.tenant_id).MakeScopedKey(item.key) ==
+                storage_key) {
+                walk.push_back(item.key);
+            }
+        }
+    }
+    ASSERT_EQ(buckets.size(), walk.size() / 4);
+    for (size_t b = 0; b < buckets.size(); ++b) {
+        const std::vector<std::string> expected(walk.begin() + 4 * b,
+                                                walk.begin() + 4 * (b + 1));
+        EXPECT_EQ(AsSet(buckets[b]), AsSet(expected)) << "bucket " << b;
+    }
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
