@@ -722,6 +722,10 @@ class MasterService {
      * registration and writes the replica inside one shared-lock section,
      * which therefore falls entirely before the deregistration (registered,
      * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     *
+     * With async_disk_unmount_sweep the call returns right after the
+     * deregistration and the sweep runs in the background; the replicas are
+     * unreadable from the return on (see DiskUnmountSweepJob).
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -1204,6 +1208,22 @@ class MasterService {
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    // Lock holds and removals of one ClearStaleHandlesInShard call.
+    struct StaleHandleShardStats {
+        uint64_t keys_scanned = 0;
+        uint64_t removed_replicas = 0;
+        uint64_t scan_hold_ns = 0;       // pass 1, shard lock shared
+        uint64_t max_batch_hold_ns = 0;  // pass 2, longest exclusive hold
+        uint64_t batch_hold_ns = 0;      // pass 2, all exclusive holds
+    };
+    // One shard of ClearStaleHandles. `on_removed` (optional) sees each
+    // replica the shard's cleanup removes, before it is erased; `stats`
+    // (optional) gets the shard's lock holds. With HA oplog the cleanup is
+    // only persisted here, so neither callback nor counts see it.
+    std::optional<ErrorCode> ClearStaleHandlesInShard(
+        size_t shard_index, const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const Replica&)>* on_removed = nullptr,
+        StaleHandleShardStats* stats = nullptr);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     bool ShouldSkipSnapshotForClientOffboarding() const {
         return client_offboarding_worker_.HasPending();
@@ -1765,6 +1785,58 @@ class MasterService {
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
     const bool enable_async_segment_cleanup_;
+
+    // ---- Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep).
+    //
+    // With it on, UnmountLocalDiskSegment drops the registration and records
+    // the owner here in the same snapshot_mutex_ (exclusive) section, then
+    // returns; disk_unmount_sweep_worker_ erases the owner's replicas. Until
+    // an owner's sweep has visited every shard after its unmount:
+    //   - its LOCAL_DISK replicas are never readable
+    //     (TryGetReadableReplicaDescriptor), so no reader is sent to a disk
+    //     the store has handed back;
+    //   - PutStart, UpsertStart and Remove treat them as stale;
+    //   - the same client cannot mount a LOCAL_DISK tier again
+    //     (MountLocalDiskSegment refuses with UNAVAILABLE_IN_CURRENT_STATUS),
+    //     so a new registration never coexists with replicas of the old one,
+    //     exactly as after the synchronous sweep.
+    // No replica of an unregistered owner can be added (NotifyOffloadSuccess
+    // checks the registration under snapshot_mutex_), so a sweep that has
+    // visited every shard once has erased them all.
+    struct DiskUnmountSweepJob {
+        UUID owner;
+        std::chrono::steady_clock::time_point started;
+        size_t shards_left = kNumShards;
+        uint64_t removed_replicas = 0;
+        uint64_t max_scan_hold_ns = 0;
+        uint64_t max_batch_hold_ns = 0;
+    };
+    // True when async_disk_unmount_sweep is on and effective (offload on;
+    // HA, snapshot and CXL off, as for enable_async_segment_cleanup_).
+    bool async_disk_unmount_sweep_{false};
+    // Guards disk_unmount_sweep_jobs_. A leaf lock: taken under shard locks
+    // (readers) and under snapshot_mutex_ (unmount, mount); nothing is
+    // acquired while it is held.
+    mutable std::shared_mutex disk_unmount_sweep_mutex_;
+    std::condition_variable_any disk_unmount_sweep_cv_;
+    std::vector<DiskUnmountSweepJob> disk_unmount_sweep_jobs_;
+    // Fast path for readers: number of entries in disk_unmount_sweep_jobs_.
+    std::atomic<size_t> disk_unmount_sweep_owner_count_{0};
+    std::atomic<bool> disk_unmount_sweep_stopping_{false};
+    // Next shard the worker visits; only the worker thread touches it.
+    size_t disk_unmount_sweep_cursor_{0};
+    // Test hook: called on the worker thread before each shard step, with
+    // the shard index, no lock held.
+    std::function<void(size_t)> disk_unmount_sweep_shard_hook_;
+    BackgroundWorker disk_unmount_sweep_worker_;
+
+    // True if `owner`'s unmount sweep is pending.
+    bool DiskUnmountSweepPending(const UUID& owner) const;
+    // True for a LOCAL_DISK replica whose owner's unmount sweep is pending.
+    bool IsDiskReplicaOfSweepingOwner(const Replica& replica) const;
+    // Worker body: visits shards until no sweep is pending or it stops.
+    void RunDiskUnmountSweeps();
+    void PublishDiskUnmountSweepProgressLocked() const;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an

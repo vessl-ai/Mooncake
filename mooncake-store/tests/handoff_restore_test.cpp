@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -662,6 +665,120 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     Put(master, stores_[0], "after");
     EXPECT_EQ(Offload(master, stores_[0], "disk-0", 10).size(), 1u);
     EXPECT_TRUE(HasDisk(master, "after", stores_[0].client_id));
+}
+
+// async_disk_unmount_sweep: a store unmounted its disk tier and the master
+// rolls while the background sweep of its replicas is still running. The
+// unmounted store is no longer registered, so the export drops its disk
+// replicas; nothing of the handed-back disk is readable on the new master.
+TEST_F(HandoffRestoreTest, L4UnmountSweepInProgressAtTheRollIsNotCarried) {
+    TempDir dir;
+    std::vector<std::string> leaving_disk_only;
+    std::vector<std::string> staying_disk_only;
+    for (int i = 0; i < 5; ++i) {
+        leaving_disk_only.push_back("leaving-disk-only-" + std::to_string(i));
+        staying_disk_only.push_back("staying-disk-only-" + std::to_string(i));
+    }
+    {
+        // Parks the sweep thread before its fourth shard step.
+        std::mutex mutex;
+        std::condition_variable cv;
+        size_t steps = 0;
+        bool released = false;
+        auto release = [&] {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released = true;
+            }
+            cv.notify_all();
+        };
+        MasterServiceConfig config = MakeL4Config();
+        config.async_disk_unmount_sweep = true;
+        MasterService old_master(config);
+        struct Releaser {
+            std::function<void()> fn;
+            ~Releaser() { fn(); }
+        } release_on_exit{release};
+        MasterServiceTestPeer peer(old_master);
+        ASSERT_TRUE(peer.AsyncDiskUnmountSweepEnabledForTesting());
+        peer.SetDiskUnmountSweepShardHookForTesting([&](size_t) {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++steps;
+            cv.notify_all();
+            if (steps > 3) cv.wait(lock, [&] { return released; });
+        });
+        for (int s = 0; s < 2; ++s) {
+            Store store{generate_uuid(), {MakeSegment(s)}};
+            ASSERT_TRUE(
+                old_master.MountSegment(store.segments[0], store.client_id)
+                    .has_value());
+            stores_.push_back(store);
+            EnableL4(old_master, store);
+        }
+        for (int i = 0; i < 20; ++i) Put(old_master, stores_[0], Key(0, i));
+        ASSERT_EQ(Offload(old_master, stores_[0], "disk-0", 20).size(), 20u);
+        PutDiskOnly(old_master, stores_[0], leaving_disk_only, "disk-0");
+        PutDiskOnly(old_master, stores_[1], staying_disk_only, "disk-1");
+
+        ASSERT_TRUE(old_master.UnmountLocalDiskSegment(stores_[0].client_id)
+                        .has_value());
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(60),
+                                    [&] { return steps > 3; }));
+        }
+        // The roll quiesces the background work; the parked step is freed
+        // once the stop flag is set, so the sweep stops right there.
+        std::thread quiesce([&] { old_master.QuiesceBackgroundWork(); });
+        while (!peer.DiskUnmountSweepStoppingForTesting()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        release();
+        quiesce.join();
+        ASSERT_TRUE(
+            peer.DiskUnmountSweepPendingForTesting(stores_[0].client_id));
+        for (const auto& key : leaving_disk_only) {
+            EXPECT_FALSE(Readable(old_master, key)) << key;
+        }
+
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.local_disk_clients, 1u);
+        // Only the staying store's disk replicas are carried.
+        EXPECT_EQ(written.stats.local_disk_replicas, staying_disk_only.size());
+        EXPECT_EQ(written.stats.disk_only_objects, staying_disk_only.size());
+    }
+
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {3});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->local_disk_clients, 1u);
+    EXPECT_EQ(restored->local_disk_replicas, staying_disk_only.size());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    ASSERT_TRUE(Remount(master, stores_[1]));
+
+    // The unmounted store's disk-only objects are gone; its objects with a
+    // memory copy come back with that copy only.
+    for (const auto& key : leaving_disk_only) {
+        auto r = master.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(r.has_value()) << key;
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+    for (int i = 0; i < 20; ++i) {
+        auto replicas = Replicas(master, Key(0, i));
+        ASSERT_EQ(replicas.size(), 1u) << Key(0, i);
+        EXPECT_TRUE(replicas[0].is_memory_replica());
+    }
+    // Its registration was not carried: its next heartbeat registers anew
+    // (and the store drops its files).
+    auto unmounted = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_FALSE(unmounted.has_value());
+    EXPECT_EQ(unmounted.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    // The staying store's disk-only objects open with its heartbeat.
+    ASSERT_TRUE(
+        master.OffloadObjectHeartbeat(stores_[1].client_id, true).has_value());
+    for (const auto& key : staying_disk_only) {
+        EXPECT_TRUE(HasDisk(master, key, stores_[1].client_id)) << key;
+    }
 }
 
 TEST_F(HandoffRestoreTest, L4GateOpensOnPing) {

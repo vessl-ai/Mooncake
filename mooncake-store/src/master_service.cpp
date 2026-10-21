@@ -251,6 +251,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
       enable_async_segment_cleanup_(
           !config.enable_ha && !config.enable_snapshot && !config.enable_cxl),
+      disk_unmount_sweep_worker_([this] { RunDiskUnmountSweeps(); }),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -456,6 +457,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
         }
     }
 
+    // Same conditions as the memory segment's deferred sweep: HA, snapshot
+    // and CXL keep the synchronous sweep.
+    async_disk_unmount_sweep_ = enable_offload_ &&
+                                config.async_disk_unmount_sweep &&
+                                enable_async_segment_cleanup_;
+    if (async_disk_unmount_sweep_) {
+        LOG(INFO) << "Async disk unmount sweep enabled: "
+                     "UnmountLocalDiskSegment returns before its replica "
+                     "sweep, which runs in the background";
+    } else if (config.async_disk_unmount_sweep) {
+        LOG(WARNING) << "async_disk_unmount_sweep ignored: it needs "
+                        "enable_offload and no HA, snapshot or CXL";
+    }
+
     offload_stall_metrics_ =
         enable_offload_ && config.enable_offload_stall_metrics;
     if (offload_stall_metrics_) {
@@ -629,6 +644,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     VLOG(1) << "action=start_task_cleanup_thread";
 
     replica_cleanup_worker_.Start();
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Start();
+    }
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
@@ -815,6 +833,11 @@ void MasterService::QuiesceBackgroundWork() {
     http_metadata_cleanup_running_ = false;
     timed("graceful_unmount", [&] { graceful_unmount_scheduler_.Stop(); });
     timed("replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
+    // A pending sweep stops at its next shard; its owners' replicas stay
+    // hidden on this master, and the handoff export drops them (their owner
+    // is no longer registered).
+    disk_unmount_sweep_stopping_.store(true, std::memory_order_release);
+    timed("disk_unmount_sweep", [&] { disk_unmount_sweep_worker_.Stop(); });
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -864,6 +887,7 @@ bool MasterService::BackgroundWorkQuiesced() const {
            !job_dispatch_thread_.joinable() &&
            !dynamic_replication_admission_thread_.joinable() &&
            !replica_cleanup_worker_.Joinable() &&
+           !disk_unmount_sweep_worker_.Joinable() &&
            !graceful_unmount_scheduler_.Joinable() &&
            !client_offboarding_worker_.Joinable() && !snapshot_manager_;
 }
@@ -2337,10 +2361,11 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
     const {
     return BuildStaleHandleCleanupPlan(
-        metadata, [&retaining_clients](const Replica& replica) {
+        metadata, [this, &retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients) ||
+                    IsDiskReplicaOfSweepingOwner(replica)) &&
                    replica.is_completed();
         });
 }
@@ -2905,6 +2930,30 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
     for (size_t i = 0; i < kNumShards; i++) {
+        const auto shard_error = ClearStaleHandlesInShard(i, is_stale);
+        if (shard_error && !first_persist_error) {
+            first_persist_error = shard_error;
+        }
+    }
+    if (first_persist_error) {
+        return tl::make_unexpected(*first_persist_error);
+    }
+    return {};
+}
+
+std::optional<ErrorCode> MasterService::ClearStaleHandlesInShard(
+    size_t i, const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const Replica&)>* on_removed,
+    StaleHandleShardStats* stats) {
+    using SteadyClock = std::chrono::steady_clock;
+    const auto elapsed_ns = [](SteadyClock::time_point since) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                SteadyClock::now() - since)
+                .count());
+    };
+    std::optional<ErrorCode> first_persist_error;
+    {
         // Pass 1: pick out the keys that need work under the shard's shared
         // lock. A sweep normally finds nothing in most shards, and such a
         // shard never takes the exclusive lock at all.
@@ -2912,17 +2961,21 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         std::vector<TenantId> empty_tenants;
         {
             MetadataShardAccessorRO shard(this, i);
+            const auto scan_start =
+                stats ? SteadyClock::now() : SteadyClock::time_point{};
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 if (tenant_state.Empty()) {
                     empty_tenants.push_back(tenant_id);
                     continue;
                 }
+                if (stats) stats->keys_scanned += tenant_state.metadata.size();
                 for (const auto& [key, metadata] : tenant_state.metadata) {
                     if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
                         stale_keys.emplace_back(tenant_id, key);
                     }
                 }
             }
+            if (stats) stats->scan_hold_ns += elapsed_ns(scan_start);
         }
 
         // Pass 2: clean the picked keys in bounded batches, so the exclusive
@@ -2935,6 +2988,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             const size_t end = std::min(begin + kStaleHandleCleanupBatchSize,
                                         stale_keys.size());
             MetadataShardAccessorRW shard(this, i);
+            const auto batch_start =
+                stats ? SteadyClock::now() : SteadyClock::time_point{};
             for (size_t j = begin; j < end; j++) {
                 auto tenant_it = shard->tenants.find(stale_keys[j].first);
                 if (tenant_it == shard->tenants.end()) {
@@ -2961,6 +3016,14 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                             }
                             continue;
                         }
+                    }
+                    if (on_removed) {
+                        std::as_const(it->second)
+                            .VisitReplicas(is_stale, *on_removed);
+                    }
+                    if (stats) {
+                        stats->removed_replicas +=
+                            cleanup_plan.removed_ids.size();
                     }
                     if (CleanupStaleHandles(it->first, tenant_it->first,
                                             tenant_state, it->second, is_stale,
@@ -3008,6 +3071,12 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     shard->tenants.erase(tenant_it);
                 }
             }
+            if (stats) {
+                const uint64_t hold = elapsed_ns(batch_start);
+                stats->batch_hold_ns += hold;
+                stats->max_batch_hold_ns =
+                    std::max(stats->max_batch_hold_ns, hold);
+            }
         }
 
         if (!empty_tenants.empty()) {
@@ -3028,10 +3097,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             }
         }
     }
-    if (first_persist_error) {
-        return tl::make_unexpected(*first_persist_error);
-    }
-    return {};
+    return first_persist_error;
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
@@ -4422,6 +4488,11 @@ bool MasterService::TryGetReadableReplicaDescriptor(
         const auto& disk = descriptor.get_local_disk_descriptor();
         // Handoff restore: unreadable until the owner process shows up.
         if (HandoffDiskGated(disk.client_id)) {
+            return false;
+        }
+        // Unmounted, sweep still running: the owner handed this disk back.
+        if (async_disk_unmount_sweep_ &&
+            DiskUnmountSweepPending(disk.client_id)) {
             return false;
         }
         endpoint = disk.transport_endpoint;
@@ -8081,16 +8152,17 @@ bool MasterService::CleanupStaleHandles(
     MetadataShardAccessorRW* shard) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner no longer retains
-    // resources.
+    // resources or whose owner's background unmount sweep is pending.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
     return CleanupStaleHandles(
         key, tenant_id, tenant_state, metadata,
-        [&retaining_clients](const Replica& replica) {
+        [this, &retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients) ||
+                    IsDiskReplicaOfSweepingOwner(replica)) &&
                    replica.is_completed();
         },
         shard);
@@ -8356,14 +8428,31 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         MasterMetricManager::instance().client_liveness_record_created();
     }
     ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    bool unmount_sweep_pending = false;
     const auto observation =
         record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            // A new registration must not coexist with replicas of this
+            // client's previous one. The sweep job is recorded under
+            // snapshot_mutex_ held exclusively, so this check and the
+            // registration below see it or come entirely before it.
+            if (async_disk_unmount_sweep_ &&
+                DiskUnmountSweepPending(client_id)) {
+                unmount_sweep_pending = true;
+                err = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                return false;
+            }
             err =
                 local_ssd_manager_.RegisterClient(client_id, enable_offloading);
             return err == ErrorCode::OK ||
                    err == ErrorCode::SEGMENT_ALREADY_EXISTS;
         });
+    if (unmount_sweep_pending) {
+        MasterMetricManager::instance().inc_disk_unmount_remount_refused();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=mount_local_disk_segment_deferred"
+                  << ", reason=unmount_sweep_pending";
+    }
     if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -8409,10 +8498,39 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // (the check refuses it). Without the exclusive lock a registration
     // admitted against the old one could land in a shard the sweep had
     // already passed and survive as a stale owner.
+    //
+    // With async_disk_unmount_sweep the sweep runs on
+    // disk_unmount_sweep_worker_ instead. The job is recorded in the same
+    // exclusive section as the deregistration, so from the moment this call
+    // can return the owner's replicas are unreadable
+    // (TryGetReadableReplicaDescriptor) and a mount of the same client is
+    // refused until the sweep ends (MountLocalDiskSegment).
     std::optional<int64_t> reported_capacity;
+    size_t pending_sweeps = 0;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
+        if (reported_capacity && async_disk_unmount_sweep_) {
+            std::unique_lock<std::shared_mutex> sweep_lock(
+                disk_unmount_sweep_mutex_);
+            auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                    disk_unmount_sweep_jobs_.end(),
+                                    [&client_id](const auto& pending) {
+                                        return pending.owner == client_id;
+                                    });
+            if (job == disk_unmount_sweep_jobs_.end()) {
+                disk_unmount_sweep_jobs_.push_back(DiskUnmountSweepJob{
+                    .owner = client_id,
+                    .started = std::chrono::steady_clock::now()});
+            } else {
+                // Not reachable while a pending sweep refuses the mount;
+                // restarting the full pass keeps the invariant regardless.
+                job->shards_left = kNumShards;
+            }
+            pending_sweeps = disk_unmount_sweep_jobs_.size();
+            disk_unmount_sweep_owner_count_.store(pending_sweeps);
+            PublishDiskUnmountSweepProgressLocked();
+        }
     }
     if (!reported_capacity) {
         // Idempotent, the same way MountLocalDiskSegment treats an
@@ -8432,11 +8550,159 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // erased -- and when that disk replica was the key's only one, the key
     // itself. An owner-id predicate cannot misclassify a concurrent mount,
     // whatever the interleaving.
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Schedule();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=unmount_local_disk_segment_by_request"
+                  << ", sweep=background, pending_sweeps=" << pending_sweeps;
+        return {};
+    }
     ClearLocalDiskHandlesOwnedBy(client_id);
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
     return {};
+}
+
+bool MasterService::DiskUnmountSweepPending(const UUID& owner) const {
+    if (disk_unmount_sweep_owner_count_.load() == 0) {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+    return std::any_of(
+        disk_unmount_sweep_jobs_.begin(), disk_unmount_sweep_jobs_.end(),
+        [&owner](const auto& job) { return job.owner == owner; });
+}
+
+bool MasterService::IsDiskReplicaOfSweepingOwner(const Replica& replica) const {
+    if (!async_disk_unmount_sweep_ || !replica.is_local_disk_replica()) {
+        return false;
+    }
+    const auto owner = replica.get_local_disk_client_id();
+    return owner && DiskUnmountSweepPending(*owner);
+}
+
+void MasterService::PublishDiskUnmountSweepProgressLocked() const {
+    int64_t remaining_shards = 0;
+    int64_t remaining_replicas = 0;
+    int64_t oldest_age_seconds = 0;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& job : disk_unmount_sweep_jobs_) {
+        remaining_shards += static_cast<int64_t>(job.shards_left);
+        const size_t visited = kNumShards - job.shards_left;
+        if (visited > 0) {
+            // Keys hash uniformly over the shards.
+            remaining_replicas += static_cast<int64_t>(
+                job.removed_replicas * job.shards_left / visited);
+        }
+        oldest_age_seconds = std::max<int64_t>(
+            oldest_age_seconds,
+            std::chrono::duration_cast<std::chrono::seconds>(now - job.started)
+                .count());
+    }
+    MasterMetricManager::instance().set_disk_unmount_sweep_progress(
+        static_cast<int64_t>(disk_unmount_sweep_jobs_.size()), remaining_shards,
+        remaining_replicas, oldest_age_seconds);
+}
+
+void MasterService::RunDiskUnmountSweeps() {
+    // One shard per step, round robin. Every pending owner takes part in
+    // each step; an owner is done once it has taken part in kNumShards
+    // consecutive steps, i.e. once every shard was swept for it after its
+    // unmount. Owners that unmount together share the shard walks.
+    while (!disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+        std::vector<UUID> owners;
+        {
+            std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            if (disk_unmount_sweep_jobs_.empty()) {
+                return;
+            }
+            owners.reserve(disk_unmount_sweep_jobs_.size());
+            for (const auto& job : disk_unmount_sweep_jobs_) {
+                owners.push_back(job.owner);
+            }
+        }
+        const size_t shard = disk_unmount_sweep_cursor_;
+        disk_unmount_sweep_cursor_ = (shard + 1) % kNumShards;
+        if (disk_unmount_sweep_shard_hook_) {
+            disk_unmount_sweep_shard_hook_(shard);
+        }
+        if (disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::vector<uint64_t> removed(owners.size(), 0);
+        const auto owner_index = [&owners](const Replica& replica) {
+            const auto owner = replica.get_local_disk_client_id();
+            if (!owner) return owners.size();
+            return static_cast<size_t>(
+                std::find(owners.begin(), owners.end(), *owner) -
+                owners.begin());
+        };
+        const std::function<bool(const Replica&)> is_stale =
+            [&owners, &owner_index](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.is_completed() &&
+                       owner_index(replica) < owners.size();
+            };
+        const std::function<void(const Replica&)> on_removed =
+            [&removed, &owner_index](const Replica& replica) {
+                const size_t index = owner_index(replica);
+                if (index < removed.size()) ++removed[index];
+            };
+        StaleHandleShardStats stats;
+        (void)ClearStaleHandlesInShard(shard, is_stale, &on_removed, &stats);
+
+        uint64_t removed_total = 0;
+        std::vector<DiskUnmountSweepJob> finished;
+        {
+            std::unique_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            for (size_t k = 0; k < owners.size(); ++k) {
+                auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                        disk_unmount_sweep_jobs_.end(),
+                                        [&](const auto& pending) {
+                                            return pending.owner == owners[k];
+                                        });
+                if (job == disk_unmount_sweep_jobs_.end()) continue;
+                removed_total += removed[k];
+                job->removed_replicas += removed[k];
+                job->max_scan_hold_ns =
+                    std::max(job->max_scan_hold_ns, stats.scan_hold_ns);
+                job->max_batch_hold_ns =
+                    std::max(job->max_batch_hold_ns, stats.max_batch_hold_ns);
+                if (--job->shards_left == 0) {
+                    finished.push_back(*job);
+                    disk_unmount_sweep_jobs_.erase(job);
+                }
+            }
+            disk_unmount_sweep_owner_count_.store(
+                disk_unmount_sweep_jobs_.size());
+            PublishDiskUnmountSweepProgressLocked();
+        }
+        if (!finished.empty()) {
+            disk_unmount_sweep_cv_.notify_all();
+        }
+        if (removed_total > 0) {
+            MasterMetricManager::instance()
+                .inc_disk_unmount_sweep_removed_replicas(
+                    static_cast<int64_t>(removed_total));
+        }
+        for (const auto& job : finished) {
+            const auto duration_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - job.started)
+                    .count();
+            MasterMetricManager::instance()
+                .observe_disk_unmount_sweep_duration_ms(duration_ms);
+            LOG(INFO) << "client_id=" << job.owner
+                      << ", action=local_disk_unmount_sweep_done"
+                      << ", duration_ms=" << duration_ms
+                      << ", removed_replicas=" << job.removed_replicas
+                      << ", max_shard_scan_us=" << job.max_scan_hold_ns / 1000
+                      << ", max_erase_batch_us="
+                      << job.max_batch_hold_ns / 1000;
+        }
+    }
 }
 
 bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {

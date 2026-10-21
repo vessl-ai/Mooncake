@@ -249,6 +249,15 @@ DEFINE_bool(enable_offload_stall_metrics, false,
             "LOCAL_DISK registration left, the oldest task's age, expired "
             "tasks, and (with offload_on_evict) eviction candidates kept in "
             "memory because their store has no LOCAL_DISK tier");
+DEFINE_bool(async_disk_unmount_sweep, false,
+            "With enable_offload, return from UnmountLocalDiskSegment as soon "
+            "as the store's LOCAL_DISK registration is dropped, and erase its "
+            "disk replicas on a background thread. Until that sweep ends the "
+            "replicas are never handed to a reader, and the same store "
+            "cannot mount its disk tier again (the mount fails with "
+            "UNAVAILABLE_IN_CURRENT_STATUS and the store retries). Off, the "
+            "unmount RPC returns only after the sweep. Ignored with HA, "
+            "snapshot or CXL, like the memory segment's deferred sweep");
 DEFINE_bool(enable_reuse_sampler, false,
             "Track a hash-sampled fraction of keys after eviction and export "
             "the time until each is referenced again (reuse age) and its "
@@ -701,6 +710,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_offload_stall_metrics",
                            &master_config.enable_offload_stall_metrics,
                            FLAGS_enable_offload_stall_metrics);
+    default_config.GetBool("async_disk_unmount_sweep",
+                           &master_config.async_disk_unmount_sweep,
+                           FLAGS_async_disk_unmount_sweep);
     default_config.GetBool("enable_reuse_sampler",
                            &master_config.enable_reuse_sampler,
                            FLAGS_enable_reuse_sampler);
@@ -1128,6 +1140,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_offload_stall_metrics =
             FLAGS_enable_offload_stall_metrics;
+    }
+    if ((google::GetCommandLineFlagInfo("async_disk_unmount_sweep", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.async_disk_unmount_sweep = FLAGS_async_disk_unmount_sweep;
     }
     if ((google::GetCommandLineFlagInfo("enable_reuse_sampler", &info) &&
          !info.is_default) ||
@@ -2087,6 +2104,8 @@ int main(int argc, char* argv[]) {
         << master_config.offload_evict_without_local_disk
         << ", enable_offload_stall_metrics="
         << master_config.enable_offload_stall_metrics
+        << ", async_disk_unmount_sweep="
+        << master_config.async_disk_unmount_sweep
         << ", enable_reuse_sampler=" << master_config.enable_reuse_sampler
         << ", reuse_sampler_rate=" << master_config.reuse_sampler_rate
         << ", reuse_sampler_max_entries="

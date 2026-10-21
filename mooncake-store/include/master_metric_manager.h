@@ -378,6 +378,22 @@ class MasterMetricManager {
     int64_t get_offload_task_oldest_age_seconds();
     int64_t get_offload_tasks_expired();
 
+    // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep). Only
+    // set while that mode is on, so no series exists with it off.
+    void set_disk_unmount_sweep_progress(int64_t pending_owners,
+                                         int64_t remaining_shards,
+                                         int64_t remaining_replicas,
+                                         int64_t oldest_age_seconds);
+    void inc_disk_unmount_sweep_removed_replicas(int64_t val);
+    void observe_disk_unmount_sweep_duration_ms(int64_t ms);
+    void inc_disk_unmount_remount_refused(int64_t val = 1);
+    int64_t get_disk_unmount_sweep_pending_owners();
+    int64_t get_disk_unmount_sweep_remaining_shards();
+    int64_t get_disk_unmount_sweep_remaining_replicas();
+    int64_t get_disk_unmount_sweep_oldest_age_seconds();
+    int64_t get_disk_unmount_sweep_removed_replicas();
+    int64_t get_disk_unmount_remount_refused();
+
     // Ghost-key reuse-age sampler metrics (enable_reuse_sampler). Label
     // values: state = "disk" | "none", op = "exist" | "get" | "put_start",
     // tier = "memory" | "disk".
@@ -821,6 +837,15 @@ class MasterMetricManager {
     ylt::metric::gauge_t offload_tasks_without_local_disk_;
     ylt::metric::gauge_t offload_task_oldest_age_seconds_;
     ylt::metric::counter_t offload_tasks_expired_total_;
+
+    // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep)
+    ylt::metric::gauge_t disk_unmount_sweep_pending_owners_;
+    ylt::metric::gauge_t disk_unmount_sweep_remaining_shards_;
+    ylt::metric::gauge_t disk_unmount_sweep_remaining_replicas_;
+    ylt::metric::gauge_t disk_unmount_sweep_oldest_age_seconds_;
+    ylt::metric::counter_t disk_unmount_sweep_removed_replicas_total_;
+    ylt::metric::histogram_t disk_unmount_sweep_duration_ms_;
+    ylt::metric::counter_t disk_unmount_remount_refused_total_;
 
     // Ghost-key reuse-age sampler metrics (enable_reuse_sampler)
     LabeledHistogram<2> reuse_sampler_memory_reuse_age_seconds_;

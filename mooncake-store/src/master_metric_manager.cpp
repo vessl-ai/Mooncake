@@ -500,6 +500,38 @@ MasterMetricManager::MasterMetricManager()
           "master_offload_tasks_expired_total",
           "Offload tasks released because no completion arrived within "
           "put_start_release_timeout_sec"),
+      disk_unmount_sweep_pending_owners_(
+          "master_disk_unmount_sweep_pending_owners",
+          "async_disk_unmount_sweep: stores whose LOCAL_DISK tier was "
+          "unmounted and whose disk replicas are still being erased; their "
+          "replicas are hidden from readers meanwhile"),
+      disk_unmount_sweep_remaining_shards_(
+          "master_disk_unmount_sweep_remaining_shards",
+          "async_disk_unmount_sweep: metadata shards the pending sweeps "
+          "still have to visit, summed over the pending stores (1024 per "
+          "store at the start)"),
+      disk_unmount_sweep_remaining_replicas_(
+          "master_disk_unmount_sweep_remaining_replicas",
+          "async_disk_unmount_sweep: estimated disk replicas of the pending "
+          "stores not yet erased (replicas erased so far scaled by the "
+          "shards still to visit; 0 when no sweep is pending)"),
+      disk_unmount_sweep_oldest_age_seconds_(
+          "master_disk_unmount_sweep_oldest_age_seconds",
+          "async_disk_unmount_sweep: time since the oldest pending sweep's "
+          "unmount (0 when none is pending)"),
+      disk_unmount_sweep_removed_replicas_total_(
+          "master_disk_unmount_sweep_removed_replicas_total",
+          "async_disk_unmount_sweep: disk replicas erased by unmount sweeps"),
+      disk_unmount_sweep_duration_ms_(
+          "master_disk_unmount_sweep_duration_ms",
+          "async_disk_unmount_sweep: time from a LOCAL_DISK unmount to the "
+          "end of its background sweep, in milliseconds",
+          {100, 500, 1000, 2000, 5000, 10000, 20000, 30000, 45000, 60000,
+           120000, 300000}),
+      disk_unmount_remount_refused_total_(
+          "master_disk_unmount_remount_refused_total",
+          "async_disk_unmount_sweep: LOCAL_DISK mounts refused because the "
+          "same store's earlier unmount sweep had not finished"),
       reuse_sampler_memory_reuse_age_seconds_(
           "master_reuse_sampler_memory_reuse_age_seconds",
           "Sampled keys: time from the eviction of the last memory copy to "
@@ -1533,6 +1565,53 @@ int64_t MasterMetricManager::get_offload_tasks_expired() {
     return offload_tasks_expired_total_.value();
 }
 
+// Background LOCAL_DISK unmount sweep metrics
+void MasterMetricManager::set_disk_unmount_sweep_progress(
+    int64_t pending_owners, int64_t remaining_shards,
+    int64_t remaining_replicas, int64_t oldest_age_seconds) {
+    disk_unmount_sweep_pending_owners_.update(pending_owners);
+    disk_unmount_sweep_remaining_shards_.update(remaining_shards);
+    disk_unmount_sweep_remaining_replicas_.update(remaining_replicas);
+    disk_unmount_sweep_oldest_age_seconds_.update(oldest_age_seconds);
+}
+
+void MasterMetricManager::inc_disk_unmount_sweep_removed_replicas(int64_t val) {
+    disk_unmount_sweep_removed_replicas_total_.inc(val);
+}
+
+void MasterMetricManager::observe_disk_unmount_sweep_duration_ms(int64_t ms) {
+    // ylt's histogram serializes nothing while its sum is 0.
+    disk_unmount_sweep_duration_ms_.observe(std::max<int64_t>(ms, 1));
+}
+
+void MasterMetricManager::inc_disk_unmount_remount_refused(int64_t val) {
+    disk_unmount_remount_refused_total_.inc(val);
+}
+
+int64_t MasterMetricManager::get_disk_unmount_sweep_pending_owners() {
+    return disk_unmount_sweep_pending_owners_.value();
+}
+
+int64_t MasterMetricManager::get_disk_unmount_sweep_remaining_shards() {
+    return disk_unmount_sweep_remaining_shards_.value();
+}
+
+int64_t MasterMetricManager::get_disk_unmount_sweep_remaining_replicas() {
+    return disk_unmount_sweep_remaining_replicas_.value();
+}
+
+int64_t MasterMetricManager::get_disk_unmount_sweep_oldest_age_seconds() {
+    return disk_unmount_sweep_oldest_age_seconds_.value();
+}
+
+int64_t MasterMetricManager::get_disk_unmount_sweep_removed_replicas() {
+    return disk_unmount_sweep_removed_replicas_total_.value();
+}
+
+int64_t MasterMetricManager::get_disk_unmount_remount_refused() {
+    return disk_unmount_remount_refused_total_.value();
+}
+
 // Ghost-key reuse-age sampler metrics
 void MasterMetricManager::observe_reuse_sampler_memory_reuse_age(
     const std::string& state, const std::string& op, double seconds) {
@@ -2377,6 +2456,13 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(offload_tasks_without_local_disk_);
     serialize_metric(offload_task_oldest_age_seconds_);
     serialize_metric(offload_tasks_expired_total_);
+    serialize_metric(disk_unmount_sweep_pending_owners_);
+    serialize_metric(disk_unmount_sweep_remaining_shards_);
+    serialize_metric(disk_unmount_sweep_remaining_replicas_);
+    serialize_metric(disk_unmount_sweep_oldest_age_seconds_);
+    serialize_metric(disk_unmount_sweep_removed_replicas_total_);
+    serialize_metric(disk_unmount_sweep_duration_ms_);
+    serialize_metric(disk_unmount_remount_refused_total_);
     serialize_metric(reuse_sampler_memory_reuse_age_seconds_);
     serialize_metric(reuse_sampler_disk_reuse_age_seconds_);
     serialize_metric(reuse_sampler_evicted_age_seconds_);
