@@ -98,12 +98,14 @@ namespace {
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
 
-// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
-// when offload-on-evict mode is active. Defers memory eviction for at most
-// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
-// falls back according to `offload_force_evict_`.
-// NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
-// configurable via --offloading_queue_limit and --offload_cap_ratio flags.
+// Per-cycle offload cap: `offloading_queue_limit_ * offload_cap_ratio_`
+// (--offloading_queue_limit, --offload_cap_ratio). Used only in
+// offload-on-evict mode with `offload_force_evict_` set: once a BatchEvict
+// cycle (or one tenant eviction call) has queued this many objects, the
+// remaining candidates are evicted without a disk copy. Without
+// `offload_force_evict_` the cap is not consulted; a cycle keeps queueing
+// until a store's mailbox holds `offloading_queue_limit_` items, and a push
+// beyond that fails with KEYS_ULTRA_LIMIT and leaves the object in memory.
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,

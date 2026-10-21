@@ -112,15 +112,17 @@ These flags control when the master asks clients to persist objects to SSD, whet
 |------|---------|-------------|
 | `--enable_offload` | `false` | Enables the master-side SSD offload control plane. Set this on the master and on every real client that owns SSD storage |
 | `--offload_on_evict` | `false` | Defer SSD persistence until memory eviction selects an object. When `false`, successful `Put` completion queues eager SSD persistence |
-| `--offload_force_evict` | `false` | If offload-on-evict exceeds the per-cycle offload cap, force-evict excess objects instead of leaving them in DRAM |
+| `--offload_force_evict` | `false` | With offload-on-evict, evict without an SSD copy the objects beyond the per-cycle offload cap and the objects whose offload push fails, instead of leaving them in DRAM |
 | `--offloading_queue_limit` | `50000` | Maximum pending offload objects per local disk segment. Must be greater than `0` and at most `100000000` |
-| `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle |
+| `--offload_cap_ratio` | `0.5` | Per-eviction-cycle cap as a fraction of `offloading_queue_limit`; range `[0.0, 1.0]`. Default cap is `25000` objects per cycle. Used only with `--offload_force_evict=true` |
 | `--promotion_on_hit` | `false` | Promote SSD-resident objects back to DRAM after read hits |
 | `--promotion_admission_threshold` | `2` | Minimum CountMinSketch count before promotion is admitted. Set `1` to disable second-touch gating |
 | `--promotion_max_per_heartbeat` | `1` | Maximum promotion tasks returned to one client per heartbeat. Keep conservative for large objects because each task does SSD read plus memory write |
 | `--promotion_queue_limit` | `50000` | Maximum in-flight promotion tasks tracked by the master |
 
-Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
+Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict with `--offload_force_evict=true` is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
+
+Without `--offload_force_evict`, the per-cycle cap is not applied: an eviction cycle queues candidates until a client's queue holds `offloading_queue_limit` objects, and an object that cannot be queued stays in DRAM until a later cycle queues it. Memory is freed only by the eviction cycle after the SSD copy completes. An object on a client with no local disk segment taking offloads is never queued, so with offload-on-evict that client's DRAM is not reclaimed by eviction unless `--offload_force_evict=true` is set.
 
 ---
 

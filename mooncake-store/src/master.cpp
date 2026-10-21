@@ -233,7 +233,9 @@ DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
-            "Force-evict objects exceeding offload cap without disk offload");
+            "With offload_on_evict, evict without a disk copy the objects "
+            "beyond the per-cycle offload cap and the objects whose offload "
+            "push fails");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -259,8 +261,10 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
 });
 DEFINE_double(offload_cap_ratio, 0.5,
               "Per-cycle offload cap as a fraction of offloading_queue_limit. "
-              "Controls how many objects can be queued for offload in a single "
-              "eviction cycle before falling back to force-evict");
+              "Used only with offload_force_evict: once a cycle has queued "
+              "this many objects, the rest are evicted without a disk copy. "
+              "Without offload_force_evict a cycle queues until a store's "
+              "offloading_queue_limit is reached");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
