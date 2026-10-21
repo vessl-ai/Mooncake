@@ -164,6 +164,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`. `0` disables it. Its scope depends on the deployment — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_BUCKET_READ_PENDING_EVICTION` | `false` | Keep serving reads of keys whose bucket is being evicted until the master has acknowledged the eviction. An eviction removes the keys from the local index before it tells the master, and the master keeps returning the disk replica until it processes that message; by default a read in that window fails with `INVALID_KEY` although the file is still on disk. When enabled, such a read takes the same in-flight guard that file deletion waits for. Reads that arrive after the master acknowledged still fail as before. |
 
 ### File-per-key backend settings
 
