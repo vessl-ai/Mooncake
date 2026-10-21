@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "placement_key.h"
 
 #include <algorithm>
 #include <array>
@@ -469,6 +470,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else if (config.async_disk_unmount_sweep) {
         LOG(WARNING) << "async_disk_unmount_sweep ignored: it needs "
                         "enable_offload and no HA, snapshot or CXL";
+    }
+
+    placement_key_hrw_ = config.placement_key_hrw;
+    if (placement_key_hrw_) {
+        LOG(INFO) << "Placement key HRW enabled: a preferred segment entry "
+                  << "\"" << kPlacementKeyPrefix
+                  << "<key>\" ranks the serving segments by rendezvous hash";
     }
 
     offload_stall_metrics_ =
@@ -4968,6 +4976,48 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::ExpandPlacementKeys(
+    const ReplicateConfig& config,
+    const ScopedAllocatorAccess& allocator_access,
+    std::vector<std::string>& preferred_segments) const {
+    const std::vector<std::string>* entries = nullptr;
+    std::vector<std::string> single;
+    if (!config.preferred_segment.empty()) {
+        single.push_back(config.preferred_segment);
+        entries = &single;
+    } else {
+        entries = &config.preferred_segments;
+    }
+    if (std::none_of(entries->begin(), entries->end(), [](const auto& entry) {
+            return ParsePlacementKey(entry).has_value();
+        })) {
+        return;
+    }
+
+    // Rebuild the list in the caller's order, each placement key replaced by
+    // the serving segments in its HRW order (first occurrence wins).
+    const auto serving =
+        allocator_access.getAllocatorManager().getServingNames();
+    std::vector<std::string> expanded;
+    auto append = [&expanded](const std::string& name) {
+        if (!name.empty() && std::find(expanded.begin(), expanded.end(),
+                                       name) == expanded.end()) {
+            expanded.push_back(name);
+        }
+    };
+    for (const auto& entry : *entries) {
+        if (auto placement_key = ParsePlacementKey(entry)) {
+            for (const auto& name :
+                 RankSegmentsForPlacementKey(*placement_key, serving)) {
+                append(name);
+            }
+        } else {
+            append(entry);
+        }
+    }
+    preferred_segments = std::move(expanded);
+}
+
 auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
@@ -5003,6 +5053,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
             has_enough_memory_segments = allocator_access.getAllocatorManager()
                                              .getServingNames()
                                              .size() >= config.replica_num;
+            if (placement_key_hrw_) {
+                ExpandPlacementKeys(config, allocator_access,
+                                    preferred_segments);
+            }
             if (!writer_host_id.empty()) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,

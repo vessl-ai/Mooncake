@@ -1682,6 +1682,15 @@ class MasterService {
                           const std::string& writer_host_id)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
+    // --placement_key_hrw: when the config names a placement key
+    // (placement_key.h), rebuilds `preferred_segments` with each key replaced
+    // by the serving segments in its HRW order. Leaves it unchanged
+    // otherwise. Called under the allocator access of AllocateReplicas.
+    void ExpandPlacementKeys(
+        const ReplicateConfig& config,
+        const ScopedAllocatorAccess& allocator_access,
+        std::vector<std::string>& preferred_segments) const;
+
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
                         const std::string& key, uint64_t value_length,
                         const ReplicateConfig& config,
@@ -1814,6 +1823,8 @@ class MasterService {
     // True when async_disk_unmount_sweep is on and effective (offload on;
     // HA, snapshot and CXL off, as for enable_async_segment_cleanup_).
     bool async_disk_unmount_sweep_{false};
+    // --placement_key_hrw (fork-only, default off; placement_key.h).
+    bool placement_key_hrw_{false};
     // Guards disk_unmount_sweep_jobs_. A leaf lock: taken under shard locks
     // (readers) and under snapshot_mutex_ (unmount, mount); nothing is
     // acquired while it is held.

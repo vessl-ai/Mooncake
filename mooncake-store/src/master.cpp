@@ -249,6 +249,14 @@ DEFINE_bool(enable_offload_stall_metrics, false,
             "LOCAL_DISK registration left, the oldest task's age, expired "
             "tasks, and (with offload_on_evict) eviction candidates kept in "
             "memory because their store has no LOCAL_DISK tier");
+DEFINE_bool(placement_key_hrw, false,
+            "Let a put name a placement key instead of a segment: a "
+            "preferred_segments entry \"placement-key:<key>\" is replaced by "
+            "every serving memory segment, ranked by rendezvous (HRW) hash "
+            "of <key> and the segment name, so puts that share a key (e.g. "
+            "one prefix chain) land on one segment and spill to the next in "
+            "the same order. Off, such an entry names no segment and the "
+            "put is placed as before.");
 DEFINE_bool(async_disk_unmount_sweep, false,
             "With enable_offload, return from UnmountLocalDiskSegment as soon "
             "as the store's LOCAL_DISK registration is dropped, and erase its "
@@ -713,6 +721,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("async_disk_unmount_sweep",
                            &master_config.async_disk_unmount_sweep,
                            FLAGS_async_disk_unmount_sweep);
+    default_config.GetBool("placement_key_hrw",
+                           &master_config.placement_key_hrw,
+                           FLAGS_placement_key_hrw);
     default_config.GetBool("enable_reuse_sampler",
                            &master_config.enable_reuse_sampler,
                            FLAGS_enable_reuse_sampler);
@@ -1145,6 +1156,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.async_disk_unmount_sweep = FLAGS_async_disk_unmount_sweep;
+    }
+    if ((google::GetCommandLineFlagInfo("placement_key_hrw", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.placement_key_hrw = FLAGS_placement_key_hrw;
     }
     if ((google::GetCommandLineFlagInfo("enable_reuse_sampler", &info) &&
          !info.is_default) ||

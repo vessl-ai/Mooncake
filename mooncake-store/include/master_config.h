@@ -198,6 +198,7 @@ struct MasterConfig {
     bool offload_evict_without_local_disk = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
     bool enable_reuse_sampler = false;
     double reuse_sampler_rate = 0.01;
     size_t reuse_sampler_max_entries = 1000000;
@@ -333,6 +334,7 @@ class MasterServiceSupervisorConfig {
     bool offload_evict_without_local_disk = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
     bool enable_reuse_sampler = false;
     double reuse_sampler_rate = 0.01;
     size_t reuse_sampler_max_entries = 1000000;
@@ -404,6 +406,7 @@ class MasterServiceSupervisorConfig {
             config.offload_evict_without_local_disk;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
         enable_reuse_sampler = config.enable_reuse_sampler;
         reuse_sampler_rate = config.reuse_sampler_rate;
         reuse_sampler_max_entries = config.reuse_sampler_max_entries;
@@ -615,6 +618,7 @@ class WrappedMasterServiceConfig {
     bool offload_evict_without_local_disk = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
     bool enable_reuse_sampler = false;
     double reuse_sampler_rate = 0.01;
     size_t reuse_sampler_max_entries = 1000000;
@@ -722,6 +726,7 @@ class WrappedMasterServiceConfig {
             config.offload_evict_without_local_disk;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
         enable_reuse_sampler = config.enable_reuse_sampler;
         reuse_sampler_rate = config.reuse_sampler_rate;
         reuse_sampler_max_entries = config.reuse_sampler_max_entries;
@@ -859,6 +864,7 @@ class WrappedMasterServiceConfig {
             config.offload_evict_without_local_disk;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
         enable_reuse_sampler = config.enable_reuse_sampler;
         reuse_sampler_rate = config.reuse_sampler_rate;
         reuse_sampler_max_entries = config.reuse_sampler_max_entries;
@@ -1367,6 +1373,7 @@ class MasterServiceConfig {
     bool offload_evict_without_local_disk = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
     bool enable_reuse_sampler = false;
     double reuse_sampler_rate = 0.01;
     size_t reuse_sampler_max_entries = 1000000;
@@ -1470,6 +1477,7 @@ class MasterServiceConfig {
             config.offload_evict_without_local_disk;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
         async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
         enable_reuse_sampler = config.enable_reuse_sampler;
         reuse_sampler_rate = config.reuse_sampler_rate;
         reuse_sampler_max_entries = config.reuse_sampler_max_entries;
