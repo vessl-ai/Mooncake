@@ -456,6 +456,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                          "store with no LOCAL_DISK tier taking offloads will "
                          "be evicted without disk offload";
         }
+        offload_evict_frontier_only_ = config.offload_evict_frontier_only;
+        if (offload_evict_frontier_only_) {
+            LOG(INFO) << "Frontier-only offload enabled: an eviction cycle "
+                         "queues offloads only for its oldest-lease frontier, "
+                         "oldest first; other keys are freed only when they "
+                         "have a disk copy";
+        }
     }
 
     // Same conditions as the memory segment's deferred sweep: HA, snapshot
@@ -12466,6 +12473,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // key at most once, but the second pass may retry a key the first pass
     // kept, so the stall gauge reports the larger of the two passes.
     long offload_no_local_disk_skipped = 0;
+    // offload_evict_frontier_only: the first pass queues offloads only for
+    // the frontier, its oldest-lease candidates. try_evict_or_offload reads
+    // this gate; the passes below clear it for every key past the frontier.
+    const bool frontier_only = offload_evict_frontier_only_;
+    bool offload_queue_allowed = true;
+    // #keys past the frontier kept in memory because they have no disk copy
+    long offload_beyond_frontier_kept = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -12505,6 +12519,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // releases.
         if (tenant_state.offloading_tasks.contains(key)) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
+        // Past the frontier (offload_evict_frontier_only): queue nothing. A
+        // key without a disk copy stays in memory, so a recently read key is
+        // not sent to disk ahead of older ones.
+        if (!offload_queue_allowed) {
+            offload_beyond_frontier_kept++;
+            return 0;
         }
 
         // Force-evict cap: if force_evict enabled and cap reached, force
@@ -13052,18 +13074,36 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (!candidates.empty()) {
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
+        auto earlier_lease = [](const Candidate& a, const Candidate& b) {
+            return a.lease_timeout < b.lease_timeout;
+        };
         std::nth_element(candidates.begin(),
                          candidates.begin() + (evict_num - 1), candidates.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
-                         });
+                         earlier_lease);
+
+        // offload_evict_frontier_only: the frontier is every candidate of the
+        // compact path (the reserve cutoff bounds them) and otherwise the
+        // evict_num oldest, which nth_element just put first. Walk it from
+        // the oldest lease, so the offload queue receives keys in lease order.
+        size_t frontier_size = candidates.size();
+        if (frontier_only) {
+            if (!compact_frontier_used) {
+                frontier_size = static_cast<size_t>(evict_num);
+            }
+            std::sort(candidates.begin(), candidates.begin() + frontier_size,
+                      earlier_lease);
+        }
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
+        // Only the first `queueable` candidates of a batch may be queued for
+        // offload (all of them unless offload_evict_frontier_only is set).
         long evicted_this_pass = 0;
-        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
-            for (auto& c : batch) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch,
+                                         size_t queueable) {
+            for (size_t i = 0; i < batch.size(); ++i) {
+                auto& c = batch[i];
                 if (stop_eviction_scan || stopping()) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
@@ -13074,6 +13114,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
+                offload_queue_allowed = i < queueable;
                 auto evict_result = try_evict_group_or_object(
                     c.tenant_id, c.key, c.shard_idx,
                     /*allow_soft_pinned=*/false, deferred_replicas);
@@ -13096,7 +13137,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         };
 
-        evict_candidate_batch(candidates);
+        evict_candidate_batch(candidates, frontier_size);
 
         // Metadata may change after the frontier is materialized. If the
         // reserve is exhausted before the target is met, refill from the
@@ -13108,8 +13149,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
-            evict_candidate_batch(refill_candidates);
+            // Every refill key is newer than the frontier.
+            evict_candidate_batch(refill_candidates,
+                                  frontier_only ? 0 : refill_candidates.size());
         }
+        offload_queue_allowed = true;
     }
 
     const long first_pass_no_local_disk_skipped = offload_no_local_disk_skipped;
@@ -13129,7 +13173,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
+    // evict_ratio_lowerbound. Its keys are not in the frontier.
+    offload_queue_allowed = !frontier_only;
     if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
@@ -13289,6 +13334,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     ? ", offload_no_local_disk_evicted=" +
                           std::to_string(offload_no_local_disk_evicted)
                     : std::string())
+            << (frontier_only ? ", offload_beyond_frontier_kept=" +
+                                    std::to_string(offload_beyond_frontier_kept)
+                              : std::string())
             << ", total_freed_size=" << total_freed_size
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="

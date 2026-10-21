@@ -243,6 +243,13 @@ DEFINE_bool(offload_evict_without_local_disk, false,
             "registered, fenced, unmounted, or offloading disabled). A full "
             "offload queue and other push failures still keep the object in "
             "memory");
+DEFINE_bool(offload_evict_frontier_only, false,
+            "With offload_on_evict, queue offloads only for the eviction "
+            "frontier of a cycle (the oldest-lease candidates the target "
+            "asks for), walked from the oldest lease. Every other object the "
+            "cycle visits is freed only if it already has a disk copy and is "
+            "otherwise left in memory, instead of being queued in metadata "
+            "(hash) order until the offload queue is full");
 DEFINE_bool(enable_offload_stall_metrics, false,
             "Export metrics that show eviction waiting on offloads that "
             "cannot finish: pending offload tasks, tasks whose store has no "
@@ -715,6 +722,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_evict_without_local_disk",
                            &master_config.offload_evict_without_local_disk,
                            FLAGS_offload_evict_without_local_disk);
+    default_config.GetBool("offload_evict_frontier_only",
+                           &master_config.offload_evict_frontier_only,
+                           FLAGS_offload_evict_frontier_only);
     default_config.GetBool("enable_offload_stall_metrics",
                            &master_config.enable_offload_stall_metrics,
                            FLAGS_enable_offload_stall_metrics);
@@ -1144,6 +1154,12 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_evict_without_local_disk =
             FLAGS_offload_evict_without_local_disk;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_evict_frontier_only", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_evict_frontier_only =
+            FLAGS_offload_evict_frontier_only;
     }
     if ((google::GetCommandLineFlagInfo("enable_offload_stall_metrics",
                                         &info) &&

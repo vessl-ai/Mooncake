@@ -222,7 +222,7 @@ class OffloadOnEvictCycleTest : public ::testing::Test {
     }
 
     std::vector<std::string> Put(const Store& store, const std::string& prefix,
-                                 int count) {
+                                 int count, size_t object_size = kObjectSize) {
         std::vector<std::string> keys;
         for (int i = 0; i < count; ++i) {
             const std::string key = prefix + std::to_string(i);
@@ -230,7 +230,7 @@ class OffloadOnEvictCycleTest : public ::testing::Test {
             config.replica_num = 1;
             config.preferred_segment = store.segment_name;
             auto started = service_->PutStart(
-                store.client_id, key, TenantId::Default(), kObjectSize, config);
+                store.client_id, key, TenantId::Default(), object_size, config);
             EXPECT_TRUE(started.has_value()) << key;
             EXPECT_TRUE(service_->PutEnd(store.client_id, key,
                                          TenantId::Default(),
@@ -238,6 +238,17 @@ class OffloadOnEvictCycleTest : public ::testing::Test {
             keys.push_back(key);
         }
         return keys;
+    }
+
+    // Overwrite the lease deadline of a key (the eviction order).
+    void SetLease(const std::string& key,
+                  std::chrono::system_clock::time_point deadline) {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists()) << key;
+        SpinLocker locker(&accessor.Get().lock);
+        accessor.Get().lease_->SetDeadline(deadline);
     }
 
     // One BatchEvict cycle with the given target (and lower bound).
@@ -827,9 +838,163 @@ TEST_F(OffloadOnEvictCycleTest, StallMetricsStayUntouchedByDefault) {
     EXPECT_EQ(metrics.get_offload_no_local_disk_evicted(), evicted_before);
 }
 
+// =============================================================================
+// Which keys a cycle queues, and in what order (INF-651 hole analysis).
+//
+// 2000 objects of 4 KiB, all expired, key i with the i-th oldest lease. A 5%
+// target asks for 100 objects; the frontier is those plus the reserve slack
+// (1024), i.e. the 1124 oldest keys. Queueing frees nothing, so the first
+// pass never reaches the target and the refill pass walks the 876 newer keys
+// in metadata (hash) order. A 50% target (above the compact-frontier ratio)
+// takes every candidate at once; its frontier is the 1000 oldest.
+// =============================================================================
+
+class OffloadFrontierTest : public OffloadOnEvictCycleTest {
+   protected:
+    static constexpr int kKeys = 2000;
+    static constexpr size_t kSmallObject = 4096;
+    static constexpr int kCompactFrontier = 1124;
+
+    std::vector<std::string> PutAgedKeys(const Store& store) {
+        auto keys = Put(store, "lease_", kKeys, kSmallObject);
+        for (int i = 0; i < kKeys; ++i) {
+            SetLease(keys[i], base_ + std::chrono::milliseconds(i));
+        }
+        return keys;
+    }
+
+    // Index (lease rank) of each drained key, in task id order (the order
+    // the master queued them).
+    static std::vector<int> RanksInQueueOrder(
+        std::vector<OffloadTaskItem> items) {
+        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+            return a.task_id->seq < b.task_id->seq;
+        });
+        std::vector<int> ranks;
+        for (const auto& item : items) {
+            ranks.push_back(std::stoi(item.key.substr(6)));  // "lease_<i>"
+        }
+        return ranks;
+    }
+
+    static std::vector<int> Range(int begin, int end) {
+        std::vector<int> out;
+        for (int i = begin; i < end; ++i) out.push_back(i);
+        return out;
+    }
+
+    MasterServiceConfig FrontierConfig(bool frontier_only) {
+        MasterServiceConfig config = Config();
+        config.offload_evict_frontier_only = frontier_only;
+        return config;
+    }
+
+    const std::chrono::system_clock::time_point base_ =
+        std::chrono::system_clock::now() - std::chrono::hours(1);
+};
+
+TEST_F(OffloadFrontierTest, ByDefaultTheRefillQueuesKeysNewerThanTheFrontier) {
+    Start(FrontierConfig(false));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    PutAgedKeys(a);
+
+    Evict(/*ratio=*/0.05);
+
+    const auto ranks = RanksInQueueOrder(Drain(a));
+    ASSERT_EQ(ranks.size(), static_cast<size_t>(kKeys));
+    // The 876 refill keys are queued after the frontier, in hash order.
+    const std::vector<int> refill(ranks.begin() + kCompactFrontier,
+                                  ranks.end());
+    EXPECT_EQ(*std::min_element(refill.begin(), refill.end()),
+              kCompactFrontier);
+    EXPECT_FALSE(std::is_sorted(refill.begin(), refill.end()));
+}
+
+TEST_F(OffloadFrontierTest, FrontierOnlyQueuesTheOldestLeasesInLeaseOrder) {
+    Start(FrontierConfig(true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto keys = PutAgedKeys(a);
+
+    Evict(/*ratio=*/0.05);
+
+    EXPECT_EQ(RanksInQueueOrder(Drain(a)), Range(0, kCompactFrontier));
+    // Past the frontier nothing is queued, and nothing is lost.
+    for (int i = kCompactFrontier; i < kKeys; ++i) {
+        ASSERT_EQ(CopiesOf(keys[i]).memory, 1u) << keys[i];
+    }
+    // The next cycle takes the next oldest: the queued keys are pinned.
+    Evict(/*ratio=*/0.05);
+    EXPECT_EQ(RanksInQueueOrder(Drain(a)), Range(kCompactFrontier, kKeys));
+}
+
+TEST_F(OffloadFrontierTest, FrontierOnlyFullCandidateScanQueuesTheEvictNum) {
+    // A 50% target skips the compact frontier: every candidate is collected
+    // and the frontier is the evict_num (1000) oldest.
+    for (const bool frontier_only : {false, true}) {
+        SCOPED_TRACE(frontier_only);
+        Start(FrontierConfig(frontier_only));
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        PutAgedKeys(a);
+
+        Evict(/*ratio=*/0.5);
+
+        const auto ranks = RanksInQueueOrder(Drain(a));
+        if (frontier_only) {
+            EXPECT_EQ(ranks, Range(0, kKeys / 2));
+        } else {
+            EXPECT_EQ(ranks.size(), static_cast<size_t>(kKeys));
+        }
+        service_->RemoveAll();
+    }
+}
+
+TEST_F(OffloadFrontierTest, FrontierOnlyStillFreesDiskBackedKeysPastIt) {
+    // Keys 0..49 get a disk copy and then the newest leases, so the next
+    // cycle meets them in the refill pass. Both modes free them there (they
+    // are safe to drop from memory); only the default also queues the S2
+    // keys of the refill.
+    for (const bool frontier_only : {false, true}) {
+        SCOPED_TRACE(frontier_only);
+        Start(FrontierConfig(frontier_only));
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const auto keys = PutAgedKeys(a);
+        constexpr int kOnDisk = 50;
+
+        Evict(/*ratio=*/0.05);
+        const auto taken = Drain(a);
+        std::vector<OffloadTaskItem> done, nacked;
+        for (const auto& item : taken) {
+            (std::stoi(item.key.substr(6)) < kOnDisk ? done : nacked)
+                .push_back(item);
+        }
+        ASSERT_EQ(done.size(), static_cast<size_t>(kOnDisk));
+        Report(a, done, static_cast<int64_t>(kSmallObject));  // completed
+        Nack(a, nacked);
+        for (int i = 0; i < kOnDisk; ++i) {
+            SetLease(keys[i], base_ + std::chrono::minutes(30) +
+                                  std::chrono::milliseconds(i));
+        }
+
+        Evict(/*ratio=*/0.05);
+
+        for (int i = 0; i < kOnDisk; ++i) {
+            EXPECT_EQ(CopiesOf(keys[i]).memory, 0u) << keys[i];
+            EXPECT_EQ(CopiesOf(keys[i]).local_disk, 1u) << keys[i];
+        }
+        const auto ranks = RanksInQueueOrder(Drain(a));
+        if (frontier_only) {
+            EXPECT_EQ(ranks, Range(kOnDisk, kOnDisk + kCompactFrontier));
+        } else {
+            EXPECT_EQ(ranks.size(), static_cast<size_t>(kKeys - kOnDisk));
+        }
+        service_->RemoveAll();
+    }
+}
+
 TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
     MasterServiceConfig config;
     EXPECT_FALSE(config.offload_evict_without_local_disk);
+    EXPECT_FALSE(config.offload_evict_frontier_only);
     EXPECT_FALSE(config.offload_force_evict);
     EXPECT_FALSE(config.offload_on_evict);
     EXPECT_FALSE(config.enable_offload_stall_metrics);

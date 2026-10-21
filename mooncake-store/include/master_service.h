@@ -2379,6 +2379,12 @@ class MasterService {
     // failures still skip the key. (config: offload_evict_without_local_disk,
     // only effective when offload_on_evict_=true)
     bool offload_evict_without_local_disk_{false};
+    // Frontier-only offload: with offload_on_evict, BatchEvict queues
+    // offloads only for its eviction frontier (the oldest-lease candidates the
+    // target asks for), walked from the oldest lease. Other keys a cycle
+    // visits are freed only when they already have a disk copy. (config:
+    // offload_evict_frontier_only, only effective when offload_on_evict_=true)
+    bool offload_evict_frontier_only_{false};
 
     // Offload stall metrics (config: enable_offload_stall_metrics).
     bool offload_stall_metrics_{false};
