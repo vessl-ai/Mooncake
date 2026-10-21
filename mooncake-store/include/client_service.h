@@ -393,8 +393,9 @@ class Client {
      *        this returns the master neither names its replicas to readers
      *        nor allocates in it. The memory stays allocated and registered
      *        with the transfer engine, so a read that already holds a
-     *        descriptor still completes while the process lives; ~Client
-     *        releases the registrations. Afterwards new mounts are refused
+     *        descriptor still completes until the store tears down
+     *        (RealClient::tearDownAll frees the memory; ~Client releases the
+     *        registrations). Afterwards new mounts are refused
      *        and a heartbeat remount never brings these segments back.
      *        Calling it again retries only the segments a master error left
      *        mounted.

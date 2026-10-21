@@ -196,9 +196,14 @@ TEST_F(SegmentDrainTest, DrainHidesTheReplicasAtOnceAndHeldReadsFinish) {
         auto exists = reader_->IsExist(Key(i));
         ASSERT_TRUE(exists.has_value());
         EXPECT_FALSE(*exists) << Key(i);
+        // No replica is handed out. Until the master's background metadata
+        // sweep reaches the key the code is REPLICA_IS_NOT_READY, after it
+        // OBJECT_NOT_FOUND; both are a miss to the reader.
         auto query = reader_->Query(Key(i));
         ASSERT_FALSE(query.has_value()) << Key(i);
-        EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND) << Key(i);
+        EXPECT_TRUE(query.error() == ErrorCode::OBJECT_NOT_FOUND ||
+                    query.error() == ErrorCode::REPLICA_IS_NOT_READY)
+            << Key(i) << " " << toString(query.error());
     }
     for (const auto& exists : reader_->BatchIsExist(keys)) {
         ASSERT_TRUE(exists.has_value());

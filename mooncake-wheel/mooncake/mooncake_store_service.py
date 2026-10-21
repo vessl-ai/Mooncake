@@ -716,10 +716,11 @@ class MooncakeStoreService:
 
         Meant as the first step of a preStop hook (fork-only; nothing calls it
         otherwise). The master stops naming this store's memory replicas at
-        once, so readers get a clean miss and writers re-put elsewhere instead
-        of being pointed at a process that is about to stop serving. The
-        memory stays registered, so reads already handed a descriptor finish;
-        the store refuses later mounts. The body is ignored. Calling it again
+        once, so exists is false, reads find no replica and writers re-put
+        elsewhere instead of being pointed at a process that is about to stop
+        serving. The memory stays registered until the process tears down, so
+        reads already handed a descriptor finish; the store refuses later
+        mounts. The body is ignored. Calling it again
         retries only what a master error left mounted.
         """
         try:
