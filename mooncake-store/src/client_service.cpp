@@ -487,6 +487,25 @@ Client::~Client() {
         }
     }
 
+    // Drained segments are already off the master; only the transfer engine
+    // registration is left.
+    std::vector<Segment> drained_segments_copy;
+    {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        for (auto& entry : drained_segments_) {
+            drained_segments_copy.emplace_back(entry.second);
+        }
+        drained_segments_.clear();
+    }
+    for (auto& segment : drained_segments_copy) {
+        int rc = transfer_engine_->unregisterLocalMemory(
+            reinterpret_cast<void*>(segment.base));
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "Failed to unregister drained segment in destructor: "
+                       << rc;
+        }
+    }
+
     // Unregister gracefully unmounting segments: master already has timer
     for (auto& segment : gracefully_unmounting_segments_copy) {
         int rc = transfer_engine_->unregisterLocalMemory(
@@ -3805,6 +3824,15 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
+        // A store whose memory segments were drained is leaving; it takes no
+        // new segment (UnmountMemorySegmentsForDrain).
+        if (memory_segments_drained_) {
+            LOG(WARNING) << "mount_segment_refused base=" << buffer
+                         << " size=" << size
+                         << ", reason=memory_segments_drained";
+            return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+
         // Check if the segment overlaps with any existing segment
         for (auto& it : mounted_segments_) {
             auto& mtseg = it.second;
@@ -3888,6 +3916,46 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     mounted_segments_.erase(segment);
     StartGracefulUnmountTimer(segment_id, grace_period_ms);
     return {};
+}
+
+tl::expected<size_t, ErrorCode> Client::UnmountMemorySegmentsForDrain() {
+    // Held across the master RPCs, as UnmountSegmentById does, so the
+    // heartbeat's remount (which takes the same mutex and remounts exactly
+    // mounted_segments_) runs wholly before or wholly after this.
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    memory_segments_drained_ = true;
+
+    size_t unmounted = 0;
+    std::optional<ErrorCode> first_error;
+    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();) {
+        // A hard unmount: the master drops the allocator, so every replica in
+        // the segment stops being readable and the key stops existing unless
+        // another replica holds it. Already unmounted is OK (idempotent).
+        auto result = master_client_.UnmountSegment(it->second.id);
+        if (!result) {
+            LOG(ERROR) << "action=drain_memory_segment, segment_id="
+                       << UuidToString(it->second.id)
+                       << ", segment_name=" << it->second.name
+                       << ", error=" << toString(result.error());
+            if (!first_error) first_error = result.error();
+            ++it;
+            continue;
+        }
+        // Keep the transfer engine registration: the memory is not freed and
+        // a reader that got a descriptor before the unmount still reads the
+        // bytes it was promised.
+        drained_segments_.emplace(it->first, it->second);
+        it = mounted_segments_.erase(it);
+        ++unmounted;
+    }
+
+    LOG(INFO) << "action=drain_memory_segments, unmounted=" << unmounted
+              << ", still_mounted=" << mounted_segments_.size()
+              << ", drained_total=" << drained_segments_.size();
+    if (first_error) {
+        return tl::unexpected(*first_error);
+    }
+    return unmounted;
 }
 
 bool Client::WaitForGracefulUnmountDelay(std::chrono::milliseconds delay) {

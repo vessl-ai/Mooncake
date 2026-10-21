@@ -385,6 +385,25 @@ class Client {
         std::function<void(const UUID&)> cleanup_callback = {});
 
     /**
+     * @brief Takes every mounted memory segment off the master at once, for
+     *        a store that is about to leave (fork-only, called by nothing
+     *        unless a caller asks; meant for a preStop hook).
+     *
+     *        Each segment is hard-unmounted on the master, so from the moment
+     *        this returns the master neither names its replicas to readers
+     *        nor allocates in it. The memory stays allocated and registered
+     *        with the transfer engine, so a read that already holds a
+     *        descriptor still completes while the process lives; ~Client
+     *        releases the registrations. Afterwards new mounts are refused
+     *        and a heartbeat remount never brings these segments back.
+     *        Calling it again retries only the segments a master error left
+     *        mounted.
+     * @return the number of segments this call took off the master, or the
+     *         first master error (those segments stay mounted).
+     */
+    tl::expected<size_t, ErrorCode> UnmountMemorySegmentsForDrain();
+
+    /**
      * @brief Registers memory buffer with TransferEngine for data transfer
      * @param addr Memory address to register
      * @param length Size of the memory region
@@ -981,6 +1000,13 @@ class Client {
     std::unordered_map<UUID, std::function<void(const UUID&)>,
                        boost::hash<UUID>>
         graceful_unmount_cleanup_callbacks_;
+
+    // Segments UnmountMemorySegmentsForDrain took off the master: no longer
+    // known to it, still registered with the transfer engine until ~Client.
+    // Guarded by mounted_segments_mutex_, as is the latch below.
+    std::unordered_map<UUID, Segment, boost::hash<UUID>> drained_segments_;
+    // Set by UnmountMemorySegmentsForDrain; refuses later mounts.
+    bool memory_segments_drained_{false};
 
     /**
      * @brief Internal helper to unmount a segment by iterator.

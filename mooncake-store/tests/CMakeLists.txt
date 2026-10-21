@@ -149,6 +149,7 @@ endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(segment_drain_test segment_drain_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND

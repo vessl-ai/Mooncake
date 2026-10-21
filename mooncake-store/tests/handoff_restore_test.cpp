@@ -781,6 +781,78 @@ TEST_F(HandoffRestoreTest, L4UnmountSweepInProgressAtTheRollIsNotCarried) {
     }
 }
 
+// The store preStop drain (Client::UnmountMemorySegmentsForDrain, then
+// /api/unmount_local_disk): a store took its memory segment off the master
+// and handed back its disk tier, and the master rolls before the store
+// process is gone. Nothing of that store is carried: the new master has
+// neither its segment nor any of its replicas, and the remount its
+// heartbeat sends (no segment, since the drained one is no longer the
+// client's) brings nothing back.
+TEST_F(HandoffRestoreTest, StoreDrainedBeforeTheRollIsNotCarried) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeL4Config());
+        for (int s = 0; s < 2; ++s) {
+            Store store{generate_uuid(), {MakeSegment(s)}};
+            ASSERT_TRUE(
+                old_master.MountSegment(store.segments[0], store.client_id)
+                    .has_value());
+            stores_.push_back(store);
+            EnableL4(old_master, store);
+            for (int i = 0; i < 10; ++i) Put(old_master, store, Key(s, i));
+        }
+        // Half of the leaving store's objects also have a disk copy.
+        ASSERT_EQ(Offload(old_master, stores_[0], "disk-0", 5).size(), 5u);
+
+        ASSERT_TRUE(
+            old_master
+                .UnmountSegment(stores_[0].segments[0].id, stores_[0].client_id)
+                .has_value());
+        // Memory gone: only the disk copies are still named, and only
+        // until the disk tier is handed back.
+        size_t named = 0;
+        for (int i = 0; i < 10; ++i) {
+            if (Readable(old_master, Key(0, i))) ++named;
+        }
+        EXPECT_EQ(named, 5u);
+        ASSERT_TRUE(old_master.UnmountLocalDiskSegment(stores_[0].client_id)
+                        .has_value());
+        for (int i = 0; i < 10; ++i) {
+            EXPECT_FALSE(Readable(old_master, Key(0, i))) << Key(0, i);
+        }
+
+        // As the roll does: the memory segment's metadata sweep may or may
+        // not have run by now; the export must not carry its replicas
+        // either way.
+        old_master.QuiesceBackgroundWork();
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.local_disk_clients, 1u);
+        EXPECT_EQ(written.stats.local_disk_replicas, 0u);
+    }
+
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {3});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->segments, 1u);
+    EXPECT_EQ(restored->objects, 10u);
+    // The drained store's heartbeat remount carries no segment.
+    ASSERT_TRUE(master.ReMountSegment({}, stores_[0].client_id).has_value());
+    ASSERT_TRUE(Remount(master, stores_[1]));
+
+    for (int i = 0; i < 10; ++i) {
+        auto r = master.GetReplicaList(Key(0, i), TenantId::Default());
+        ASSERT_FALSE(r.has_value()) << Key(0, i);
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
+        EXPECT_TRUE(Readable(master, Key(1, i))) << Key(1, i);
+    }
+    auto leaving_segment = master.QuerySegments(stores_[0].segments[0].name);
+    EXPECT_TRUE(!leaving_segment.has_value() || leaving_segment->second == 0);
+    // Its disk tier was not carried either.
+    auto heartbeat = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_FALSE(heartbeat.has_value());
+    EXPECT_EQ(heartbeat.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 TEST_F(HandoffRestoreTest, L4GateOpensOnPing) {
     TempDir dir;
     WriteL4Snapshot(dir.path());

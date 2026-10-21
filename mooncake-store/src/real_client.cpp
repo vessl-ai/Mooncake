@@ -2012,6 +2012,15 @@ int RealClient::drainLocalDiskSegment(uint64_t grace_period_seconds) {
     return result ? 0 : -1;
 }
 
+int RealClient::unmountMemorySegments() {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+    auto result = client_->UnmountMemorySegmentsForDrain();
+    return result ? 0 : toInt(result.error());
+}
+
 int RealClient::fenceLocalDisk(const std::string &reason) {
     if (!file_storage_) {
         LOG(WARNING) << "action=fence_local_disk, warn=ssd_offload_not_enabled";

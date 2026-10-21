@@ -44,6 +44,7 @@ MasterServiceConfig SweepConfig(bool async) {
 struct Store {
     UUID client_id;
     std::string segment;
+    UUID segment_id{};
 };
 
 Store MountStore(MasterService& service, int index) {
@@ -54,6 +55,7 @@ Store MountStore(MasterService& service, int index) {
     segment.base = 0x100000000000ULL + index * 0x10000000000ULL;
     segment.size = 1ULL << 30;
     segment.te_endpoint = segment.name;
+    store.segment_id = segment.id;
     EXPECT_TRUE(service.MountSegment(segment, store.client_id).has_value());
     EXPECT_TRUE(
         service.MountLocalDiskSegment(store.client_id, true).has_value());
@@ -808,6 +810,105 @@ TEST(DiskUnmountSweepTest,
         GTEST_SKIP() << "set MOONCAKE_SWEEP_SCALE_TEST=1 to run";
     }
     RunSweepAtScale(1000000, 200000, 2000);
+}
+
+// The store preStop drain takes the memory segment off the master
+// (UnmountSegment, Client::UnmountMemorySegmentsForDrain) and hands the disk
+// tier back (UnmountLocalDiskSegment), in either order. With the background
+// sweep parked, nothing of the leaving store is named once both have
+// returned; between the two only the tier not yet handed back is named; a
+// re-put lands on the staying store and survives the sweep; the leaving
+// store's disk mount is refused until the sweep ends.
+TEST(DiskUnmountSweepTest,
+     AMemoryDrainAndAPendingDiskSweepTogetherHideTheStore) {
+    for (const bool memory_first : {true, false}) {
+        SCOPED_TRACE(memory_first ? "memory first" : "disk first");
+        SweepGate gate(/*block_after=*/0);
+        MasterService service(SweepConfig(true));
+        ReleaseOnExit release{gate};
+        InstallGate(service, gate);
+        Store leaving = MountStore(service, 0);
+        Store staying = MountStore(service, 1);
+        const auto both = Keys("both-", 10);
+        const auto disk_only = Keys("disk-only-", 10);
+        const auto staying_keys = Keys("staying-", 10);
+        PutWithDiskCopy(service, leaving, both);
+        PutDiskOnly(service, leaving, disk_only);
+        PutWithDiskCopy(service, staying, staying_keys);
+
+        auto drain_memory = [&] {
+            ASSERT_TRUE(
+                service.UnmountSegment(leaving.segment_id, leaving.client_id)
+                    .has_value());
+        };
+        auto hand_back_disk = [&] {
+            ASSERT_TRUE(
+                service.UnmountLocalDiskSegment(leaving.client_id).has_value());
+        };
+
+        if (memory_first) {
+            drain_memory();
+            // Only the leaving store's disk copies are still named.
+            for (const auto& key : both) {
+                auto replicas = Replicas(service, key);
+                ASSERT_EQ(replicas.size(), 1u) << key;
+                EXPECT_TRUE(HasDiskOf(replicas, leaving.client_id)) << key;
+            }
+            for (const auto& key : disk_only) EXPECT_TRUE(Exists(service, key));
+            hand_back_disk();
+        } else {
+            hand_back_disk();
+            // Only the leaving store's memory copies are still named.
+            for (const auto& key : both) {
+                auto replicas = Replicas(service, key);
+                ASSERT_EQ(replicas.size(), 1u) << key;
+                EXPECT_TRUE(replicas[0].is_memory_replica()) << key;
+            }
+            for (const auto& key : disk_only) {
+                EXPECT_FALSE(Exists(service, key));
+            }
+            drain_memory();
+        }
+        gate.WaitBlocked();
+
+        for (const auto& key : both) {
+            EXPECT_FALSE(Exists(service, key)) << key;
+            EXPECT_TRUE(Replicas(service, key).empty()) << key;
+        }
+        for (const auto& key : disk_only) {
+            EXPECT_FALSE(Exists(service, key)) << key;
+        }
+        for (const auto& key : staying_keys) {
+            EXPECT_EQ(Replicas(service, key).size(), 2u) << key;
+        }
+        auto remount = service.MountLocalDiskSegment(leaving.client_id, true);
+        ASSERT_FALSE(remount.has_value());
+        EXPECT_EQ(remount.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+        // The writer re-puts a missing key; the leaving segment is gone, so
+        // it lands on the staying store.
+        Put(service, leaving, both[0]);
+        auto replicas = Replicas(service, both[0]);
+        ASSERT_EQ(replicas.size(), 1u);
+        ASSERT_TRUE(replicas[0].is_memory_replica());
+        EXPECT_EQ(replicas[0]
+                      .get_memory_descriptor()
+                      .buffer_descriptor.transport_endpoint_,
+                  staying.segment);
+
+        gate.Release();
+        ASSERT_TRUE(WaitForSweeps(service));
+        EXPECT_TRUE(Exists(service, both[0]));
+        for (size_t i = 1; i < both.size(); ++i) {
+            EXPECT_FALSE(Exists(service, both[i])) << both[i];
+        }
+        for (const auto& key : disk_only) EXPECT_FALSE(Exists(service, key));
+        for (const auto& key : staying_keys) {
+            EXPECT_EQ(Replicas(service, key).size(), 2u) << key;
+        }
+        EXPECT_TRUE(
+            service.MountLocalDiskSegment(leaving.client_id, true).has_value());
+    }
 }
 
 }  // namespace
