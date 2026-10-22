@@ -6,6 +6,7 @@
 
 #include "client_service.h"
 #include "client_buffer.h"
+#include "offload_read_guard.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
 
@@ -91,6 +92,9 @@ class FileStorage {
     tl::expected<BatchGetResult, ErrorCode> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
+
+    // The read guard (config_.offload_read_deadline_ms > 0), else nullptr.
+    const OffloadReadGuard* read_guard() const { return read_guard_.get(); }
 
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
@@ -412,6 +416,13 @@ class FileStorage {
         test_offload_completion_rpc_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
+    // Bounds BatchGet (peer offload reads) when configured. Reset first in
+    // the destructor: its late reads release buffers through this object.
+    std::unique_ptr<OffloadReadGuard> read_guard_;
+
+    tl::expected<BatchGetResult, ErrorCode> BatchGetUnguarded(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
 };
 
 }  // namespace mooncake
