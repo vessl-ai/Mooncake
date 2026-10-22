@@ -147,6 +147,12 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_READ_SHED_MS, config.offload_read_shed_ms);
     config.offload_read_threads = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_READ_THREADS, config.offload_read_threads);
+    config.offload_read_parallelism =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_READ_PARALLELISM,
+                        config.offload_read_parallelism);
+    config.offload_read_io_threads =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_READ_IO_THREADS,
+                        config.offload_read_io_threads);
 
     return config;
 }
@@ -250,6 +256,24 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: "
                    << "disk_eviction_low_watermark_ratio must be lower than "
                    << "disk_eviction_high_watermark_ratio";
+        return false;
+    }
+    constexpr uint32_t kMaxReadParallelism = 256;
+    constexpr uint32_t kMaxReadIoThreads = 1024;
+    if (offload_read_parallelism == 0 ||
+        offload_read_parallelism > kMaxReadParallelism) {
+        LOG(ERROR) << "FileStorageConfig: offload_read_parallelism must be in "
+                      "[1, "
+                   << kMaxReadParallelism << "]";
+        return false;
+    }
+    if (offload_read_parallelism > 1 &&
+        (offload_read_io_threads == 0 ||
+         offload_read_io_threads > kMaxReadIoThreads)) {
+        LOG(ERROR) << "FileStorageConfig: offload_read_io_threads must be in "
+                      "[1, "
+                   << kMaxReadIoThreads
+                   << "] when offload_read_parallelism is above 1";
         return false;
     }
     if (offload_read_deadline_ms > 0) {

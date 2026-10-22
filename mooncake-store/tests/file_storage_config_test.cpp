@@ -75,6 +75,8 @@ struct FileStorageEnvironment {
     ScopedEnvVar offload_read_deadline{"MOONCAKE_OFFLOAD_READ_DEADLINE_MS"};
     ScopedEnvVar offload_read_shed{"MOONCAKE_OFFLOAD_READ_SHED_MS"};
     ScopedEnvVar offload_read_threads{"MOONCAKE_OFFLOAD_READ_THREADS"};
+    ScopedEnvVar offload_read_parallelism{"MOONCAKE_OFFLOAD_READ_PARALLELISM"};
+    ScopedEnvVar offload_read_io_threads{"MOONCAKE_OFFLOAD_READ_IO_THREADS"};
 };
 
 void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
@@ -96,6 +98,8 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.offload_read_deadline_ms, 0u);
     EXPECT_EQ(config.offload_read_shed_ms, 5000u);
     EXPECT_EQ(config.offload_read_threads, 64u);
+    EXPECT_EQ(config.offload_read_parallelism, 1u);
+    EXPECT_EQ(config.offload_read_io_threads, 64u);
 }
 
 class FileStorageConfigTest : public ::testing::Test {
@@ -178,6 +182,33 @@ TEST_F(FileStorageConfigTest, ReadsOffloadReadGuardValues) {
     // The guard's limits only matter while it is on.
     config.offload_read_threads = 0;
     config.offload_read_deadline_ms = 0;
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ReadsOffloadReadParallelismValues) {
+    env.offload_read_parallelism.Set("16");
+    env.offload_read_io_threads.Set("32");
+
+    auto config = FileStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.offload_read_parallelism, 16u);
+    EXPECT_EQ(config.offload_read_io_threads, 32u);
+
+    config.storage_filepath = data_path.string();
+    EXPECT_TRUE(config.Validate());
+    config.offload_read_parallelism = 0;
+    EXPECT_FALSE(config.Validate());
+    config.offload_read_parallelism = 257;
+    EXPECT_FALSE(config.Validate());
+    config.offload_read_parallelism = 256;
+    EXPECT_TRUE(config.Validate());
+    config.offload_read_io_threads = 1024;
+    EXPECT_TRUE(config.Validate());
+    config.offload_read_io_threads = 1025;
+    EXPECT_FALSE(config.Validate());
+    config.offload_read_io_threads = 0;
+    EXPECT_FALSE(config.Validate());
+    // The pool size only matters for parallel reads.
+    config.offload_read_parallelism = 1;
     EXPECT_TRUE(config.Validate());
 }
 
