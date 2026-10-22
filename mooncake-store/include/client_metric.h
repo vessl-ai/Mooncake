@@ -541,6 +541,21 @@ struct SsdMetric {
                                     {0.5, 0.9, 0.99}, labels),
           ssd_disk_fenced("mooncake_ssd_disk_fenced",
                           "1 after a disk failure fenced the SSD tier", labels),
+          ssd_read_deadline_miss(
+              "mooncake_ssd_read_deadline_miss_total",
+              "Peer offload reads answered as failed at the read deadline",
+              labels),
+          ssd_read_deadline_miss_keys(
+              "mooncake_ssd_read_deadline_miss_keys_total",
+              "Keys of peer offload reads failed at the read deadline", labels),
+          ssd_read_shed("mooncake_ssd_read_shed_total",
+                        "Peer offload reads refused without disk I/O after a "
+                        "read deadline miss",
+                        labels),
+          ssd_read_shed_keys("mooncake_ssd_read_shed_keys_total",
+                             "Keys of peer offload reads refused without "
+                             "disk I/O after a read deadline miss",
+                             labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -556,6 +571,13 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
     ylt::metric::gauge_t ssd_disk_fenced;
+    // Offload read guard (FileStorageConfig::offload_read_deadline_ms).
+    // Exported only while the guard is on, so the default output is unchanged.
+    ylt::metric::counter_t ssd_read_deadline_miss;
+    ylt::metric::counter_t ssd_read_deadline_miss_keys;
+    ylt::metric::counter_t ssd_read_shed;
+    ylt::metric::counter_t ssd_read_shed_keys;
+    std::atomic<bool> read_guard_enabled{false};
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -572,6 +594,12 @@ struct SsdMetric {
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
         ssd_disk_fenced.serialize(str);
+        if (read_guard_enabled.load(std::memory_order_relaxed)) {
+            ssd_read_deadline_miss.serialize(str);
+            ssd_read_deadline_miss_keys.serialize(str);
+            ssd_read_shed.serialize(str);
+            ssd_read_shed_keys.serialize(str);
+        }
     }
 
     std::string summary_metrics() {

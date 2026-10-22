@@ -308,6 +308,7 @@ add_store_test(nvme_kv_io_concurrency_config_test
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(bucket_eviction_read_test bucket_eviction_read_test.cpp)
+add_store_test(bucket_parallel_read_test bucket_parallel_read_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
@@ -317,6 +318,7 @@ add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
+add_store_test(offload_read_guard_test offload_read_guard_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
