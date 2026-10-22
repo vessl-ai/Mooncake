@@ -21,6 +21,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
+#include "thread_pool.h"
 #include "types.h"
 
 namespace mooncake {
@@ -245,6 +246,16 @@ struct FileStorageConfig {
     // Threads that run guarded reads (used only when the guard is on). Keep
     // it above the number of peer reads in flight at once.
     uint32_t offload_read_threads = 64;
+
+    // Reads of one offload read (one BucketStorageBackend::BatchLoad) that
+    // may be on the disk at once. 1 = one after another (the default). Only
+    // the POSIX read path uses it; the io_uring path already submits a
+    // bucket's reads together.
+    uint32_t offload_read_parallelism = 1;
+    // Threads shared by all offload reads to run the extra reads (used only
+    // when offload_read_parallelism > 1). The calling thread always reads
+    // too, so a read never waits for this pool to make progress.
+    uint32_t offload_read_io_threads = 64;
 
     // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
     // object storage uses the regular offload control plane.
@@ -1158,7 +1169,40 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_batch_load_after_plan_hook_ = std::move(hook);
     }
 
+    // Test-only: called by BatchLoad's POSIX read path right before it reads
+    // `key` from the disk, on the thread that reads it (with
+    // offload_read_parallelism > 1, possibly several threads at once). Set
+    // it before reads start; it is not synchronized with BatchLoad.
+    void SetBeforeKeyReadHookForTest(
+        std::function<void(const std::string&)> hook) {
+        test_before_key_read_hook_ = std::move(hook);
+    }
+
    private:
+    // One key's read on the POSIX path, used when reads run in parallel.
+    struct OffloadReadJob {
+        std::string key;
+        int64_t bucket_id;
+        size_t path_index;  // into ParallelReadState::paths
+        int64_t file_offset;
+        Slice dest_slice;
+    };
+    struct ParallelReadState;
+
+    // Runs `jobs` with up to offload_read_parallelism reads on the disk at
+    // once: the calling thread and read_pool_ threads take jobs from a shared
+    // index. Returns after every job that was started has finished, so no
+    // read writes into a destination buffer after this returns. After the
+    // first failure no new read starts, and the first failure in `jobs`
+    // order among the reads that ran is returned.
+    tl::expected<void, ErrorCode> ReadJobsInParallel(
+        std::vector<std::string> paths, std::vector<OffloadReadJob> jobs);
+    // Takes jobs from `state` until none is left.
+    void RunReadJobs(ParallelReadState& state) const;
+    ErrorCode ReadJob(const OffloadReadJob& job, const std::string& path,
+                      std::unique_ptr<StorageFile>& file,
+                      size_t& file_path_index) const;
+
     void NotifyDiskError(int err, const char* op) const {
         if (err != 0 && disk_error_observer_) disk_error_observer_(err, op);
     }
@@ -1166,6 +1210,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     DiskErrorObserver disk_error_observer_;
     std::atomic<bool> test_datasync_failure_{false};
     std::function<void()> test_batch_load_after_plan_hook_;
+    std::function<void(const std::string&)> test_before_key_read_hook_;
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1235,6 +1280,12 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Clear file cache (called on destruction or when needed)
     void ClearFileCache();
+
+    // Runs the extra reads of parallel offload reads; nullptr unless
+    // offload_read_parallelism > 1 (and io_uring is off). Declared last so
+    // it is destroyed first; the destructor also stops it before anything
+    // else.
+    std::unique_ptr<ThreadPool> read_pool_;
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
