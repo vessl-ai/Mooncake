@@ -140,6 +140,14 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_USE_URING, legacy_use_uring);
     config.use_uring = ParseStrictBoolOr(use_uring, false);
 
+    config.offload_read_deadline_ms =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_READ_DEADLINE_MS,
+                        config.offload_read_deadline_ms);
+    config.offload_read_shed_ms = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_READ_SHED_MS, config.offload_read_shed_ms);
+    config.offload_read_threads = Environ::ReadOr(
+        Variables::MOONCAKE_OFFLOAD_READ_THREADS, config.offload_read_threads);
+
     return config;
 }
 
@@ -243,6 +251,33 @@ bool FileStorageConfig::Validate() const {
                    << "disk_eviction_low_watermark_ratio must be lower than "
                    << "disk_eviction_high_watermark_ratio";
         return false;
+    }
+    if (offload_read_deadline_ms > 0) {
+        constexpr uint64_t kMaxReadGuardMs = 3'600'000;  // 1 hour
+        constexpr uint32_t kMaxReadGuardThreads = 1024;
+        if (offload_read_deadline_ms > kMaxReadGuardMs ||
+            offload_read_shed_ms > kMaxReadGuardMs) {
+            LOG(ERROR) << "FileStorageConfig: offload_read_deadline_ms and "
+                          "offload_read_shed_ms must be at most "
+                       << kMaxReadGuardMs;
+            return false;
+        }
+        if (offload_read_threads == 0 ||
+            offload_read_threads > kMaxReadGuardThreads) {
+            LOG(ERROR) << "FileStorageConfig: offload_read_threads must be in "
+                          "[1, "
+                       << kMaxReadGuardThreads
+                       << "] when offload_read_deadline_ms is set";
+            return false;
+        }
+        if (offload_read_deadline_ms >= client_buffer_gc_ttl_ms) {
+            // The reader already fails a read that took this long
+            // (OBJECT_HAS_LEASE), so the guard would never answer first.
+            LOG(WARNING) << "FileStorageConfig: offload_read_deadline_ms ("
+                         << offload_read_deadline_ms
+                         << ") is not below client_buffer_gc_ttl_ms ("
+                         << client_buffer_gc_ttl_ms << ")";
+        }
     }
     return true;
 }

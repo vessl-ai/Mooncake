@@ -8040,8 +8040,16 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         [s]() { return s->file_storage->BatchGet(s->keys, s->sizes); });
     auto result = try_result.value();
     if (!result) {
-        LOG(ERROR) << "Batch get offload object failed,err_code = "
-                   << result.error();
+        if (result.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            // The offload read guard failed it on purpose (slow disk); it
+            // logs and counts those itself, and shedding answers every read.
+            LOG_EVERY_N(WARNING, 1000)
+                << "Batch get offload object refused by the read guard "
+                   "(logged every 1000)";
+        } else {
+            LOG(ERROR) << "Batch get offload object failed,err_code = "
+                       << result.error();
+        }
         co_return tl::make_unexpected(result.error());
     }
     co_return BatchGetOffloadObjectResponse(

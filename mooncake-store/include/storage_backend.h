@@ -233,6 +233,19 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Offload read guard (OffloadReadGuard). 0 = off: a peer's offload read
+    // waits for the disk however long it takes. Otherwise the store answers
+    // a peer's offload read within this time, the wait for a free read
+    // thread included; a read not done then fails (the peer treats its keys
+    // as misses) and finishes in the background. While a late read runs and
+    // for offload_read_shed_ms after the last miss, reads are refused without
+    // disk I/O; then one read probes the disk.
+    uint64_t offload_read_deadline_ms = 0;
+    uint64_t offload_read_shed_ms = 5000;
+    // Threads that run guarded reads (used only when the guard is on). Keep
+    // it above the number of peer reads in flight at once.
+    uint32_t offload_read_threads = 64;
+
     // DFS page-offset mode. Enabled for filesystem-mode distributed storage;
     // object storage uses the regular offload control plane.
     bool enable_dfs = false;
