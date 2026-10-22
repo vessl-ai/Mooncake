@@ -35,6 +35,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
+    reuse_sampler.cpp
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp

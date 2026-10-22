@@ -4,6 +4,7 @@
 #include <chrono>
 #include <mutex>
 #include <set>
+#include <limits>
 #include <string>
 #include <unordered_map>
 
@@ -11,6 +12,7 @@
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
+#include "labeled_histogram.h"
 
 #include "client_liveness.h"
 
@@ -360,6 +362,77 @@ class MasterMetricManager {
     void inc_offload_cancelled(const std::string& client_id, int64_t val = 1);
     void inc_offload_enqueue_rejected(const std::string& client_id,
                                       int64_t val = 1);
+
+    // Offload stall metrics (enable_offload_stall_metrics). They show
+    // eviction that waits on offloads which cannot finish.
+    void set_offload_no_local_disk_skipped_objects(int64_t val);
+    void inc_offload_no_local_disk_evicted(int64_t val = 1);
+    void set_offload_tasks_pending(int64_t val);
+    void set_offload_tasks_without_local_disk(int64_t val);
+    void set_offload_task_oldest_age_seconds(int64_t val);
+    void inc_offload_tasks_expired(int64_t val = 1);
+    int64_t get_offload_no_local_disk_skipped_objects();
+    int64_t get_offload_no_local_disk_evicted();
+    int64_t get_offload_tasks_pending();
+    int64_t get_offload_tasks_without_local_disk();
+    int64_t get_offload_task_oldest_age_seconds();
+    int64_t get_offload_tasks_expired();
+
+    // Offload admission (offload_admission_second_put,
+    // offload_admission_read_since_put). Only moved while the mode is on, so
+    // no series exists with it off.
+    void inc_offload_admission_put_admitted(int64_t val = 1);
+    void inc_offload_admission_put_skipped(int64_t val = 1);
+    void inc_offload_admission_unread_evicted(int64_t val = 1);
+    int64_t get_offload_admission_put_admitted();
+    int64_t get_offload_admission_put_skipped();
+    int64_t get_offload_admission_unread_evicted();
+
+    // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep). Only
+    // set while that mode is on, so no series exists with it off.
+    void set_disk_unmount_sweep_progress(int64_t pending_owners,
+                                         int64_t remaining_shards,
+                                         int64_t remaining_replicas,
+                                         int64_t oldest_age_seconds);
+    void inc_disk_unmount_sweep_removed_replicas(int64_t val);
+    void observe_disk_unmount_sweep_duration_ms(int64_t ms);
+    void inc_disk_unmount_remount_refused(int64_t val = 1);
+    int64_t get_disk_unmount_sweep_pending_owners();
+    int64_t get_disk_unmount_sweep_remaining_shards();
+    int64_t get_disk_unmount_sweep_remaining_replicas();
+    int64_t get_disk_unmount_sweep_oldest_age_seconds();
+    int64_t get_disk_unmount_sweep_removed_replicas();
+    int64_t get_disk_unmount_remount_refused();
+
+    // Ghost-key reuse-age sampler metrics (enable_reuse_sampler). Label
+    // values: state = "disk" | "none", op = "exist" | "get" | "put_start",
+    // tier = "memory" | "disk".
+    void observe_reuse_sampler_memory_reuse_age(const std::string& state,
+                                                const std::string& op,
+                                                double seconds);
+    void observe_reuse_sampler_disk_reuse_age(const std::string& op,
+                                              double seconds);
+    void observe_reuse_sampler_evicted_age(const std::string& tier,
+                                           double seconds);
+    void inc_reuse_sampler_ghost_overflow(int64_t val = 1);
+    void set_reuse_sampler_ghost_entries(int64_t val);
+    void set_reuse_sampler_window_seconds(int64_t val);
+    void set_reuse_sampler_config(double sampling_rate, int64_t capacity);
+    // Observations of a labelled series at or below `le` seconds, as the
+    // cumulative `_bucket{le=...}` sample reports them (0 when absent). `le`
+    // must be one of the bucket bounds; the default counts everything.
+    int64_t get_reuse_sampler_memory_reuse_age_count(
+        const std::string& state, const std::string& op,
+        double le = std::numeric_limits<double>::infinity());
+    int64_t get_reuse_sampler_disk_reuse_age_count(
+        const std::string& op,
+        double le = std::numeric_limits<double>::infinity());
+    int64_t get_reuse_sampler_evicted_age_count(
+        const std::string& tier,
+        double le = std::numeric_limits<double>::infinity());
+    int64_t get_reuse_sampler_ghost_overflow();
+    int64_t get_reuse_sampler_ghost_entries();
+    int64_t get_reuse_sampler_window_seconds();
 
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
@@ -766,6 +839,39 @@ class MasterMetricManager {
     ylt::metric::dynamic_counter_1t offload_failed_total_;
     ylt::metric::dynamic_counter_1t offload_cancelled_total_;
     ylt::metric::dynamic_counter_1t offload_enqueue_rejected_total_;
+
+    // Offload stall metrics (enable_offload_stall_metrics)
+    ylt::metric::gauge_t offload_no_local_disk_skipped_objects_;
+    ylt::metric::counter_t offload_no_local_disk_evicted_total_;
+    ylt::metric::gauge_t offload_tasks_pending_;
+    ylt::metric::gauge_t offload_tasks_without_local_disk_;
+    ylt::metric::gauge_t offload_task_oldest_age_seconds_;
+    ylt::metric::counter_t offload_tasks_expired_total_;
+
+    // Offload admission (offload_admission_second_put,
+    // offload_admission_read_since_put)
+    ylt::metric::counter_t offload_admission_put_admitted_total_;
+    ylt::metric::counter_t offload_admission_put_skipped_total_;
+    ylt::metric::counter_t offload_admission_unread_evicted_total_;
+
+    // Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep)
+    ylt::metric::gauge_t disk_unmount_sweep_pending_owners_;
+    ylt::metric::gauge_t disk_unmount_sweep_remaining_shards_;
+    ylt::metric::gauge_t disk_unmount_sweep_remaining_replicas_;
+    ylt::metric::gauge_t disk_unmount_sweep_oldest_age_seconds_;
+    ylt::metric::counter_t disk_unmount_sweep_removed_replicas_total_;
+    ylt::metric::histogram_t disk_unmount_sweep_duration_ms_;
+    ylt::metric::counter_t disk_unmount_remount_refused_total_;
+
+    // Ghost-key reuse-age sampler metrics (enable_reuse_sampler)
+    LabeledHistogram<2> reuse_sampler_memory_reuse_age_seconds_;
+    LabeledHistogram<1> reuse_sampler_disk_reuse_age_seconds_;
+    LabeledHistogram<1> reuse_sampler_evicted_age_seconds_;
+    ylt::metric::counter_t reuse_sampler_ghost_overflow_total_;
+    ylt::metric::gauge_t reuse_sampler_ghost_entries_;
+    ylt::metric::gauge_t reuse_sampler_window_seconds_;
+    ylt::metric::gauge_d reuse_sampler_sampling_rate_;
+    ylt::metric::gauge_t reuse_sampler_capacity_entries_;
 
     // Snapshot Metrics
     ylt::metric::histogram_t snapshot_duration_ms_;

@@ -62,6 +62,23 @@ struct BucketBackendConfig {
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
+    // Keep serving reads of keys that an eviction has already removed from
+    // the index while the master is still being told about it (between
+    // PrepareEviction and CommitPreparedEviction). The master keeps handing
+    // out those disk replicas until it processes the notification, so without
+    // this a read in that window fails with INVALID_KEY although the bucket
+    // file is still on disk. Off by default: the default read path is
+    // unchanged.
+    bool read_pending_eviction = false;
+
+    // Fill offload buckets in the order the master queued the objects (the
+    // sequence number of their task id) instead of hash order. Objects queued
+    // together (one request's pages, a page's K and V) then share a bucket,
+    // and FIFO bucket eviction drops the oldest-queued objects first instead
+    // of a few objects of many prefix chains. Off by default: the default
+    // grouping is unchanged.
+    bool keep_queue_order = false;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();

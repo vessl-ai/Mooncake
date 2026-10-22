@@ -282,6 +282,12 @@ CompleteOffloadAction CompleteOffload(std::initializer_list<std::string> keys) {
     return action;
 }
 
+CompleteOffloadAction CompleteOffload(std::vector<std::string> keys) {
+    CompleteOffloadAction action;
+    action.keys = std::move(keys);
+    return action;
+}
+
 EvictDiskReplicaAction EvictDiskReplica(std::string key) {
     return {.key = std::move(key)};
 }

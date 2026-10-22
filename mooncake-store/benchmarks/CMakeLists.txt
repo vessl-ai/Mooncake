@@ -52,6 +52,13 @@ target_link_libraries(
   batch_evict_bench PRIVATE master_service_test_peer cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
 
+# LOCAL_DISK unmount sweep: synchronous vs async_disk_unmount_sweep
+add_executable(disk_unmount_sweep_bench disk_unmount_sweep_bench.cpp)
+target_link_libraries(
+  disk_unmount_sweep_bench
+  PRIVATE master_service_test_peer cachelib_memory_allocator gflags::gflags
+          glog::glog pthread)
+
 add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
 target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
                                                           gflags::gflags)

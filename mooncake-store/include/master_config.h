@@ -195,6 +195,18 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
+    bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
+    bool offload_admission_read_since_put = false;
+    bool enable_offload_stall_metrics = false;
+    bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
+    bool enable_reuse_sampler = false;
+    double reuse_sampler_rate = 0.01;
+    size_t reuse_sampler_max_entries = 1000000;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
@@ -324,6 +336,18 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
+    bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
+    bool offload_admission_read_since_put = false;
+    bool enable_offload_stall_metrics = false;
+    bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
+    bool enable_reuse_sampler = false;
+    double reuse_sampler_rate = 0.01;
+    size_t reuse_sampler_max_entries = 1000000;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -388,6 +412,20 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
+        offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
+        enable_offload_stall_metrics = config.enable_offload_stall_metrics;
+        async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
+        enable_reuse_sampler = config.enable_reuse_sampler;
+        reuse_sampler_rate = config.reuse_sampler_rate;
+        reuse_sampler_max_entries = config.reuse_sampler_max_entries;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -593,6 +631,18 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
+    bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
+    bool offload_admission_read_since_put = false;
+    bool enable_offload_stall_metrics = false;
+    bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
+    bool enable_reuse_sampler = false;
+    double reuse_sampler_rate = 0.01;
+    size_t reuse_sampler_max_entries = 1000000;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -693,6 +743,20 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
+        offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
+        enable_offload_stall_metrics = config.enable_offload_stall_metrics;
+        async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
+        enable_reuse_sampler = config.enable_reuse_sampler;
+        reuse_sampler_rate = config.reuse_sampler_rate;
+        reuse_sampler_max_entries = config.reuse_sampler_max_entries;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -823,6 +887,20 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
+        offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
+        enable_offload_stall_metrics = config.enable_offload_stall_metrics;
+        async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
+        enable_reuse_sampler = config.enable_reuse_sampler;
+        reuse_sampler_rate = config.reuse_sampler_rate;
+        reuse_sampler_max_entries = config.reuse_sampler_max_entries;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;
@@ -1325,6 +1403,18 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool offload_evict_without_local_disk = false;
+    bool offload_evict_frontier_only = false;
+    bool offload_admission_second_put = false;
+    size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
+    bool offload_admission_read_since_put = false;
+    bool enable_offload_stall_metrics = false;
+    bool async_disk_unmount_sweep = false;
+    bool placement_key_hrw = false;
+    bool enable_reuse_sampler = false;
+    double reuse_sampler_rate = 0.01;
+    size_t reuse_sampler_max_entries = 1000000;
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     double malloc_trim_growth_ratio = 0.25;
@@ -1421,6 +1511,20 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        offload_evict_without_local_disk =
+            config.offload_evict_without_local_disk;
+        offload_evict_frontier_only = config.offload_evict_frontier_only;
+        offload_admission_second_put = config.offload_admission_second_put;
+        offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
+        offload_admission_read_since_put =
+            config.offload_admission_read_since_put;
+        enable_offload_stall_metrics = config.enable_offload_stall_metrics;
+        async_disk_unmount_sweep = config.async_disk_unmount_sweep;
+        placement_key_hrw = config.placement_key_hrw;
+        enable_reuse_sampler = config.enable_reuse_sampler;
+        reuse_sampler_rate = config.reuse_sampler_rate;
+        reuse_sampler_max_entries = config.reuse_sampler_max_entries;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         malloc_trim_growth_ratio = config.malloc_trim_growth_ratio;

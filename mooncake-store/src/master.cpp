@@ -233,7 +233,115 @@ DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
-            "Force-evict objects exceeding offload cap without disk offload");
+            "With offload_on_evict, evict without a disk copy the objects "
+            "beyond the per-cycle offload cap and the objects whose offload "
+            "push fails");
+DEFINE_bool(offload_evict_without_local_disk, false,
+            "With offload_on_evict, evict without a disk copy, as the eager "
+            "mode does, an object whose offload push fails because the store "
+            "holding it has no LOCAL_DISK tier taking offloads (none "
+            "registered, fenced, unmounted, or offloading disabled). "
+            "Offloading disabled includes a store that turned offloading off "
+            "because its disk reached its key or size limit, which can clear "
+            "once the disk frees space: such objects are evicted too. A full "
+            "offload queue and other push failures still keep the object in "
+            "memory");
+DEFINE_bool(offload_evict_frontier_only, false,
+            "With offload_on_evict, queue offloads only for the eviction "
+            "frontier of a cycle (the oldest-lease candidates the target "
+            "asks for), walked from the oldest lease. Every other object the "
+            "cycle visits is freed only if it already has a disk copy and is "
+            "otherwise left in memory, instead of being queued in metadata "
+            "(hash) order until the offload queue is full. A frontier "
+            "object whose push fails (full queue, no local disk) passes its "
+            "slot to the next oldest object past the frontier");
+DEFINE_bool(offload_admission_second_put, false,
+            "Eager offload admission (offload_on_evict=false): a PutEnd "
+            "queues its disk offload only when the same key was put before "
+            "within the last offload_admission_window_puts puts, as kept by "
+            "a two-generation filter (CountMinSketch, or Bloom with "
+            "offload_admission_bloom_filter). A first put stays in memory "
+            "only and is dropped by eviction as before. The put history is "
+            "not carried across a master restart or handoff: for up to two "
+            "windows after one, every put counts as a first put");
+DEFINE_uint64(offload_admission_window_puts, 33554432,
+              "With offload_admission_second_put, how many later puts (of "
+              "any key) a put is remembered for: at least this many and at "
+              "most twice as many. The filter allocates 24 bytes per window "
+              "put once at start (768 MiB at the default)");
+DEFINE_validator(offload_admission_window_puts, [](const char* flagname,
+                                                   uint64_t value) {
+    // Report and return false: gflags then names the flag and exits.
+    if (value == 0 || value > (1ULL << 28)) {
+        LOG(ERROR) << "offload_admission_window_puts must be in "
+                      "[1, 268435456], current "
+                   << value;
+        return false;
+    }
+    return true;
+});
+DEFINE_bool(offload_admission_bloom_filter, false,
+            "With offload_admission_second_put, keep the put history in "
+            "Bloom filter bits instead of CountMinSketch byte counters: the "
+            "same memory (24 bytes per window put), but a false \"put "
+            "before\" rate of about 1e-5 instead of about 3%. A false "
+            "admission writes one object of an otherwise memory-only chunk "
+            "to disk, and its older disk copy later breaks the chunk's "
+            "prefix");
+DEFINE_bool(offload_admission_read_since_put, false,
+            "With offload_on_evict, eviction queues a disk offload only for "
+            "an object that was read from memory since its PutEnd; an "
+            "object nobody read is evicted without a disk copy, as the "
+            "eager mode evicts. Objects restored by a handoff or snapshot "
+            "count as read");
+DEFINE_bool(enable_offload_stall_metrics, false,
+            "Export metrics that show eviction waiting on offloads that "
+            "cannot finish: pending offload tasks, tasks whose store has no "
+            "LOCAL_DISK registration left, the oldest task's age, expired "
+            "tasks, and (with offload_on_evict) eviction candidates kept in "
+            "memory because their store has no LOCAL_DISK tier");
+DEFINE_bool(placement_key_hrw, false,
+            "Let a put name a placement key instead of a segment: a "
+            "preferred_segments entry \"placement-key:<key>\" is replaced by "
+            "every serving memory segment, ranked by rendezvous (HRW) hash "
+            "of <key> and the segment name, so puts that share a key (e.g. "
+            "one prefix chain) land on one segment and spill to the next in "
+            "the same order. Off, such an entry names no segment and the "
+            "put is placed as before.");
+DEFINE_bool(async_disk_unmount_sweep, false,
+            "With enable_offload, return from UnmountLocalDiskSegment as soon "
+            "as the store's LOCAL_DISK registration is dropped, and erase its "
+            "disk replicas on a background thread. Until that sweep ends the "
+            "replicas are never handed to a reader, and the same store "
+            "cannot mount its disk tier again (the mount fails with "
+            "UNAVAILABLE_IN_CURRENT_STATUS and the store retries). Off, the "
+            "unmount RPC returns only after the sweep. Ignored with HA, "
+            "snapshot or CXL, like the memory segment's deferred sweep");
+DEFINE_bool(enable_reuse_sampler, false,
+            "Track a hash-sampled fraction of keys after eviction and export "
+            "the time until each is referenced again (reuse age) and its "
+            "age at eviction as histograms");
+DEFINE_double(reuse_sampler_rate, 0.01,
+              "Fraction of keys the reuse sampler tracks, in (0, 1]");
+DEFINE_validator(reuse_sampler_rate, [](const char* flagname, double value) {
+    if (!(value > 0.0 && value <= 1.0)) {
+        LOG(FATAL) << "reuse_sampler_rate must be in (0, 1]";
+        return false;
+    }
+    return true;
+});
+DEFINE_uint64(reuse_sampler_max_entries, 1000000,
+              "Maximum number of evicted keys (ghosts) the reuse sampler "
+              "holds, about 40 bytes each. When full, the oldest ghost is "
+              "dropped");
+DEFINE_validator(reuse_sampler_max_entries, [](const char* flagname,
+                                               uint64_t value) {
+    if (value == 0 || value > 100'000'000ULL) {
+        LOG(FATAL) << "reuse_sampler_max_entries must be in [1, 100000000]";
+        return false;
+    }
+    return true;
+});
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -259,8 +367,10 @@ DEFINE_validator(offloading_queue_limit, [](const char* flagname,
 });
 DEFINE_double(offload_cap_ratio, 0.5,
               "Per-cycle offload cap as a fraction of offloading_queue_limit. "
-              "Controls how many objects can be queued for offload in a single "
-              "eviction cycle before falling back to force-evict");
+              "Used only with offload_force_evict: once a cycle has queued "
+              "this many objects, the rest are evicted without a disk copy. "
+              "Without offload_force_evict a cycle queues until a store's "
+              "offloading_queue_limit is reached");
 DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
@@ -653,6 +763,54 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    default_config.GetBool("offload_evict_without_local_disk",
+                           &master_config.offload_evict_without_local_disk,
+                           FLAGS_offload_evict_without_local_disk);
+    default_config.GetBool("offload_evict_frontier_only",
+                           &master_config.offload_evict_frontier_only,
+                           FLAGS_offload_evict_frontier_only);
+    default_config.GetBool("offload_admission_second_put",
+                           &master_config.offload_admission_second_put,
+                           FLAGS_offload_admission_second_put);
+    {
+        uint64_t tmp_offload_admission_window_puts =
+            FLAGS_offload_admission_window_puts;
+        default_config.GetUInt64("offload_admission_window_puts",
+                                 &tmp_offload_admission_window_puts,
+                                 FLAGS_offload_admission_window_puts);
+        master_config.offload_admission_window_puts =
+            static_cast<size_t>(tmp_offload_admission_window_puts);
+    }
+    default_config.GetBool("offload_admission_bloom_filter",
+                           &master_config.offload_admission_bloom_filter,
+                           FLAGS_offload_admission_bloom_filter);
+    default_config.GetBool("offload_admission_read_since_put",
+                           &master_config.offload_admission_read_since_put,
+                           FLAGS_offload_admission_read_since_put);
+    default_config.GetBool("enable_offload_stall_metrics",
+                           &master_config.enable_offload_stall_metrics,
+                           FLAGS_enable_offload_stall_metrics);
+    default_config.GetBool("async_disk_unmount_sweep",
+                           &master_config.async_disk_unmount_sweep,
+                           FLAGS_async_disk_unmount_sweep);
+    default_config.GetBool("placement_key_hrw",
+                           &master_config.placement_key_hrw,
+                           FLAGS_placement_key_hrw);
+    default_config.GetBool("enable_reuse_sampler",
+                           &master_config.enable_reuse_sampler,
+                           FLAGS_enable_reuse_sampler);
+    default_config.GetDouble("reuse_sampler_rate",
+                             &master_config.reuse_sampler_rate,
+                             FLAGS_reuse_sampler_rate);
+    {
+        uint64_t tmp_reuse_sampler_max_entries =
+            FLAGS_reuse_sampler_max_entries;
+        default_config.GetUInt64("reuse_sampler_max_entries",
+                                 &tmp_reuse_sampler_max_entries,
+                                 FLAGS_reuse_sampler_max_entries);
+        master_config.reuse_sampler_max_entries =
+            static_cast<size_t>(tmp_reuse_sampler_max_entries);
+    }
     {
         uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
         default_config.GetUInt64("offloading_queue_limit",
@@ -1051,6 +1209,80 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_evict_without_local_disk",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_evict_without_local_disk =
+            FLAGS_offload_evict_without_local_disk;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_evict_frontier_only", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_evict_frontier_only =
+            FLAGS_offload_evict_frontier_only;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_second_put",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_second_put =
+            FLAGS_offload_admission_second_put;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_window_puts",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_window_puts =
+            static_cast<size_t>(FLAGS_offload_admission_window_puts);
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_bloom_filter",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_bloom_filter =
+            FLAGS_offload_admission_bloom_filter;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_read_since_put",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_read_since_put =
+            FLAGS_offload_admission_read_since_put;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_offload_stall_metrics",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_offload_stall_metrics =
+            FLAGS_enable_offload_stall_metrics;
+    }
+    if ((google::GetCommandLineFlagInfo("async_disk_unmount_sweep", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.async_disk_unmount_sweep = FLAGS_async_disk_unmount_sweep;
+    }
+    if ((google::GetCommandLineFlagInfo("placement_key_hrw", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.placement_key_hrw = FLAGS_placement_key_hrw;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_reuse_sampler", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_reuse_sampler = FLAGS_enable_reuse_sampler;
+    }
+    if ((google::GetCommandLineFlagInfo("reuse_sampler_rate", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.reuse_sampler_rate = FLAGS_reuse_sampler_rate;
+    }
+    if ((google::GetCommandLineFlagInfo("reuse_sampler_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.reuse_sampler_max_entries =
+            static_cast<size_t>(FLAGS_reuse_sampler_max_entries);
     }
     if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
          !info.is_default) ||
@@ -1990,6 +2222,16 @@ int main(int argc, char* argv[]) {
         << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", offload_evict_without_local_disk="
+        << master_config.offload_evict_without_local_disk
+        << ", enable_offload_stall_metrics="
+        << master_config.enable_offload_stall_metrics
+        << ", async_disk_unmount_sweep="
+        << master_config.async_disk_unmount_sweep
+        << ", enable_reuse_sampler=" << master_config.enable_reuse_sampler
+        << ", reuse_sampler_rate=" << master_config.reuse_sampler_rate
+        << ", reuse_sampler_max_entries="
+        << master_config.reuse_sampler_max_entries
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type

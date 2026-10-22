@@ -49,6 +49,9 @@ struct BucketBackendEnvironment {
         "MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS"};
     ScopedEnvVar eviction_policy{"MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
+    ScopedEnvVar read_pending_eviction{
+        "MOONCAKE_OFFLOAD_BUCKET_READ_PENDING_EVICTION"};
+    ScopedEnvVar keep_queue_order{"MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER"};
 };
 
 class BucketBackendConfigTest : public ::testing::Test {
@@ -65,6 +68,30 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.max_physical_bytes, 0);
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
+    EXPECT_FALSE(config.read_pending_eviction);
+    EXPECT_FALSE(config.keep_queue_order);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsTheKeepQueueOrderOptIn) {
+    env.keep_queue_order.Set("true");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+
+    env.keep_queue_order.Set("false");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+
+    env.keep_queue_order.Set("not-a-bool");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsTheReadPendingEvictionOptIn) {
+    env.read_pending_eviction.Set("true");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
+
+    env.read_pending_eviction.Set("false");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
+
+    env.read_pending_eviction.Set("not-a-bool");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
 }
 
 TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {
