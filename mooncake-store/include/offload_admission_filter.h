@@ -161,6 +161,10 @@ class BloomAdmissionGeneration final : public OffloadAdmissionGeneration {
 // chunk whose other objects stay memory-only, and when that older disk copy
 // is evicted it leaves a gap inside the chunk's later copies. That is why
 // the Bloom kind exists.
+//
+// The filter lives only in the master's memory: a master restart or handoff
+// starts it empty, so for up to two windows afterwards every put counts as
+// a first put and is not written to disk.
 class OffloadAdmissionFilter {
    public:
     static constexpr size_t kGenerations = 3;

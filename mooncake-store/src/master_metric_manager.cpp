@@ -502,13 +502,14 @@ MasterMetricManager::MasterMetricManager()
           "put_start_release_timeout_sec"),
       offload_admission_put_admitted_total_(
           "master_offload_admission_put_admitted_total",
-          "offload_admission_second_put: PutEnds whose key was put before "
-          "within the admission window, so their disk offload was queued"),
+          "offload_admission_second_put: writes (counted at their first "
+          "PutEnd) whose key was put before within the admission window, so "
+          "their disk offload may be queued"),
       offload_admission_put_skipped_total_(
           "master_offload_admission_put_skipped_total",
-          "offload_admission_second_put: PutEnds whose key was not put "
-          "before within the admission window, so no disk offload was "
-          "queued"),
+          "offload_admission_second_put: writes (counted at their first "
+          "PutEnd) whose key was not put before within the admission window, "
+          "so no disk offload is queued"),
       offload_admission_unread_evicted_total_(
           "master_offload_admission_unread_evicted_total",
           "offload_admission_read_since_put: objects evicted without a disk "

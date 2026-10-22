@@ -37,15 +37,14 @@ void MasterServiceTestPeer::PrepareOffloadAdmissionSpareForTesting() {
 }
 
 bool MasterServiceTestPeer::AdmitEagerOffloadForTesting(
-    const std::string& key, bool same_write_judged) {
+    const std::string& key) {
     const auto object_id =
         service_.MakeObjectIdentity(key, TenantId::Default());
     MasterService::MetadataAccessorRW accessor(&service_, object_id);
     if (!accessor.Exists()) {
         return false;
     }
-    return service_.AdmitEagerOffload(object_id, accessor.Get(),
-                                      same_write_judged);
+    return service_.AdmitEagerOffload(object_id, accessor.Get());
 }
 
 ReuseSampler* MasterServiceTestPeer::GetReuseSamplerForTesting() const {

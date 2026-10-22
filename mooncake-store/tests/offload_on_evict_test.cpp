@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1282,6 +1285,15 @@ class OffloadAdmissionTest : public OffloadOnEvictCycleTest {
         return copies;
     }
 
+    // Whether the current write of `key` has asked the admission filter.
+    bool Judged(const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service_.get(),
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists()) << key;
+        return accessor.Exists() && accessor.Get().eager_offload_judged;
+    }
+
     bool Unread(const std::string& key) {
         MasterServiceTestPeer::MetadataAccessorRW accessor(
             service_.get(),
@@ -1556,18 +1568,153 @@ TEST_F(OffloadAdmissionTest, SecondPutLaterEndOfTheSameWriteFollowsTheFirst) {
     const auto keys = Put(a, "two_ends_", 4, kSmallObject);  // first puts
     MasterServiceTestPeer peer(*service_);
     for (const auto& key : keys) {
-        EXPECT_FALSE(
-            peer.AdmitEagerOffloadForTesting(key, /*same_write_judged=*/true))
-            << key;
+        EXPECT_FALSE(peer.AdmitEagerOffloadForTesting(key)) << key;
     }
     // The next write of each key is admitted, and so is its later End.
     RemoveAll(keys);
     Put(a, "two_ends_", 4, kSmallObject);
     EXPECT_EQ(Drain(a).size(), keys.size());
     for (const auto& key : keys) {
-        EXPECT_TRUE(
-            peer.AdmitEagerOffloadForTesting(key, /*same_write_judged=*/true))
-            << key;
+        EXPECT_TRUE(peer.AdmitEagerOffloadForTesting(key)) << key;
+    }
+}
+
+// Sets an environment variable for its lifetime.
+class ScopedEnv {
+   public:
+    ScopedEnv(const char* name, const std::string& value) : name_(name) {
+        if (const char* previous = std::getenv(name)) previous_ = previous;
+        ::setenv(name, value.c_str(), 1);
+    }
+    ~ScopedEnv() {
+        if (previous_) {
+            ::setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_;
+};
+
+// A directory removed with its contents when the test leaves, even on a
+// failed ASSERT.
+class ScopedTempDir {
+   public:
+    explicit ScopedTempDir(const std::string& name)
+        : path_((std::filesystem::temp_directory_path() /
+                 (name + "_" + std::to_string(::getpid())))
+                    .string()) {
+        std::filesystem::create_directories(path_);
+    }
+    ~ScopedTempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+    const std::string& path() const { return path_; }
+
+   private:
+    std::string path_;
+};
+
+// The regression test of the admission fix: on the code before it, the DFS
+// End skipped the filter and the MEMORY End took "not admitted", so neither
+// write below was counted and the second was not queued.
+TEST_F(OffloadAdmissionTest, SecondPutJudgesAWriteWhoseDfsEndComesFirst) {
+    // A write with a DFS replica can end with its DFS End before its MEMORY
+    // End. The DFS End cannot queue an offload but still records the put,
+    // so the MEMORY End follows this write's answer. UpsertStart case B
+    // (same size, the metadata is reused) is a new write and asks again.
+    const ScopedTempDir dfs_dir("offload_admission_dfs");
+    const std::string& dfs_root = dfs_dir.path();
+    {
+        ScopedEnv enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+        ScopedEnv fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        ScopedEnv root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root);
+        ScopedEnv shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+        ScopedEnv shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+        ScopedEnv alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+        ScopedEnv eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+        ScopedEnv deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+        ScopedEnv single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+        for (const bool bloom : {false, true}) {
+            SCOPED_TRACE(bloom ? "Bloom" : "CountMinSketch");
+            Start(EagerConfig(/*second_put=*/true, 1024, bloom));
+            const Store a = AddStore("store_a", /*with_disk=*/true);
+            const auto before = Counters();
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            config.preferred_segment = a.segment_name;
+            const std::string key = "dfs_end_first";
+            const auto tenant = TenantId::Default();
+
+            // First write: a first put, judged by the DFS End, not queued.
+            auto started = service_->PutStart(a.client_id, key, tenant,
+                                              kSmallObject, config);
+            ASSERT_TRUE(started.has_value());
+            ASSERT_EQ(started->size(), 2u);
+            ASSERT_TRUE(
+                service_->PutEnd(a.client_id, key, tenant, ReplicaType::DFS));
+            EXPECT_TRUE(Judged(key));
+            ASSERT_TRUE(service_->PutEnd(a.client_id, key, tenant,
+                                         ReplicaType::MEMORY));
+            EXPECT_TRUE(Drain(a).empty());
+            const auto mid = Counters();
+            EXPECT_EQ(mid.skipped - before.skipped, 1);
+            EXPECT_EQ(mid.admitted, before.admitted);
+
+            // Second write in place, DFS End first again: the second put of
+            // the key is queued by its MEMORY End.
+            ASSERT_TRUE(service_->UpsertStart(a.client_id, key, tenant,
+                                              kSmallObject, config));
+            EXPECT_FALSE(Judged(key));
+            ASSERT_TRUE(service_->UpsertEnd(a.client_id, key, tenant,
+                                            ReplicaType::DFS));
+            ASSERT_TRUE(service_->UpsertEnd(a.client_id, key, tenant,
+                                            ReplicaType::MEMORY));
+            EXPECT_EQ(Keys(Drain(a)), std::vector<std::string>{key});
+            const auto after = Counters();
+            EXPECT_EQ(after.admitted - mid.admitted, 1);
+            EXPECT_EQ(after.skipped, mid.skipped);
+
+            service_->RemoveAll();
+            service_.reset();
+        }
+    }
+}
+
+TEST_F(OffloadAdmissionTest, SecondPutUpsertInPlaceIsANewWrite) {
+    // UpsertStart case B reuses the metadata of the previous write. Its End
+    // must ask the filter again rather than follow the previous answer. With
+    // MEMORY replicas only this also held before the admission fix (the End
+    // judged because no replica was complete); it pins that case B clears
+    // the per-write mark.
+    for (const bool bloom : {false, true}) {
+        SCOPED_TRACE(bloom ? "Bloom" : "CountMinSketch");
+        Start(EagerConfig(/*second_put=*/true, 1024, bloom));
+        const Store a = AddStore("store_a", /*with_disk=*/true);
+        const auto keys = Put(a, "upsert_", 8, kSmallObject);  // first puts
+        EXPECT_TRUE(Drain(a).empty());
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segment = a.segment_name;
+        for (const auto& key : keys) {
+            EXPECT_TRUE(Judged(key)) << key;
+            ASSERT_TRUE(service_->UpsertStart(
+                a.client_id, key, TenantId::Default(), kSmallObject, config))
+                << key;
+            EXPECT_FALSE(Judged(key)) << key;
+            ASSERT_TRUE(service_->UpsertEnd(
+                a.client_id, key, TenantId::Default(), ReplicaType::MEMORY))
+                << key;
+        }
+        EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+        service_->RemoveAll();
+        service_.reset();
     }
 }
 
@@ -1787,9 +1934,9 @@ TEST_F(OffloadAdmissionTest, ReadSincePutUnreadDoesNotUseTheForceCap) {
     EXPECT_EQ(Keys(Drain(a)), Sorted({keys[0], keys[1]}));
 }
 
-// unread_since_put and eager_offload_admitted sit in padding. On the
-// production toolchain (x86-64 libstdc++, no debug containers) the struct
-// stays at its size before the admission fields.
+// unread_since_put, eager_offload_judged and eager_offload_admitted sit in
+// padding. On the production toolchain (x86-64 libstdc++, no debug
+// containers) the struct stays at its size before the admission fields.
 #if defined(__x86_64__) && defined(__GLIBCXX__) && !defined(_GLIBCXX_DEBUG)
 static_assert(sizeof(ObjectMetadata) == 392,
               "ObjectMetadata grew; the master metadata cost model "

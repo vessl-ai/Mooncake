@@ -1671,8 +1671,22 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
     if (remaining > 0) {
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
             UUID id;
-            if (StringToUuid(mounted_ids[i], id)) {
-                client_->UnmountSegmentById(id);
+            const bool unmounted = StringToUuid(mounted_ids[i], id) &&
+                                   client_->UnmountSegmentById(id).has_value();
+            if (!unmounted) {
+                // A memory drain may have taken the chunk in the meantime
+                // and kept its transfer engine registration, so a reader
+                // can still be reading it. (After a master error instead,
+                // the chunk stays mounted and serving although this call
+                // fails; its id is only in the log.) Keep the mapping, as
+                // unmountSegment does on a failed unmount; it is released
+                // with the other records when the client is torn down.
+                LOG(ERROR) << "Rollback unmount failed for " << mounted_ids[i]
+                           << "; keeping its mapping";
+                std::lock_guard<std::mutex> lock(
+                    mounted_segment_records_mutex_);
+                mounted_segment_records_[mounted_ids[i]] = mounted_records[i];
+                continue;
             }
             if (mounted_records[i].mmap_base) {
                 munmap(mounted_records[i].mmap_base, mounted_records[i].size);

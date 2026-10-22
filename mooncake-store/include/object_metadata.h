@@ -129,8 +129,11 @@ struct ObjectMetadata {
     // lock, hence the atomic. It sits in the padding after the bools above.
     mutable std::atomic<bool> unread_since_put{false};
     // offload_admission_second_put: the first PutEnd of the current write
-    // was admitted to the eager offload. A later End of the same write
-    // follows it. Written under the shard's exclusive lock.
+    // asked the admission filter (eager_offload_judged) and its answer
+    // (eager_offload_admitted). A later End of the same write follows that
+    // answer. A write that reuses this metadata (UpsertStart case B) clears
+    // both. Written under the shard's exclusive lock.
+    bool eager_offload_judged{false};
     bool eager_offload_admitted{false};
     TenantQuotaLedger quota_ledger;
 

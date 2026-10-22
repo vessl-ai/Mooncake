@@ -108,6 +108,7 @@ class SegmentDrainTest : public ::testing::Test {
         local_.reset();
         free(leaving_segment_);
         free(staying_segment_);
+        for (void* chunk : extra_chunks_) free(chunk);
         master_.Stop();
     }
 
@@ -162,6 +163,8 @@ class SegmentDrainTest : public ::testing::Test {
     std::shared_ptr<Client> reader_;
     void* leaving_segment_ = nullptr;
     void* staying_segment_ = nullptr;
+    // Freed after the clients, like the segments above.
+    std::vector<void*> extra_chunks_;
     std::unique_ptr<SimpleAllocator> local_;
 };
 
@@ -334,6 +337,32 @@ TEST_F(SegmentDrainTest, ADrainThatFailsIsRetriedByCallingAgain) {
     EXPECT_EQ(*retried, 1u);
     EXPECT_TRUE(
         WaitVisible(master_, leaving_name_, false, std::chrono::seconds(5)));
+}
+
+// A file mount (RealClient::mountSegment) mounts a file chunk by chunk and,
+// when a later chunk fails, unmounts the chunks it already mounted. A drain
+// in between takes those chunks and keeps their transfer engine
+// registration, so the rollback's unmount fails. That failure is what tells
+// the rollback to keep the chunk's memory. This pins the Client behavior the
+// rollback relies on; the rollback itself (RealClient) is not driven here.
+TEST_F(SegmentDrainTest, AMountInterruptedByADrainCannotUnmountItsChunks) {
+    constexpr size_t kChunkSize = kSegmentSize / 2;
+    void* first = allocate_buffer_allocator_memory(kChunkSize);
+    void* second = allocate_buffer_allocator_memory(kChunkSize);
+    extra_chunks_ = {first, second};
+    ASSERT_TRUE(first && second);
+
+    auto first_id = leaving_->MountSegmentAndGetId(first, kChunkSize, "tcp");
+    ASSERT_TRUE(first_id.has_value()) << toString(first_id.error());
+    ASSERT_TRUE(leaving_->UnmountMemorySegmentsForDrain().has_value());
+
+    auto second_id = leaving_->MountSegmentAndGetId(second, kChunkSize, "tcp");
+    ASSERT_FALSE(second_id.has_value());
+    EXPECT_EQ(second_id.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    auto rollback = leaving_->UnmountSegmentById(*first_id);
+    ASSERT_FALSE(rollback.has_value());
+    EXPECT_EQ(rollback.error(), ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace

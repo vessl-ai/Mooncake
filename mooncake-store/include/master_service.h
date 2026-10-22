@@ -1760,12 +1760,12 @@ class MasterService {
     }
 
     // offload_admission_second_put: whether a PutEnd may queue its eager
-    // offload. True when the mode is off. Otherwise records the put in the
-    // admission filter, answers whether the key was put before and keeps the
-    // answer in `metadata`; `same_write_judged` (a later End of a write
-    // already judged) returns that kept answer.
+    // offload. True when the mode is off. Otherwise the first call of a write
+    // records the put in the admission filter, answers whether the key was
+    // put before and keeps the answer in `metadata`; a later call of the same
+    // write (metadata.eager_offload_judged) returns that kept answer.
     bool AdmitEagerOffload(const ObjectIdentity& object_id,
-                           ObjectMetadata& metadata, bool same_write_judged);
+                           ObjectMetadata& metadata);
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is

@@ -240,7 +240,10 @@ DEFINE_bool(offload_evict_without_local_disk, false,
             "With offload_on_evict, evict without a disk copy, as the eager "
             "mode does, an object whose offload push fails because the store "
             "holding it has no LOCAL_DISK tier taking offloads (none "
-            "registered, fenced, unmounted, or offloading disabled). A full "
+            "registered, fenced, unmounted, or offloading disabled). "
+            "Offloading disabled includes a store that turned offloading off "
+            "because its disk reached its key or size limit, which can clear "
+            "once the disk frees space: such objects are evicted too. A full "
             "offload queue and other push failures still keep the object in "
             "memory");
 DEFINE_bool(offload_evict_frontier_only, false,
@@ -256,8 +259,11 @@ DEFINE_bool(offload_admission_second_put, false,
             "Eager offload admission (offload_on_evict=false): a PutEnd "
             "queues its disk offload only when the same key was put before "
             "within the last offload_admission_window_puts puts, as kept by "
-            "a two-generation CountMinSketch. A first put stays in memory "
-            "only and is dropped by eviction as before");
+            "a two-generation filter (CountMinSketch, or Bloom with "
+            "offload_admission_bloom_filter). A first put stays in memory "
+            "only and is dropped by eviction as before. The put history is "
+            "not carried across a master restart or handoff: for up to two "
+            "windows after one, every put counts as a first put");
 DEFINE_uint64(offload_admission_window_puts, 33554432,
               "With offload_admission_second_put, how many later puts (of "
               "any key) a put is remembered for: at least this many and at "

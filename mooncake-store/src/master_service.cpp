@@ -112,11 +112,15 @@ constexpr auto kOffloadStallMetricsInterval = std::chrono::seconds(10);
 // beyond that fails with KEYS_ULTRA_LIMIT and leaves the object in memory.
 
 // Why the offload pushes for one eviction candidate failed. A push fails with
-// UNABLE_OFFLOADING only when no LOCAL_DISK tier can take the item: the
-// owning store has none registered (never mounted, or unmounted after a fence
-// or a drain), its mailbox has offloading disabled (a fence), or the replica
-// names no source segment. Other failures (a full mailbox, an owner that is
-// not serving) can clear on their own, so they keep the candidate in memory.
+// UNABLE_OFFLOADING only when no LOCAL_DISK tier takes the item right now:
+// the owning store has none registered (never mounted, or unmounted after a
+// fence or a drain), its mailbox has offloading disabled, or the replica
+// names no source segment. A store disables offloading in its heartbeat both
+// when it is fenced and when its disk is over its key or size limit
+// (StorageBackend, KEYS_ULTRA_LIMIT); the master cannot tell the two apart,
+// so the second also counts as "no local disk" although it can clear once
+// the disk frees space. Other failures (a full mailbox, an owner that is not
+// serving) can clear on their own, so they keep the candidate in memory.
 struct OffloadPushFailures {
     bool any = false;
     bool other_than_no_local_disk = false;
@@ -5591,19 +5595,19 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 bool MasterService::AdmitEagerOffload(const ObjectIdentity& object_id,
-                                      ObjectMetadata& metadata,
-                                      bool same_write_judged) {
+                                      ObjectMetadata& metadata) {
     if (!offload_admission_filter_) {
         return true;
     }
     // A later End of the same write follows the first End's answer. Asking
     // the filter again would count that first End as an earlier put.
-    if (same_write_judged) {
+    if (metadata.eager_offload_judged) {
         return metadata.eager_offload_admitted;
     }
     const std::string scoped_key =
         object_id.tenant_id.MakeScopedKey(object_id.user_key);
     const bool admitted = offload_admission_filter_->ObservePut(scoped_key);
+    metadata.eager_offload_judged = true;
     metadata.eager_offload_admitted = admitted;
     if (admitted) {
         MasterMetricManager::instance().inc_offload_admission_put_admitted();
@@ -5714,11 +5718,17 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(settle_result.error());
     }
 
+    // offload_admission_second_put: the first End of a write records the
+    // put in the admission filter whatever its replica type and whether it
+    // can queue an offload, so that a later End of the same write (a MEMORY
+    // End after a DFS End) follows this write's answer. True when the mode
+    // is off.
+    const bool eager_offload_admitted = AdmitEagerOffload(object_id, metadata);
+
     // A key has at most one offload task: a second push would replace the
     // queued item of the current task with one whose id no task has.
     // With offload_admission_second_put the key must also have been put
-    // before (AdmitEagerOffload); a later End of the same write reuses the
-    // first End's answer.
+    // before (eager_offload_admitted).
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ &&
         !accessor.GetTenantState().offloading_tasks.contains(
@@ -5726,8 +5736,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
         }) &&
-        AdmitEagerOffload(object_id, metadata,
-                          /*same_write_judged=*/had_completed_replica)) {
+        eager_offload_admitted) {
         auto& tenant_state = accessor.GetTenantState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
@@ -6412,6 +6421,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (metadata.size == slice_length && !has_read_lease) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    // A new write: its first End asks the admission filter
+                    // again (offload_admission_second_put).
+                    metadata.eager_offload_judged = false;
+                    metadata.eager_offload_admitted = false;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -12725,8 +12738,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
 
         // Every push failed because no LOCAL_DISK tier takes the offload
-        // (none registered, fenced, unmounted, offloading disabled). Waiting
-        // cannot help, so when opted in evict as the eager mode would.
+        // (none registered, fenced, unmounted, offloading disabled). When
+        // opted in, evict as the eager mode would. Offloading disabled also
+        // covers a store whose disk is over its key or size limit, where
+        // waiting could help; those objects are evicted too
+        // (OffloadPushFailures).
         if (offload_evict_without_local_disk_ &&
             push_failures.OnlyNoLocalDisk()) {
             offload_no_local_disk_evicted++;
