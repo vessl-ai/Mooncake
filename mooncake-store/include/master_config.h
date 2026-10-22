@@ -199,6 +199,7 @@ struct MasterConfig {
     bool offload_evict_frontier_only = false;
     bool offload_admission_second_put = false;
     size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
     bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
@@ -339,6 +340,7 @@ class MasterServiceSupervisorConfig {
     bool offload_evict_frontier_only = false;
     bool offload_admission_second_put = false;
     size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
     bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
@@ -415,6 +417,7 @@ class MasterServiceSupervisorConfig {
         offload_evict_frontier_only = config.offload_evict_frontier_only;
         offload_admission_second_put = config.offload_admission_second_put;
         offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
         offload_admission_read_since_put =
             config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
@@ -632,6 +635,7 @@ class WrappedMasterServiceConfig {
     bool offload_evict_frontier_only = false;
     bool offload_admission_second_put = false;
     size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
     bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
@@ -744,6 +748,7 @@ class WrappedMasterServiceConfig {
         offload_evict_frontier_only = config.offload_evict_frontier_only;
         offload_admission_second_put = config.offload_admission_second_put;
         offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
         offload_admission_read_since_put =
             config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
@@ -887,6 +892,7 @@ class WrappedMasterServiceConfig {
         offload_evict_frontier_only = config.offload_evict_frontier_only;
         offload_admission_second_put = config.offload_admission_second_put;
         offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
         offload_admission_read_since_put =
             config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;
@@ -1401,6 +1407,7 @@ class MasterServiceConfig {
     bool offload_evict_frontier_only = false;
     bool offload_admission_second_put = false;
     size_t offload_admission_window_puts = 33554432;
+    bool offload_admission_bloom_filter = false;
     bool offload_admission_read_since_put = false;
     bool enable_offload_stall_metrics = false;
     bool async_disk_unmount_sweep = false;
@@ -1509,6 +1516,7 @@ class MasterServiceConfig {
         offload_evict_frontier_only = config.offload_evict_frontier_only;
         offload_admission_second_put = config.offload_admission_second_put;
         offload_admission_window_puts = config.offload_admission_window_puts;
+        offload_admission_bloom_filter = config.offload_admission_bloom_filter;
         offload_admission_read_since_put =
             config.offload_admission_read_since_put;
         enable_offload_stall_metrics = config.enable_offload_stall_metrics;

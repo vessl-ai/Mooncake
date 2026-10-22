@@ -274,6 +274,14 @@ DEFINE_validator(offload_admission_window_puts, [](const char* flagname,
     }
     return true;
 });
+DEFINE_bool(offload_admission_bloom_filter, false,
+            "With offload_admission_second_put, keep the put history in "
+            "Bloom filter bits instead of CountMinSketch byte counters: the "
+            "same memory (24 bytes per window put), but a false \"put "
+            "before\" rate of about 1e-5 instead of about 3%. A false "
+            "admission writes one object of an otherwise memory-only chunk "
+            "to disk, and its older disk copy later breaks the chunk's "
+            "prefix");
 DEFINE_bool(offload_admission_read_since_put, false,
             "With offload_on_evict, eviction queues a disk offload only for "
             "an object that was read from memory since its PutEnd; an "
@@ -767,6 +775,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         master_config.offload_admission_window_puts =
             static_cast<size_t>(tmp_offload_admission_window_puts);
     }
+    default_config.GetBool("offload_admission_bloom_filter",
+                           &master_config.offload_admission_bloom_filter,
+                           FLAGS_offload_admission_bloom_filter);
     default_config.GetBool("offload_admission_read_since_put",
                            &master_config.offload_admission_read_since_put,
                            FLAGS_offload_admission_read_since_put);
@@ -1219,6 +1230,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offload_admission_window_puts =
             static_cast<size_t>(FLAGS_offload_admission_window_puts);
+    }
+    if ((google::GetCommandLineFlagInfo("offload_admission_bloom_filter",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_admission_bloom_filter =
+            FLAGS_offload_admission_bloom_filter;
     }
     if ((google::GetCommandLineFlagInfo("offload_admission_read_since_put",
                                         &info) &&

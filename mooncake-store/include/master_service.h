@@ -1972,7 +1972,7 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
-    // offload_admission_second_put: counters the eviction thread zeroes per
+    // offload_admission_second_put: bytes the eviction thread zeroes per
     // iteration while preparing the next filter generation (a 256 MiB
     // generation at the default window takes 8 iterations).
     // Upper bound of offload_admission_window_puts (24 bytes per window put:
@@ -2413,8 +2413,9 @@ class MasterService {
     bool offload_evict_frontier_only_{false};
     // Second-put admission: in eager mode PutEnd queues an offload only for a
     // key the filter has seen put before. Null when off. (config:
-    // offload_admission_second_put, offload_admission_window_puts; only with
-    // enable_offload_ and offload_on_evict_=false)
+    // offload_admission_second_put, offload_admission_window_puts,
+    // offload_admission_bloom_filter; only with enable_offload_ and
+    // offload_on_evict_=false)
     std::unique_ptr<OffloadAdmissionFilter> offload_admission_filter_;
     // Read-since-put admission: with offload_on_evict, eviction drops
     // without a disk copy an object marked unread_since_put. (config:

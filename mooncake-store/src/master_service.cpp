@@ -493,17 +493,27 @@ MasterService::MasterService(const MasterServiceConfig& config)
             }
             offload_admission_filter_ =
                 std::make_unique<OffloadAdmissionFilter>(
-                    config.offload_admission_window_puts);
+                    config.offload_admission_window_puts,
+                    config.offload_admission_bloom_filter
+                        ? OffloadAdmissionFilter::Kind::kBloom
+                        : OffloadAdmissionFilter::Kind::kCountMinSketch);
             LOG(INFO) << "Second-put offload admission enabled: PutEnd "
                          "queues a disk offload only for a key put before "
                          "within the last "
                       << offload_admission_filter_->window_puts()
                       << " puts (filter "
-                      << offload_admission_filter_->MemoryBytes() << " bytes)";
+                      << offload_admission_filter_->MemoryBytes() << " bytes"
+                      << (config.offload_admission_bloom_filter ? ", Bloom"
+                                                                : "")
+                      << ")";
         } else {
             LOG(WARNING) << "offload_admission_second_put ignored: it needs "
                             "enable_offload and offload_on_evict=false";
         }
+    }
+    if (config.offload_admission_bloom_filter && !offload_admission_filter_) {
+        LOG(WARNING) << "offload_admission_bloom_filter ignored: it needs "
+                        "offload_admission_second_put in effect";
     }
 
     // Same conditions as the memory segment's deferred sweep: HA, snapshot

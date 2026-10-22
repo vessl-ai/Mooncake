@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <string>
@@ -1074,16 +1075,189 @@ TEST(OffloadAdmissionFilterTest, RotationWaitsForAZeroedSpare) {
     EXPECT_FALSE(filter.Seen("never-put"));
 }
 
+namespace {
+
+// A key in the shape SGLang writes: <64 hex digits>_<rank>_<k|v>.
+std::string PageKey(uint64_t page, int rank, char half) {
+    uint64_t x = page;
+    std::string hex;
+    for (int lane = 0; lane < 4; ++lane) {
+        x += 0x9e3779b97f4a7c15ULL;
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        z ^= z >> 31;
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%016llx",
+                 static_cast<unsigned long long>(z));
+        hex += buf;
+    }
+    return hex + "_" + std::to_string(rank) + "_" + half;
+}
+
+// Share of first puts the filter calls "put before", over the second and
+// third windows of distinct keys (a full previous generation from then on).
+double SteadyFalseSeenRate(OffloadAdmissionFilter::Kind kind, size_t window) {
+    OffloadAdmissionFilter filter(window, kind);
+    uint64_t page = 0;
+    size_t false_seen = 0;
+    size_t asked = 0;
+    for (int w = 0; w < 3; ++w) {
+        EXPECT_TRUE(filter.PrepareSpare(SIZE_MAX));
+        for (size_t i = 0; i < window; i += 2, ++page) {
+            for (char half : {'k', 'v'}) {
+                const bool seen = filter.ObservePut(PageKey(page, 0, half));
+                if (w > 0) {
+                    false_seen += seen;
+                    ++asked;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(filter.deferred_rotations(), 0u);
+    return static_cast<double>(false_seen) / static_cast<double>(asked);
+}
+
+}  // namespace
+
+TEST(OffloadAdmissionFilterTest, BloomFalseSeenIsFarBelowTheSketch) {
+    // The rig run (window 2^20) admitted 0.415 of puts where the model with
+    // no false positives admits 0.400: about 2% of first puts were admitted
+    // by mistake. Same window, same memory, keys of the same shape.
+    constexpr size_t kWindow = 1 << 20;
+    const double sketch = SteadyFalseSeenRate(
+        OffloadAdmissionFilter::Kind::kCountMinSketch, kWindow);
+    const double bloom =
+        SteadyFalseSeenRate(OffloadAdmissionFilter::Kind::kBloom, kWindow);
+    LOG(INFO) << "false seen rate: CountMinSketch " << sketch << ", Bloom "
+              << bloom;
+    EXPECT_GT(sketch, 0.005);
+    EXPECT_LT(sketch, 0.05);
+    EXPECT_LT(bloom, 1e-4);
+}
+
+TEST(OffloadAdmissionFilterTest, BloomRemembersAtLeastOneWindowAndAtMostTwo) {
+    constexpr size_t kWindow = 1000;
+    OffloadAdmissionFilter filter(kWindow,
+                                  OffloadAdmissionFilter::Kind::kBloom);
+    EXPECT_EQ(filter.kind(), OffloadAdmissionFilter::Kind::kBloom);
+    // Same memory as the CountMinSketch filter.
+    EXPECT_EQ(filter.MemoryBytes(), 3u * 4u * 2u * kWindow);
+
+    size_t false_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        false_seen += filter.ObservePut("a" + std::to_string(i));
+    }
+    EXPECT_EQ(filter.rotations(), 1u);
+    EXPECT_LE(false_seen, 1u);
+    for (size_t i = 0; i < kWindow; ++i) {
+        ASSERT_TRUE(filter.Seen("a" + std::to_string(i))) << i;
+    }
+    EXPECT_TRUE(filter.PrepareSpare(SIZE_MAX));
+    false_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        false_seen += filter.ObservePut("b" + std::to_string(i));
+    }
+    EXPECT_LE(false_seen, 1u);
+    EXPECT_EQ(filter.rotations(), 2u);
+    size_t still_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        ASSERT_TRUE(filter.Seen("b" + std::to_string(i))) << i;
+        still_seen += filter.Seen("a" + std::to_string(i));
+    }
+    // The retired generation is gone; a full Bloom generation of the same
+    // bytes leaves almost no false positives.
+    EXPECT_LE(still_seen, 1u);
+    // A put seen again in the current generation is "put before".
+    EXPECT_TRUE(filter.ObservePut("b0"));
+    EXPECT_FALSE(filter.ObservePut("never-put"));
+    EXPECT_TRUE(filter.ObservePut("never-put"));
+}
+
+TEST(OffloadAdmissionFilterTest, BloomRotationWaitsForAZeroedSpare) {
+    constexpr size_t kWindow = 100;
+    OffloadAdmissionFilter filter(kWindow,
+                                  OffloadAdmissionFilter::Kind::kBloom);
+    for (size_t i = 0; i < kWindow; ++i) {
+        filter.ObservePut("a" + std::to_string(i));
+    }
+    ASSERT_EQ(filter.rotations(), 1u);
+    for (size_t i = 0; i < kWindow + 50; ++i) {
+        filter.ObservePut("b" + std::to_string(i));
+    }
+    EXPECT_EQ(filter.rotations(), 1u);
+    EXPECT_EQ(filter.deferred_rotations(), 1u);
+    EXPECT_TRUE(filter.Seen("a0"));
+    // 800 bytes (8 per window put) in slices of 150: 5 short, the 6th
+    // finishes, as for the CountMinSketch generation of the same size.
+    int calls = 0;
+    while (!filter.PrepareSpare(/*max_bytes=*/150)) {
+        ASSERT_LT(++calls, 100);
+    }
+    EXPECT_EQ(calls, 5);
+    filter.ObservePut("c0");
+    EXPECT_EQ(filter.rotations(), 2u);
+    EXPECT_TRUE(filter.Seen("b0"));
+    size_t a_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        a_seen += filter.Seen("a" + std::to_string(i));
+    }
+    EXPECT_LE(a_seen, 1u);
+    EXPECT_FALSE(filter.Seen("never-put"));
+}
+
+TEST(OffloadAdmissionFilterTest, BloomReusedGenerationStartsEmpty) {
+    // A generation that was written, retired, zeroed in slices and reused as
+    // the current one must not remember its old keys.
+    constexpr size_t kWindow = 100;
+    OffloadAdmissionFilter filter(kWindow,
+                                  OffloadAdmissionFilter::Kind::kBloom);
+    auto put_all = [&](const std::string& prefix) {
+        for (size_t i = 0; i < kWindow; ++i) {
+            filter.ObservePut(prefix + std::to_string(i));
+        }
+    };
+    auto prepare = [&] {
+        int calls = 0;
+        while (!filter.PrepareSpare(/*max_bytes=*/150)) {
+            ASSERT_LT(++calls, 100);
+        }
+    };
+    put_all("a");  // rotation 1: "a" generation becomes previous
+    prepare();
+    put_all("b");  // rotation 2: "a" generation retired
+    prepare();     // zeroes it into the spare
+    put_all("c");  // rotation 3: the zeroed "a" generation is current
+    EXPECT_EQ(filter.rotations(), 3u);
+    EXPECT_EQ(filter.deferred_rotations(), 0u);
+    size_t a_seen = 0;
+    for (size_t i = 0; i < kWindow; ++i) {
+        a_seen += filter.Seen("a" + std::to_string(i));
+    }
+    EXPECT_LE(a_seen, 1u);
+    // Rotation 3 retired the "b" generation and nothing zeroed it yet, so
+    // rotation 4 waits. One slice, then an unbounded call (as the test peer
+    // makes after the eviction thread's slices) completes the spare.
+    put_all("d");
+    EXPECT_EQ(filter.deferred_rotations(), 1u);
+    EXPECT_FALSE(filter.PrepareSpare(/*max_bytes=*/150));
+    EXPECT_TRUE(filter.PrepareSpare(SIZE_MAX));
+    filter.ObservePut("e0");
+    EXPECT_EQ(filter.rotations(), 4u);
+}
+
 class OffloadAdmissionTest : public OffloadOnEvictCycleTest {
    protected:
     static constexpr size_t kSmallObject = 4096;
 
     static MasterServiceConfig EagerConfig(bool second_put,
-                                           size_t window_puts = 1024) {
+                                           size_t window_puts = 1024,
+                                           bool bloom_filter = false) {
         MasterServiceConfig config = Config();
         config.offload_on_evict = false;
         config.offload_admission_second_put = second_put;
         config.offload_admission_window_puts = window_puts;
+        config.offload_admission_bloom_filter = bloom_filter;
         return config;
     }
 
@@ -1257,6 +1431,50 @@ TEST_F(OffloadAdmissionTest, SecondPutFalseAdmissionsStayWithinTheSketchBound) {
 
     EXPECT_LE(first_window, kWindow * 2 / 100);
     EXPECT_LE(second_window, kWindow * 5 / 100);
+}
+
+TEST_F(OffloadAdmissionTest,
+       SecondPutBloomFilterSkipsFirstPutsAndQueuesTheSecond) {
+    constexpr size_t kWindow = 4096;
+    Start(EagerConfig(/*second_put=*/true, kWindow, /*bloom_filter=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+
+    // The second put of a key is written to disk, as with the sketch.
+    const auto keys = Put(a, "page_", 20, kSmallObject);
+    EXPECT_TRUE(Drain(a).empty());
+    RemoveAll(keys);
+    Put(a, "page_", 20, kSmallObject);
+    const auto taken = Drain(a);
+    EXPECT_EQ(Keys(taken), Sorted(keys));
+    Report(a, taken, static_cast<int64_t>(kSmallObject));
+    const auto mid = Counters();
+    EXPECT_EQ(mid.admitted - before.admitted, 20);
+    EXPECT_EQ(mid.skipped - before.skipped, 20);
+
+    // Two windows of distinct first puts (compare
+    // SecondPutFalseAdmissionsStayWithinTheSketchBound: up to 2% and 5%).
+    MasterServiceTestPeer(*service_).PrepareOffloadAdmissionSpareForTesting();
+    Put(a, "first_", static_cast<int>(kWindow), kSmallObject);
+    const size_t first_window = Drain(a).size();
+    MasterServiceTestPeer(*service_).PrepareOffloadAdmissionSpareForTesting();
+    Put(a, "second_", static_cast<int>(kWindow), kSmallObject);
+    const size_t second_window = Drain(a).size();
+    EXPECT_LE(first_window, 1u);
+    EXPECT_LE(second_window, 1u);
+}
+
+TEST_F(OffloadAdmissionTest, BloomFilterAloneChangesNothing) {
+    // Without offload_admission_second_put the filter kind is ignored:
+    // every eager PutEnd is queued and no admission counter moves.
+    Start(EagerConfig(/*second_put=*/false, 1024, /*bloom_filter=*/true));
+    const Store a = AddStore("store_a", /*with_disk=*/true);
+    const auto before = Counters();
+    const auto keys = Put(a, "page_", 20, kSmallObject);
+    EXPECT_EQ(Keys(Drain(a)), Sorted(keys));
+    const auto after = Counters();
+    EXPECT_EQ(after.admitted, before.admitted);
+    EXPECT_EQ(after.skipped, before.skipped);
 }
 
 TEST_F(OffloadAdmissionTest, SecondPutRemembersTheWindowAndForgetsAfterTwo) {
@@ -1671,6 +1889,7 @@ TEST_F(OffloadOnEvictCycleTest, DefaultsKeepTheOptInOff) {
     EXPECT_FALSE(config.offload_admission_second_put);
     EXPECT_FALSE(config.offload_admission_read_since_put);
     EXPECT_EQ(config.offload_admission_window_puts, 33554432u);
+    EXPECT_FALSE(config.offload_admission_bloom_filter);
     EXPECT_FALSE(config.offload_evict_without_local_disk);
     EXPECT_FALSE(config.offload_evict_frontier_only);
     EXPECT_FALSE(config.offload_force_evict);
