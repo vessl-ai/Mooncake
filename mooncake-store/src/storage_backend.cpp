@@ -19,6 +19,8 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -1523,9 +1525,33 @@ BucketStorageBackend::BucketStorageBackend(
         LOG(INFO) << "BucketStorageBackend: keep_queue_order enabled; "
                      "offload buckets are filled in the master's queue order";
     }
+    const uint32_t read_parallelism =
+        file_storage_config_.offload_read_parallelism;
+    bool uring_reads = false;
+#ifdef USE_URING
+    uring_reads = file_storage_config_.use_uring;
+#endif
+    if (read_parallelism > 1) {
+        if (uring_reads) {
+            LOG(WARNING) << "BucketStorageBackend: offload_read_parallelism="
+                         << read_parallelism
+                         << " is ignored with io_uring, which already "
+                            "submits a bucket's reads together";
+        } else {
+            const uint32_t io_threads = std::max<uint32_t>(
+                1, file_storage_config_.offload_read_io_threads);
+            read_pool_ = std::make_unique<ThreadPool>(io_threads);
+            LOG(INFO) << "BucketStorageBackend: offload reads run in "
+                         "parallel, parallelism="
+                      << read_parallelism << ", io_threads=" << io_threads;
+        }
+    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    // Finish the read helpers first (no BatchLoad runs any more, so they
+    // find no work left).
+    read_pool_.reset();
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -1831,6 +1857,29 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     }
 
     // Step 2: Perform IO without holding any locks
+    if (read_pool_ != nullptr && batch_object.size() > 1) {
+        // POSIX path with offload_read_parallelism > 1: several keys on the
+        // disk at once. bucket_guards stay alive until every read is done.
+        std::vector<std::string> paths;
+        std::vector<OffloadReadJob> jobs;
+        paths.reserve(bucket_read_plans.size());
+        jobs.reserve(batch_object.size());
+        for (const auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto filepath_res = GetBucketDataPath(bucket_id);
+            if (!filepath_res) {
+                LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                           << bucket_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            paths.push_back(std::move(filepath_res.value()));
+            for (const auto& plan : read_plans) {
+                jobs.push_back(OffloadReadJob{
+                    plan.key, plan.bucket_id, paths.size() - 1,
+                    plan.offset + plan.key_size, plan.dest_slice});
+            }
+        }
+        return ReadJobsInParallel(std::move(paths), std::move(jobs));
+    }
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
@@ -1929,6 +1978,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         for (const auto& plan : read_plans) {
             int64_t actual_offset = plan.offset + plan.key_size;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            if (test_before_key_read_hook_)
+                test_before_key_read_hook_(plan.key);
             auto read_result = file->vector_read(&iov, 1, actual_offset);
             if (!read_result) {
                 NotifyDiskError(file->sys_errno(), "preadv");
@@ -1949,6 +2000,122 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
     return {};
+}
+
+struct BucketStorageBackend::ParallelReadState {
+    std::vector<std::string> paths;
+    std::vector<OffloadReadJob> jobs;
+    // Next job to take. Every index below jobs.size() is taken exactly once.
+    std::atomic<size_t> next{0};
+    // Set by the first failed read; jobs taken after it are skipped.
+    std::atomic<bool> failed{false};
+    std::mutex mutex;
+    std::condition_variable all_done;
+    // errors[i] is the result of job i (OK when it was skipped).
+    std::vector<ErrorCode> errors;  // guarded by mutex
+    size_t done = 0;                // guarded by mutex
+};
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ReadJobsInParallel(
+    std::vector<std::string> paths, std::vector<OffloadReadJob> jobs) {
+    // Helpers may start after this call returned (the pool was busy), so
+    // they share the state instead of pointing into this frame. Such a
+    // helper finds no job left and touches nothing else.
+    auto state = std::make_shared<ParallelReadState>();
+    state->paths = std::move(paths);
+    state->jobs = std::move(jobs);
+    state->errors.assign(state->jobs.size(), ErrorCode::OK);
+
+    const size_t helpers =
+        std::min<size_t>(file_storage_config_.offload_read_parallelism,
+                         state->jobs.size()) -
+        1;
+    for (size_t i = 0; i < helpers; ++i) {
+        try {
+            read_pool_->enqueue([this, state] { RunReadJobs(*state); });
+        } catch (const std::exception& e) {
+            // The calling thread still reads every job left.
+            LOG(WARNING) << "Failed to start an offload read helper: "
+                         << e.what();
+            break;
+        }
+    }
+    RunReadJobs(*state);
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->all_done.wait(lock,
+                         [&] { return state->done == state->jobs.size(); });
+    for (const auto error : state->errors) {
+        if (error != ErrorCode::OK) return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+void BucketStorageBackend::RunReadJobs(ParallelReadState& state) const {
+    // Each thread opens its own file: StorageFile records errors in members,
+    // so one object is not shared by concurrent reads.
+    std::unique_ptr<StorageFile> file;
+    size_t file_path_index = std::numeric_limits<size_t>::max();
+    while (true) {
+        const size_t i = state.next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= state.jobs.size()) return;
+        ErrorCode error = ErrorCode::OK;
+        if (!state.failed.load(std::memory_order_acquire)) {
+            const auto& job = state.jobs[i];
+            try {
+                error = ReadJob(job, state.paths[job.path_index], file,
+                                file_path_index);
+            } catch (const std::exception& e) {
+                // Count the job as done either way: the caller waits for it.
+                LOG(ERROR) << "Offload read of key " << job.key
+                           << " threw: " << e.what();
+                file.reset();
+                error = ErrorCode::INTERNAL_ERROR;
+            }
+            if (error != ErrorCode::OK) {
+                state.failed.store(true, std::memory_order_release);
+            }
+        }
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.errors[i] = error;
+        if (++state.done == state.jobs.size()) state.all_done.notify_all();
+    }
+}
+
+ErrorCode BucketStorageBackend::ReadJob(const OffloadReadJob& job,
+                                        const std::string& path,
+                                        std::unique_ptr<StorageFile>& file,
+                                        size_t& file_path_index) const {
+    if (file == nullptr || file_path_index != job.path_index) {
+        file.reset();
+        auto file_res = OpenFile(path, FileMode::Read);
+        if (!file_res) {
+            LOG(ERROR) << "Failed to open bucket file: " << path;
+            return file_res.error();
+        }
+        file = std::move(file_res.value());
+        file_path_index = job.path_index;
+    }
+    if (test_before_key_read_hook_) test_before_key_read_hook_(job.key);
+    iovec iov{job.dest_slice.ptr, job.dest_slice.size};
+    auto read_result = file->vector_read(&iov, 1, job.file_offset);
+    if (!read_result) {
+        NotifyDiskError(file->sys_errno(), "preadv");
+        LOG(ERROR) << "vector_read failed for key: " << job.key
+                   << ", bucket_id=" << job.bucket_id
+                   << ", error: " << read_result.error()
+                   << ErrnoSuffix(file->sys_errno());
+        // The file object keeps this errno; do not reuse it.
+        file.reset();
+        return read_result.error();
+    }
+    if (read_result.value() != job.dest_slice.size) {
+        LOG(ERROR) << "Read size mismatch for key: " << job.key
+                   << ", expected: " << job.dest_slice.size
+                   << ", got: " << read_result.value();
+        return ErrorCode::FILE_READ_FAIL;
+    }
+    return ErrorCode::OK;
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(

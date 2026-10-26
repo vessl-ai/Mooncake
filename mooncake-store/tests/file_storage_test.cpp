@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -34,6 +35,18 @@ void SetEnv(const std::string& key, const std::string& value) {
 }
 
 void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
+
+// Polls until pred() holds or 5 s pass.
+template <typename Pred>
+bool WaitUntil(Pred pred) {
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > until) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
 
 // Fails every read the way BucketStorageBackend does when preadv fails:
 // the errno goes to the disk-error observer, FILE_READ_FAIL to the caller.
@@ -309,6 +322,9 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO");
         UnsetEnv("MOONCAKE_OFFLOAD_USE_URING");
         UnsetEnv("MOONCAKE_USE_URING");
+        UnsetEnv("MOONCAKE_OFFLOAD_READ_DEADLINE_MS");
+        UnsetEnv("MOONCAKE_OFFLOAD_READ_SHED_MS");
+        UnsetEnv("MOONCAKE_OFFLOAD_READ_THREADS");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
@@ -544,6 +560,19 @@ class FileStorageTest : public ::testing::Test {
             return 0;
         }
         return bucket_backend->UngroupedOffloadingObjectsSize();
+    }
+
+    std::shared_ptr<BucketStorageBackend> BucketBackendOf(
+        FileStorage& fileStorage) {
+        return std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
+    }
+
+    // Offload read buffers not yet released (BatchGet results waiting for
+    // their reader's release or the buffer GC).
+    size_t AllocatedBatchCount(FileStorage& fileStorage) {
+        MutexLocker locker(&fileStorage.client_buffer_mutex_);
+        return fileStorage.client_buffer_allocated_batches_.size();
     }
 
     // Static funnel to the private FileStorage::IsPerBucketSoftOffloadError.
@@ -1401,6 +1430,130 @@ TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
                         sizes[i]),
             batch_data.at(keys[i]));
     }
+}
+
+// With the read guard on, a BatchGet whose disk read is slow fails at the
+// deadline instead of waiting for the disk; the next one is refused without
+// touching the disk; the late read's buffer is released when it finishes; and
+// once the disk is fast again after the shed window, reads return the data.
+TEST_F(FileStorageTest, BatchGetReadGuardTurnsASlowDiskIntoAFastMiss) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    // Every disk read parks until the test opens the gate, the way a read on
+    // a slow device does. Declared before the store, which may still run a
+    // late read into the hook while it shuts down.
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool gate_open = false;
+    std::atomic<int> disk_reads{0};
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    // The miss is forced by the gate; the deadline only has to cover the
+    // final in-time read on a busy test host.
+    config.offload_read_deadline_ms = 1000;
+    config.offload_read_shed_ms = 300;
+    config.offload_read_threads = 2;
+    SsdMetric metric;
+    FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
+    ASSERT_NE(fileStorage.read_guard(), nullptr);
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+
+    auto backend = BucketBackendOf(fileStorage);
+    ASSERT_NE(backend, nullptr);
+    backend->SetBatchLoadAfterPlanHookForTest([&] {
+        ++disk_reads;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return gate_open; });
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto late = fileStorage.BatchGet(keys, sizes);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    ASSERT_FALSE(late);
+    EXPECT_EQ(late.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_LT(elapsed, std::chrono::seconds(5));
+    EXPECT_EQ(metric.ssd_read_deadline_miss.value(), 1);
+    EXPECT_EQ(metric.ssd_read_deadline_miss_keys.value(),
+              static_cast<int64_t>(keys.size()));
+    ASSERT_TRUE(WaitUntil([&] { return disk_reads.load() == 1; }));
+
+    // Refused at once while the late read is still on the disk.
+    auto shed = fileStorage.BatchGet(keys, sizes);
+    ASSERT_FALSE(shed);
+    EXPECT_EQ(shed.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    EXPECT_EQ(disk_reads.load(), 1);
+    EXPECT_EQ(metric.ssd_read_shed.value(), 1);
+    EXPECT_EQ(metric.ssd_read_shed_keys.value(),
+              static_cast<int64_t>(keys.size()));
+
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(WaitUntil(
+        [&] { return fileStorage.read_guard()->late_running() == 0; }));
+    // The late read's buffer went back without waiting for the buffer GC.
+    EXPECT_EQ(AllocatedBatchCount(fileStorage), 0u);
+
+    ASSERT_TRUE(WaitUntil([&] {
+        return !fileStorage.read_guard()->ShouldShed(
+            OffloadReadGuard::Clock::now());
+    }));
+    auto ok = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(ok->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(std::string(reinterpret_cast<char*>(ok->pointers[i]),
+                              static_cast<size_t>(sizes[i])),
+                  batch_data.at(keys[i]));
+    }
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(ok->batch_id));
+
+    std::string metrics_text;
+    metric.serialize(metrics_text);
+    EXPECT_TRUE(
+        HasSample(metrics_text, "mooncake_ssd_read_deadline_miss_total"));
+    EXPECT_TRUE(HasSample(metrics_text, "mooncake_ssd_read_shed_total"));
+}
+
+// The default (no deadline) keeps today's behavior: no guard, a slow read is
+// waited for, and the guard's metrics are not exported.
+TEST_F(FileStorageTest, BatchGetWithoutReadDeadlineWaitsForTheDisk) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    ASSERT_EQ(config.offload_read_deadline_ms, 0u);
+    SsdMetric metric;
+    FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
+    EXPECT_EQ(fileStorage.read_guard(), nullptr);
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+
+    auto backend = BucketBackendOf(fileStorage);
+    ASSERT_NE(backend, nullptr);
+    backend->SetBatchLoadAfterPlanHookForTest(
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(200)); });
+
+    auto result = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->pointers.size(), keys.size());
+    EXPECT_EQ(std::string(reinterpret_cast<char*>(result->pointers[0]),
+                          static_cast<size_t>(sizes[0])),
+              batch_data.at(keys[0]));
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(result->batch_id));
+
+    std::string metrics_text;
+    metric.serialize(metrics_text);
+    EXPECT_FALSE(
+        HasSample(metrics_text, "mooncake_ssd_read_deadline_miss_total"));
+    EXPECT_FALSE(HasSample(metrics_text, "mooncake_ssd_read_shed_total"));
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {
