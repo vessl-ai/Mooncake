@@ -28,6 +28,46 @@ namespace mooncake {
 
 namespace {
 
+bool ValidateBatchReadSizes(const std::vector<std::string>& keys,
+                            const std::vector<int64_t>& sizes,
+                            int64_t buffer_size) {
+    if (keys.size() != sizes.size()) {
+        LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
+                   << ", sizes=" << sizes.size();
+        return false;
+    }
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes[i] < 0 || sizes[i] > buffer_size) {
+            LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
+                       << " (limit: " << buffer_size << ")";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ValidateBatchReadRanges(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& offsets,
+                             const std::vector<int64_t>& lengths,
+                             const std::vector<int64_t>& object_sizes,
+                             int64_t buffer_size) {
+    if (keys.size() != offsets.size() || keys.size() != lengths.size() ||
+        keys.size() != object_sizes.size()) {
+        LOG(ERROR) << "Mismatched range load arguments";
+        return false;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (offsets[i] < 0 || lengths[i] < 0 || object_sizes[i] < 0 ||
+            offsets[i] > object_sizes[i] ||
+            lengths[i] > object_sizes[i] - offsets[i] ||
+            lengths[i] > buffer_size) {
+            LOG(ERROR) << "Invalid value span for key " << keys[i];
+            return false;
+        }
+    }
+    return true;
+}
+
 // syncfs for every failure except a data or metadata read: reads leave the
 // log nothing to write (measured: they alone never shut XFS down), and one
 // bad file would otherwise flush the whole filesystem on every failed read.
@@ -169,6 +209,29 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                   << config_.offload_read_deadline_ms
                   << ", shed_ms=" << config_.offload_read_shed_ms
                   << ", threads=" << config_.offload_read_threads;
+        if (config_.offload_read_miss_evict) {
+            // Bounds memory if the master stops answering: a queued key
+            // costs ~200 B (a 64+ character key in a hash set node).
+            constexpr size_t kMaxPendingKeys = 1 << 20;
+            constexpr size_t kMaxBatchKeys = 4096;
+            read_miss_evictor_ = std::make_unique<OffloadReadMissEvictor>(
+                [this](const std::vector<std::string>& keys)
+                    -> tl::expected<void, ErrorCode> {
+                    auto result = test_read_miss_evict_
+                                      ? test_read_miss_evict_(keys)
+                                      : DropDiskReplicasAfterReadMiss(keys);
+                    if (!result && ssd_metric_) {
+                        ssd_metric_->ssd_read_miss_evict_failed_keys.inc(
+                            keys.size());
+                    }
+                    return result;
+                },
+                kMaxPendingKeys, kMaxBatchKeys);
+            if (ssd_metric_) ssd_metric_->read_miss_evict_enabled = true;
+            LOG(INFO) << "Offload read miss evict enabled: a deadline miss "
+                         "or shed read drops this store's LOCAL_DISK "
+                         "replicas of its keys at the master";
+        }
     }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
@@ -197,6 +260,8 @@ FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
     // Waits for late reads, which release their buffers through this object.
     read_guard_.reset();
+    // Its thread calls the master through client_.
+    read_miss_evictor_.reset();
     heartbeat_running_ = false;
     WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
@@ -337,20 +402,6 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
                         const std::vector<int64_t>& lengths,
                         const std::vector<int64_t>& object_sizes,
                         bool prefer_pinned) {
-    if (keys.size() != offsets.size() || keys.size() != lengths.size() ||
-        keys.size() != object_sizes.size()) {
-        LOG(ERROR) << "Mismatched range load arguments";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (offsets[i] < 0 || lengths[i] < 0 || object_sizes[i] < 0 ||
-            offsets[i] > object_sizes[i] ||
-            lengths[i] > object_sizes[i] - offsets[i]) {
-            LOG(ERROR) << "Value span out of range for key " << keys[i];
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
     const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
     auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
                                  : *client_buffer_allocator_;
@@ -394,6 +445,9 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (!ValidateBatchReadSizes(keys, sizes, config_.local_buffer_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (!read_guard_) return BatchGetUnguarded(keys, sizes);
     // The read may outlive this call (and the caller's vectors): it gets
     // copies.
@@ -419,6 +473,15 @@ FileStorage::GuardPeerRead(
         } else if (outcome == OffloadReadGuard::Outcome::kShed) {
             ssd_metric_->ssd_read_shed.inc();
             ssd_metric_->ssd_read_shed_keys.inc(keys.size());
+        }
+    }
+    if (read_miss_evictor_ &&
+        (outcome == OffloadReadGuard::Outcome::kDeadlineMiss ||
+         outcome == OffloadReadGuard::Outcome::kShed)) {
+        const auto added = read_miss_evictor_->Add(keys);
+        if (ssd_metric_) {
+            ssd_metric_->ssd_read_miss_evict_keys.inc(added.queued);
+            ssd_metric_->ssd_read_miss_evict_dropped_keys.inc(added.dropped);
         }
     }
     return result;
@@ -500,6 +563,9 @@ void FileStorage::PartitionUnbucketedTasks(
 tl::expected<FileStorage::LocalBatchResult, ErrorCode>
 FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes) {
+    if (!ValidateBatchReadSizes(keys, sizes, config_.local_buffer_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto load_result = LoadBatch(keys, sizes, true);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
@@ -515,6 +581,10 @@ FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
                             const std::vector<int64_t>& offsets,
                             const std::vector<int64_t>& lengths,
                             const std::vector<int64_t>& object_sizes) {
+    if (!ValidateBatchReadRanges(keys, offsets, lengths, object_sizes,
+                                 config_.local_buffer_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     if (!read_guard_) {
         return BatchGetRangesUnguarded(keys, offsets, lengths, object_sizes);
     }
@@ -545,6 +615,10 @@ FileStorage::BatchGetLocalRanges(const std::vector<std::string>& keys,
                                  const std::vector<int64_t>& offsets,
                                  const std::vector<int64_t>& lengths,
                                  const std::vector<int64_t>& object_sizes) {
+    if (!ValidateBatchReadRanges(keys, offsets, lengths, object_sizes,
+                                 config_.local_buffer_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, true);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
@@ -970,6 +1044,36 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     return {};
 }
 
+tl::expected<void, ErrorCode> FileStorage::DropDiskReplicasAfterReadMiss(
+    const std::vector<std::string>& storage_keys) {
+    if (!client_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
+        keys_by_tenant;
+    for (const auto& storage_key : storage_keys) {
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
+        keys_by_tenant[tenant_id].push_back(key);
+    }
+    std::optional<ErrorCode> first_error;
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
+                                                      ReplicaType::LOCAL_DISK);
+        if (results.size() != keys.size()) {
+            if (!first_error) first_error = ErrorCode::INTERNAL_ERROR;
+            continue;
+        }
+        for (const auto& result : results) {
+            // OBJECT_NOT_FOUND: removed meanwhile, or dropped by an earlier
+            // failed read of the same key.
+            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                !first_error) {
+                first_error = result.error();
+            }
+        }
+    }
+    if (first_error) return tl::make_unexpected(*first_error);
+    return {};
+}
+
 tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
     if (!config_.enable_disk_watermark_eviction) {
         return {};
@@ -1350,6 +1454,10 @@ tl::expected<void, ErrorCode> FileStorage::PromoteOneKeyFromLocalDisk(
     // staging space when the local goes out of scope.
     std::vector<std::string> single_key{storage_key};
     std::vector<int64_t> single_size{size};
+    if (!ValidateBatchReadSizes(single_key, single_size,
+                                config_.local_buffer_size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto allocate_res =
         AllocateBatch(single_key, single_size, *client_buffer_allocator_);
     if (!allocate_res) {
@@ -1826,11 +1934,6 @@ tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                            const std::vector<int64_t>& sizes,
                            ClientBufferAllocator& allocator) {
-    if (keys.size() != sizes.size()) {
-        LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
-                   << ", sizes=" << sizes.size();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
     auto result = std::make_shared<AllocatedBatch>();
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
@@ -1842,12 +1945,6 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     u_int64_t total_size = 0;
     bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (sizes[i] < 0 || sizes[i] > config_.local_buffer_size) {
-            LOG(ERROR) << "Invalid size for key " << keys[i] << ": " << sizes[i]
-                       << " (limit: " << config_.local_buffer_size << ")";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
         size_t data_size = static_cast<size_t>(sizes[i]);
         size_t alloc_size = std::max<size_t>(data_size, 1);
         if (config_.use_uring) {
