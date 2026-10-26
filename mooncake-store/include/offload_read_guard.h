@@ -22,8 +22,9 @@ namespace mooncake {
 /**
  * @brief Bounds how long an offload (SSD tier) read waits for the disk.
  *
- * Without it a reader waits for the slowest read of its batch: the store reads
- * the batch's keys one after another, so a disk that answers each read in
+ * Without it a reader waits for the slowest read of its batch: by default
+ * (MOONCAKE_OFFLOAD_READ_PARALLELISM=1) the store reads the batch's keys one
+ * after another, so a disk that answers each read in
  * 20 ms makes a 60-key batch take over a second, and the reader's RPC has no
  * deadline below the 30 s transport timeout. The reader cannot use the memory
  * replicas of the same batch until then either.
