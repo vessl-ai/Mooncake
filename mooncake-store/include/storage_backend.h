@@ -246,6 +246,12 @@ struct FileStorageConfig {
     // Threads that run guarded reads (used only when the guard is on). Keep
     // it above the number of peer reads in flight at once.
     uint32_t offload_read_threads = 64;
+    // With the read guard on: after a peer offload read fails at the deadline
+    // or is shed, ask the master to drop this store's LOCAL_DISK replicas of
+    // its keys (OffloadReadMissEvictor), so the reader's recomputed put of a
+    // key that was only on this disk lands in memory instead of being skipped
+    // as "already exists". The bytes stay on the disk until bucket eviction.
+    bool offload_read_miss_evict = false;
 
     // Reads of one offload read (one BucketStorageBackend::BatchLoad) that
     // may be on the disk at once. 1 = one after another (the default). Only
