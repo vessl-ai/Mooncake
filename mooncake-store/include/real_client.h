@@ -906,6 +906,16 @@ class RealClient : public PyClient {
     int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
 
     /**
+     * @brief Take every memory segment of this store off the master now, for
+     * a planned shutdown (fork-only; see
+     * Client::UnmountMemorySegmentsForDrain). Reads already handed a descriptor
+     * still complete while the process lives; later mounts are refused. Returns
+     * 0, or the first master error (call again to retry the segments it left
+     * mounted).
+     */
+    int unmountMemorySegments();
+
+    /**
      * @brief Fence this store's disk tier on an external verdict (see
      * FileStorage::FenceLocalDisk). Returns 0 once the master has dropped the
      * segment, UNABLE_OFFLOAD when SSD offload is not enabled on this client,

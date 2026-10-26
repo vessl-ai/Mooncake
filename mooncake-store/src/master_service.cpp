@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "placement_key.h"
 
 #include <algorithm>
 #include <array>
@@ -98,12 +99,41 @@ namespace {
 // so every RPC that touched those keys stalled behind the sweep.
 constexpr size_t kStaleHandleCleanupBatchSize = 64;
 
-// Per-cycle offload cap as a fraction of `offloading_queue_limit_`. Used only
-// when offload-on-evict mode is active. Defers memory eviction for at most
-// this fraction of the queue limit per BatchEvict cycle; beyond that, eviction
-// falls back according to `offload_force_evict_`.
-// NOTE: Both offloading_queue_limit_ and offload_cap_ratio_ are now
-// configurable via --offloading_queue_limit and --offload_cap_ratio flags.
+// How often the eviction thread recomputes the offload stall gauges.
+constexpr auto kOffloadStallMetricsInterval = std::chrono::seconds(10);
+
+// Per-cycle offload cap: `offloading_queue_limit_ * offload_cap_ratio_`
+// (--offloading_queue_limit, --offload_cap_ratio). Used only in
+// offload-on-evict mode with `offload_force_evict_` set: once a BatchEvict
+// cycle (or one tenant eviction call) has queued this many objects, the
+// remaining candidates are evicted without a disk copy. Without
+// `offload_force_evict_` the cap is not consulted; a cycle keeps queueing
+// until a store's mailbox holds `offloading_queue_limit_` items, and a push
+// beyond that fails with KEYS_ULTRA_LIMIT and leaves the object in memory.
+
+// Why the offload pushes for one eviction candidate failed. A push fails with
+// UNABLE_OFFLOADING only when no LOCAL_DISK tier takes the item right now:
+// the owning store has none registered (never mounted, or unmounted after a
+// fence or a drain), its mailbox has offloading disabled, or the replica
+// names no source segment. A store disables offloading in its heartbeat both
+// when it is fenced and when its disk is over its key or size limit
+// (StorageBackend, KEYS_ULTRA_LIMIT); the master cannot tell the two apart,
+// so the second also counts as "no local disk" although it can clear once
+// the disk frees space. Other failures (a full mailbox, an owner that is not
+// serving) can clear on their own, so they keep the candidate in memory.
+struct OffloadPushFailures {
+    bool any = false;
+    bool other_than_no_local_disk = false;
+
+    void Record(ErrorCode error) {
+        any = true;
+        if (error != ErrorCode::UNABLE_OFFLOADING) {
+            other_than_no_local_disk = true;
+        }
+    }
+
+    bool OnlyNoLocalDisk() const { return any && !other_than_no_local_disk; }
+};
 
 enum class SnapshotCatalogBackendKind {
     kEmbedded,
@@ -226,6 +256,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
       enable_async_segment_cleanup_(
           !config.enable_ha && !config.enable_snapshot && !config.enable_cxl),
+      disk_unmount_sweep_worker_([this] { RunDiskUnmountSweeps(); }),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -422,6 +453,114 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+        offload_evict_without_local_disk_ =
+            config.offload_evict_without_local_disk;
+        if (offload_evict_without_local_disk_) {
+            LOG(INFO) << "Evict-without-local-disk enabled: objects on a "
+                         "store with no LOCAL_DISK tier taking offloads will "
+                         "be evicted without disk offload";
+        }
+        offload_evict_frontier_only_ = config.offload_evict_frontier_only;
+        if (offload_evict_frontier_only_) {
+            LOG(INFO) << "Frontier-only offload enabled: an eviction cycle "
+                         "queues offloads only for its oldest-lease frontier, "
+                         "oldest first; other keys are freed only when they "
+                         "have a disk copy";
+        }
+        offload_admission_read_since_put_ =
+            config.offload_admission_read_since_put;
+        if (offload_admission_read_since_put_) {
+            LOG(INFO) << "Read-since-put offload admission enabled: eviction "
+                         "queues a disk offload only for an object read from "
+                         "memory since its PutEnd and evicts the others "
+                         "without a disk copy";
+        }
+    }
+    if (config.offload_admission_read_since_put &&
+        !offload_admission_read_since_put_) {
+        LOG(WARNING) << "offload_admission_read_since_put ignored: it needs "
+                        "enable_offload and offload_on_evict";
+    }
+
+    // Second-put admission applies to the eager PutEnd offload only.
+    if (config.offload_admission_second_put) {
+        if (enable_offload_ && !offload_on_evict_) {
+            // A config file bypasses the flag validator, so check here.
+            if (config.offload_admission_window_puts == 0 ||
+                config.offload_admission_window_puts >
+                    kMaxOffloadAdmissionWindowPuts) {
+                LOG(ERROR) << "offload_admission_window_puts must be in [1, "
+                           << kMaxOffloadAdmissionWindowPuts << "], current "
+                           << config.offload_admission_window_puts;
+                throw std::invalid_argument(
+                    "Invalid offload_admission_window_puts");
+            }
+            offload_admission_filter_ =
+                std::make_unique<OffloadAdmissionFilter>(
+                    config.offload_admission_window_puts,
+                    config.offload_admission_bloom_filter
+                        ? OffloadAdmissionFilter::Kind::kBloom
+                        : OffloadAdmissionFilter::Kind::kCountMinSketch);
+            LOG(INFO) << "Second-put offload admission enabled: PutEnd "
+                         "queues a disk offload only for a key put before "
+                         "within the last "
+                      << offload_admission_filter_->window_puts()
+                      << " puts (filter "
+                      << offload_admission_filter_->MemoryBytes() << " bytes"
+                      << (config.offload_admission_bloom_filter ? ", Bloom"
+                                                                : "")
+                      << ")";
+        } else {
+            LOG(WARNING) << "offload_admission_second_put ignored: it needs "
+                            "enable_offload and offload_on_evict=false";
+        }
+    }
+    if (config.offload_admission_bloom_filter && !offload_admission_filter_) {
+        LOG(WARNING) << "offload_admission_bloom_filter ignored: it needs "
+                        "offload_admission_second_put in effect";
+    }
+
+    // Same conditions as the memory segment's deferred sweep: HA, snapshot
+    // and CXL keep the synchronous sweep.
+    async_disk_unmount_sweep_ = enable_offload_ &&
+                                config.async_disk_unmount_sweep &&
+                                enable_async_segment_cleanup_;
+    if (async_disk_unmount_sweep_) {
+        LOG(INFO) << "Async disk unmount sweep enabled: "
+                     "UnmountLocalDiskSegment returns before its replica "
+                     "sweep, which runs in the background";
+    } else if (config.async_disk_unmount_sweep) {
+        LOG(WARNING) << "async_disk_unmount_sweep ignored: it needs "
+                        "enable_offload and no HA, snapshot or CXL";
+    }
+
+    placement_key_hrw_ = config.placement_key_hrw;
+    if (placement_key_hrw_) {
+        LOG(INFO) << "Placement key HRW enabled: a preferred segment entry "
+                  << "\"" << kPlacementKeyPrefix
+                  << "<key>\" ranks the serving segments by rendezvous hash";
+    }
+
+    offload_stall_metrics_ =
+        enable_offload_ && config.enable_offload_stall_metrics;
+    if (offload_stall_metrics_) {
+        LOG(INFO) << "Offload stall metrics enabled";
+    }
+
+    if (config.enable_reuse_sampler) {
+        try {
+            reuse_sampler_ = std::make_unique<ReuseSampler>(
+                config.reuse_sampler_rate, config.reuse_sampler_max_entries);
+        } catch (const std::invalid_argument& e) {
+            // A config file value skips the flag validators.
+            LOG(FATAL) << "Invalid reuse sampler config: " << e.what()
+                       << " (reuse_sampler_rate=" << config.reuse_sampler_rate
+                       << ", reuse_sampler_max_entries="
+                       << config.reuse_sampler_max_entries << ")";
+        }
+        LOG(INFO) << "Reuse sampler enabled: sampling_rate="
+                  << reuse_sampler_->sampling_rate()
+                  << ", max_entries=" << reuse_sampler_->capacity();
     }
 
     // Growth-triggered heap trimming (see MaybeTrimHeap()). On unless the
@@ -583,6 +722,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     VLOG(1) << "action=start_task_cleanup_thread";
 
     replica_cleanup_worker_.Start();
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Start();
+    }
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
@@ -769,6 +911,13 @@ void MasterService::QuiesceBackgroundWork() {
     http_metadata_cleanup_running_ = false;
     timed("graceful_unmount", [&] { graceful_unmount_scheduler_.Stop(); });
     timed("replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
+    // A pending sweep stops at its next shard; its owners' replicas stay
+    // hidden on this master, and the handoff export drops them (their owner
+    // is no longer registered).
+    disk_unmount_sweep_stopping_.store(true, std::memory_order_release);
+    if (async_disk_unmount_sweep_) {
+        timed("disk_unmount_sweep", [&] { disk_unmount_sweep_worker_.Stop(); });
+    }
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -818,6 +967,7 @@ bool MasterService::BackgroundWorkQuiesced() const {
            !job_dispatch_thread_.joinable() &&
            !dynamic_replication_admission_thread_.joinable() &&
            !replica_cleanup_worker_.Joinable() &&
+           !disk_unmount_sweep_worker_.Joinable() &&
            !graceful_unmount_scheduler_.Joinable() &&
            !client_offboarding_worker_.Joinable() && !snapshot_manager_;
 }
@@ -2291,10 +2441,11 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
     const {
     return BuildStaleHandleCleanupPlan(
-        metadata, [&retaining_clients](const Replica& replica) {
+        metadata, [this, &retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients) ||
+                    IsDiskReplicaOfSweepingOwner(replica)) &&
                    replica.is_completed();
         });
 }
@@ -2859,6 +3010,30 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
     for (size_t i = 0; i < kNumShards; i++) {
+        const auto shard_error = ClearStaleHandlesInShard(i, is_stale);
+        if (shard_error && !first_persist_error) {
+            first_persist_error = shard_error;
+        }
+    }
+    if (first_persist_error) {
+        return tl::make_unexpected(*first_persist_error);
+    }
+    return {};
+}
+
+std::optional<ErrorCode> MasterService::ClearStaleHandlesInShard(
+    size_t i, const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const Replica&)>* on_removed,
+    StaleHandleShardStats* stats) {
+    using SteadyClock = std::chrono::steady_clock;
+    const auto elapsed_ns = [](SteadyClock::time_point since) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                SteadyClock::now() - since)
+                .count());
+    };
+    std::optional<ErrorCode> first_persist_error;
+    {
         // Pass 1: pick out the keys that need work under the shard's shared
         // lock. A sweep normally finds nothing in most shards, and such a
         // shard never takes the exclusive lock at all.
@@ -2866,17 +3041,21 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         std::vector<TenantId> empty_tenants;
         {
             MetadataShardAccessorRO shard(this, i);
+            const auto scan_start =
+                stats ? SteadyClock::now() : SteadyClock::time_point{};
             for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                 if (tenant_state.Empty()) {
                     empty_tenants.push_back(tenant_id);
                     continue;
                 }
+                if (stats) stats->keys_scanned += tenant_state.metadata.size();
                 for (const auto& [key, metadata] : tenant_state.metadata) {
                     if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
                         stale_keys.emplace_back(tenant_id, key);
                     }
                 }
             }
+            if (stats) stats->scan_hold_ns += elapsed_ns(scan_start);
         }
 
         // Pass 2: clean the picked keys in bounded batches, so the exclusive
@@ -2889,6 +3068,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             const size_t end = std::min(begin + kStaleHandleCleanupBatchSize,
                                         stale_keys.size());
             MetadataShardAccessorRW shard(this, i);
+            const auto batch_start =
+                stats ? SteadyClock::now() : SteadyClock::time_point{};
             for (size_t j = begin; j < end; j++) {
                 auto tenant_it = shard->tenants.find(stale_keys[j].first);
                 if (tenant_it == shard->tenants.end()) {
@@ -2915,6 +3096,14 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                             }
                             continue;
                         }
+                    }
+                    if (on_removed) {
+                        std::as_const(it->second)
+                            .VisitReplicas(is_stale, *on_removed);
+                    }
+                    if (stats) {
+                        stats->removed_replicas +=
+                            cleanup_plan.removed_ids.size();
                     }
                     if (CleanupStaleHandles(it->first, tenant_it->first,
                                             tenant_state, it->second, is_stale,
@@ -2962,6 +3151,12 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     shard->tenants.erase(tenant_it);
                 }
             }
+            if (stats) {
+                const uint64_t hold = elapsed_ns(batch_start);
+                stats->batch_hold_ns += hold;
+                stats->max_batch_hold_ns =
+                    std::max(stats->max_batch_hold_ns, hold);
+            }
         }
 
         if (!empty_tenants.empty()) {
@@ -2982,10 +3177,7 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
             }
         }
     }
-    if (first_persist_error) {
-        return tl::make_unexpected(*first_persist_error);
-    }
-    return {};
+    return first_persist_error;
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
@@ -3360,9 +3552,13 @@ auto MasterService::ProbeKey(const std::string& key, const TenantId& tenant_id)
 auto MasterService::ExistKeyImpl(const std::string& key,
                                  const TenantId& tenant_id, bool grant_lease)
     -> tl::expected<bool, ErrorCode> {
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    // A probe (no lease) is not a use of the object.
+    if (reuse_sampler_ && grant_lease) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "exist");
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    MetadataAccessorRO accessor(this,
-                                MakeObjectIdentityForRequest(key, tenant_id));
+    MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
@@ -3400,6 +3596,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
         return results;
+    }
+
+    if (reuse_sampler_ && grant_lease) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "exist");
+        }
     }
 
     std::vector<std::vector<size_t>> indices_by_shard(kNumShards);
@@ -4368,6 +4570,11 @@ bool MasterService::TryGetReadableReplicaDescriptor(
         if (HandoffDiskGated(disk.client_id)) {
             return false;
         }
+        // Unmounted, sweep still running: the owner handed this disk back.
+        if (async_disk_unmount_sweep_ &&
+            DiskUnmountSweepPending(disk.client_id)) {
+            return false;
+        }
         endpoint = disk.transport_endpoint;
     }
     if (endpoint && invalid_replica_endpoints_.contains(*endpoint)) {
@@ -4442,6 +4649,11 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                 }
 
                 results.emplace(key, std::move(replica_list));
+                // Not a read for offload_admission_read_since_put: like the
+                // cache-hit counters, the unread mark follows the per-key
+                // Get paths only. A regex lookup is a bulk listing, and
+                // marking every match as read would offload whatever it
+                // happens to match.
                 metadata.GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
             }
@@ -4456,6 +4668,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "get");
+    }
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
@@ -4488,6 +4703,11 @@ auto MasterService::GetReplicaList(const std::string& key,
                 })) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
+            if (OnlyReplicasOfSweepingOwners(metadata)) {
+                VLOG(1) << "key=" << key
+                        << ", info=object_not_found, reason=unmount_sweep";
+                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+            }
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
         }
@@ -4497,6 +4717,9 @@ auto MasterService::GetReplicaList(const std::string& key,
             MasterMetricManager::instance().inc_mem_cache_hit_nums();
             MasterMetricManager::instance().inc_mem_cache_hit_bytes(
                 static_cast<int64_t>(metadata.size));
+            if (offload_admission_read_since_put_) {
+                MarkReadFromMemory(metadata);
+            }
         } else if (replica_list[0].is_local_disk_replica() ||
                    replica_list[0].is_disk_replica()) {
             MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -4570,6 +4793,11 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     auto replica_list = GetReadableReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
+        if (OnlyReplicasOfSweepingOwners(metadata)) {
+            VLOG(1) << "key=" << key
+                    << ", info=object_not_found, reason=unmount_sweep";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
@@ -4593,6 +4821,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    if (reuse_sampler_) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "get");
+        }
+    }
     constexpr size_t kInvalidKeyIndex = std::numeric_limits<size_t>::max();
     std::array<size_t, kNumShards> key_list_heads;
     key_list_heads.fill(kInvalidKeyIndex);
@@ -4654,6 +4887,13 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                         continue;
                     }
+                    if (OnlyReplicasOfSweepingOwners(metadata)) {
+                        VLOG(1) << "key=" << key << ", info=object_not_found"
+                                << ", reason=unmount_sweep";
+                        results[original_idx] =
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                        continue;
+                    }
                     LOG(WARNING)
                         << "key=" << key << ", error=replica_not_ready";
                     results[original_idx] =
@@ -4665,6 +4905,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                     MasterMetricManager::instance().inc_mem_cache_hit_nums();
                     MasterMetricManager::instance().inc_mem_cache_hit_bytes(
                         static_cast<int64_t>(metadata.size));
+                    if (offload_admission_read_since_put_) {
+                        MarkReadFromMemory(metadata);
+                    }
                 } else if (replica_list[0].is_local_disk_replica() ||
                            replica_list[0].is_disk_replica()) {
                     MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -4806,6 +5049,48 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::ExpandPlacementKeys(
+    const ReplicateConfig& config,
+    const ScopedAllocatorAccess& allocator_access,
+    std::vector<std::string>& preferred_segments) const {
+    const std::vector<std::string>* entries = nullptr;
+    std::vector<std::string> single;
+    if (!config.preferred_segment.empty()) {
+        single.push_back(config.preferred_segment);
+        entries = &single;
+    } else {
+        entries = &config.preferred_segments;
+    }
+    if (std::none_of(entries->begin(), entries->end(), [](const auto& entry) {
+            return ParsePlacementKey(entry).has_value();
+        })) {
+        return;
+    }
+
+    // Rebuild the list in the caller's order, each placement key replaced by
+    // the serving segments in its HRW order (first occurrence wins).
+    const auto serving =
+        allocator_access.getAllocatorManager().getServingNames();
+    std::vector<std::string> expanded;
+    auto append = [&expanded](const std::string& name) {
+        if (!name.empty() && std::find(expanded.begin(), expanded.end(),
+                                       name) == expanded.end()) {
+            expanded.push_back(name);
+        }
+    };
+    for (const auto& entry : *entries) {
+        if (auto placement_key = ParsePlacementKey(entry)) {
+            for (const auto& name :
+                 RankSegmentsForPlacementKey(*placement_key, serving)) {
+                append(name);
+            }
+        } else {
+            append(entry);
+        }
+    }
+    preferred_segments = std::move(expanded);
+}
+
 auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
@@ -4841,6 +5126,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
             has_enough_memory_segments = allocator_access.getAllocatorManager()
                                              .getServingNames()
                                              .size() >= config.replica_num;
+            if (placement_key_hrw_) {
+                ExpandPlacementKeys(config, allocator_access,
+                                    preferred_segments);
+            }
             if (!writer_host_id.empty()) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
@@ -5119,6 +5408,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key,
+                             "put_start");
+    }
     if ((config.replica_num == 0 && config.nof_replica_num == 0 &&
          config.dfs_replica_num == 0) ||
         key.empty() || slice_length == 0) {
@@ -5301,6 +5594,29 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return result;
 }
 
+bool MasterService::AdmitEagerOffload(const ObjectIdentity& object_id,
+                                      ObjectMetadata& metadata) {
+    if (!offload_admission_filter_) {
+        return true;
+    }
+    // A later End of the same write follows the first End's answer. Asking
+    // the filter again would count that first End as an earlier put.
+    if (metadata.eager_offload_judged) {
+        return metadata.eager_offload_admitted;
+    }
+    const std::string scoped_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+    const bool admitted = offload_admission_filter_->ObservePut(scoped_key);
+    metadata.eager_offload_judged = true;
+    metadata.eager_offload_admitted = admitted;
+    if (admitted) {
+        MasterMetricManager::instance().inc_offload_admission_put_admitted();
+    } else {
+        MasterMetricManager::instance().inc_offload_admission_put_skipped();
+    }
+    return admitted;
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
@@ -5402,15 +5718,25 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(settle_result.error());
     }
 
+    // offload_admission_second_put: the first End of a write records the
+    // put in the admission filter whatever its replica type and whether it
+    // can queue an offload, so that a later End of the same write (a MEMORY
+    // End after a DFS End) follows this write's answer. True when the mode
+    // is off.
+    const bool eager_offload_admitted = AdmitEagerOffload(object_id, metadata);
+
     // A key has at most one offload task: a second push would replace the
     // queued item of the current task with one whose id no task has.
+    // With offload_admission_second_put the key must also have been put
+    // before (eager_offload_admitted).
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ &&
         !accessor.GetTenantState().offloading_tasks.contains(
             object_id.user_key) &&
         !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
-        })) {
+        }) &&
+        eager_offload_admitted) {
         auto& tenant_state = accessor.GetTenantState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
@@ -5450,6 +5776,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
+    }
+
+    // offload_admission_read_since_put: a new write is unread until a read
+    // is served from memory.
+    if (offload_admission_read_since_put_ && !had_completed_replica) {
+        metadata.unread_since_put.store(true, std::memory_order_relaxed);
     }
 
     SyncCacheTotalAccounting(metadata);
@@ -6089,6 +6421,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (metadata.size == slice_length && !has_read_lease) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    // A new write: its first End asks the admission filter
+                    // again (offload_admission_second_put).
+                    metadata.eager_offload_judged = false;
+                    metadata.eager_offload_admitted = false;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -6476,6 +6812,10 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (!metadata.IsValid()) {
+        if (reuse_sampler_) {
+            SampleDiskEviction(object_id.tenant_id, object_id.user_key,
+                               metadata);
+        }
         accessor.Erase();
     }
     return {};
@@ -8009,16 +8349,17 @@ bool MasterService::CleanupStaleHandles(
     MetadataShardAccessorRW* shard) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner no longer retains
-    // resources.
+    // resources or whose owner's background unmount sweep is pending.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
     return CleanupStaleHandles(
         key, tenant_id, tenant_state, metadata,
-        [&retaining_clients](const Replica& replica) {
+        [this, &retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
+                    replica.has_stale_local_disk_client(retaining_clients) ||
+                    IsDiskReplicaOfSweepingOwner(replica)) &&
                    replica.is_completed();
         },
         shard);
@@ -8284,14 +8625,31 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         MasterMetricManager::instance().client_liveness_record_created();
     }
     ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    bool unmount_sweep_pending = false;
     const auto observation =
         record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
             std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            // A new registration must not coexist with replicas of this
+            // client's previous one. The sweep job is recorded under
+            // snapshot_mutex_ held exclusively, so this check and the
+            // registration below see it or come entirely before it.
+            if (async_disk_unmount_sweep_ &&
+                DiskUnmountSweepPending(client_id)) {
+                unmount_sweep_pending = true;
+                err = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                return false;
+            }
             err =
                 local_ssd_manager_.RegisterClient(client_id, enable_offloading);
             return err == ErrorCode::OK ||
                    err == ErrorCode::SEGMENT_ALREADY_EXISTS;
         });
+    if (unmount_sweep_pending) {
+        MasterMetricManager::instance().inc_disk_unmount_remount_refused();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=mount_local_disk_segment_deferred"
+                  << ", reason=unmount_sweep_pending";
+    }
     if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -8337,10 +8695,39 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // (the check refuses it). Without the exclusive lock a registration
     // admitted against the old one could land in a shard the sweep had
     // already passed and survive as a stale owner.
+    //
+    // With async_disk_unmount_sweep the sweep runs on
+    // disk_unmount_sweep_worker_ instead. The job is recorded in the same
+    // exclusive section as the deregistration, so from the moment this call
+    // can return the owner's replicas are unreadable
+    // (TryGetReadableReplicaDescriptor) and a mount of the same client is
+    // refused until the sweep ends (MountLocalDiskSegment).
     std::optional<int64_t> reported_capacity;
+    size_t pending_sweeps = 0;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
+        if (reported_capacity && async_disk_unmount_sweep_) {
+            std::unique_lock<std::shared_mutex> sweep_lock(
+                disk_unmount_sweep_mutex_);
+            auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                    disk_unmount_sweep_jobs_.end(),
+                                    [&client_id](const auto& pending) {
+                                        return pending.owner == client_id;
+                                    });
+            if (job == disk_unmount_sweep_jobs_.end()) {
+                disk_unmount_sweep_jobs_.push_back(DiskUnmountSweepJob{
+                    .owner = client_id,
+                    .started = std::chrono::steady_clock::now()});
+            } else {
+                // Not reachable while a pending sweep refuses the mount;
+                // restarting the full pass keeps the invariant regardless.
+                job->shards_left = kNumShards;
+            }
+            pending_sweeps = disk_unmount_sweep_jobs_.size();
+            disk_unmount_sweep_owner_count_.store(pending_sweeps);
+            PublishDiskUnmountSweepProgressLocked();
+        }
     }
     if (!reported_capacity) {
         // Idempotent, the same way MountLocalDiskSegment treats an
@@ -8360,11 +8747,171 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // erased -- and when that disk replica was the key's only one, the key
     // itself. An owner-id predicate cannot misclassify a concurrent mount,
     // whatever the interleaving.
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Schedule();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=unmount_local_disk_segment_by_request"
+                  << ", sweep=background, pending_sweeps=" << pending_sweeps;
+        return {};
+    }
     ClearLocalDiskHandlesOwnedBy(client_id);
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
     return {};
+}
+
+bool MasterService::DiskUnmountSweepPending(const UUID& owner) const {
+    if (disk_unmount_sweep_owner_count_.load() == 0) {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+    return std::any_of(
+        disk_unmount_sweep_jobs_.begin(), disk_unmount_sweep_jobs_.end(),
+        [&owner](const auto& job) { return job.owner == owner; });
+}
+
+bool MasterService::IsDiskReplicaOfSweepingOwner(const Replica& replica) const {
+    if (!async_disk_unmount_sweep_ || !replica.is_local_disk_replica()) {
+        return false;
+    }
+    const auto owner = replica.get_local_disk_client_id();
+    return owner && DiskUnmountSweepPending(*owner);
+}
+
+bool MasterService::OnlyReplicasOfSweepingOwners(
+    const ObjectMetadata& metadata) const {
+    if (!async_disk_unmount_sweep_) {
+        return false;
+    }
+    // What the synchronous sweep leaves: no object (or only REMOVED ones).
+    return metadata.AllReplicas([this](const Replica& replica) {
+        return replica.status() == ReplicaStatus::REMOVED ||
+               IsDiskReplicaOfSweepingOwner(replica);
+    });
+}
+
+void MasterService::PublishDiskUnmountSweepProgressLocked() const {
+    int64_t remaining_shards = 0;
+    int64_t remaining_replicas = 0;
+    int64_t oldest_age_seconds = 0;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& job : disk_unmount_sweep_jobs_) {
+        remaining_shards += static_cast<int64_t>(job.shards_left);
+        const size_t visited = kNumShards - job.shards_left;
+        if (visited > 0) {
+            // Keys hash uniformly over the shards.
+            remaining_replicas += static_cast<int64_t>(
+                job.removed_replicas * job.shards_left / visited);
+        }
+        oldest_age_seconds = std::max<int64_t>(
+            oldest_age_seconds,
+            std::chrono::duration_cast<std::chrono::seconds>(now - job.started)
+                .count());
+    }
+    MasterMetricManager::instance().set_disk_unmount_sweep_progress(
+        static_cast<int64_t>(disk_unmount_sweep_jobs_.size()), remaining_shards,
+        remaining_replicas, oldest_age_seconds);
+}
+
+void MasterService::RunDiskUnmountSweeps() {
+    // One shard per step, round robin. Every pending owner takes part in
+    // each step; an owner is done once it has taken part in kNumShards
+    // consecutive steps, i.e. once every shard was swept for it after its
+    // unmount. Owners that unmount together share the shard walks.
+    while (!disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+        std::vector<UUID> owners;
+        {
+            std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            if (disk_unmount_sweep_jobs_.empty()) {
+                return;
+            }
+            owners.reserve(disk_unmount_sweep_jobs_.size());
+            for (const auto& job : disk_unmount_sweep_jobs_) {
+                owners.push_back(job.owner);
+            }
+        }
+        const size_t shard = disk_unmount_sweep_cursor_;
+        disk_unmount_sweep_cursor_ = (shard + 1) % kNumShards;
+        if (disk_unmount_sweep_shard_hook_) {
+            disk_unmount_sweep_shard_hook_(shard);
+        }
+        if (disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::vector<uint64_t> removed(owners.size(), 0);
+        const auto owner_index = [&owners](const Replica& replica) {
+            const auto owner = replica.get_local_disk_client_id();
+            if (!owner) return owners.size();
+            return static_cast<size_t>(
+                std::find(owners.begin(), owners.end(), *owner) -
+                owners.begin());
+        };
+        const std::function<bool(const Replica&)> is_stale =
+            [&owners, &owner_index](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.is_completed() &&
+                       owner_index(replica) < owners.size();
+            };
+        const std::function<void(const Replica&)> on_removed =
+            [&removed, &owner_index](const Replica& replica) {
+                const size_t index = owner_index(replica);
+                if (index < removed.size()) ++removed[index];
+            };
+        StaleHandleShardStats stats;
+        (void)ClearStaleHandlesInShard(shard, is_stale, &on_removed, &stats);
+
+        uint64_t removed_total = 0;
+        std::vector<DiskUnmountSweepJob> finished;
+        {
+            std::unique_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            for (size_t k = 0; k < owners.size(); ++k) {
+                auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                        disk_unmount_sweep_jobs_.end(),
+                                        [&](const auto& pending) {
+                                            return pending.owner == owners[k];
+                                        });
+                if (job == disk_unmount_sweep_jobs_.end()) continue;
+                removed_total += removed[k];
+                job->removed_replicas += removed[k];
+                job->max_scan_hold_ns =
+                    std::max(job->max_scan_hold_ns, stats.scan_hold_ns);
+                job->max_batch_hold_ns =
+                    std::max(job->max_batch_hold_ns, stats.max_batch_hold_ns);
+                if (--job->shards_left == 0) {
+                    finished.push_back(*job);
+                    disk_unmount_sweep_jobs_.erase(job);
+                }
+            }
+            disk_unmount_sweep_owner_count_.store(
+                disk_unmount_sweep_jobs_.size());
+            PublishDiskUnmountSweepProgressLocked();
+        }
+        if (!finished.empty()) {
+            disk_unmount_sweep_cv_.notify_all();
+        }
+        if (removed_total > 0) {
+            MasterMetricManager::instance()
+                .inc_disk_unmount_sweep_removed_replicas(
+                    static_cast<int64_t>(removed_total));
+        }
+        for (const auto& job : finished) {
+            const auto duration_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - job.started)
+                    .count();
+            MasterMetricManager::instance()
+                .observe_disk_unmount_sweep_duration_ms(duration_ms);
+            LOG(INFO) << "client_id=" << job.owner
+                      << ", action=local_disk_unmount_sweep_done"
+                      << ", duration_ms=" << duration_ms
+                      << ", removed_replicas=" << job.removed_replicas
+                      << ", max_shard_scan_us=" << job.max_scan_hold_ns / 1000
+                      << ", max_erase_batch_us="
+                      << job.max_batch_hold_ns / 1000;
+        }
+    }
 }
 
 bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
@@ -8865,6 +9412,129 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
+}
+
+void MasterService::UpdateOffloadStallMetrics() {
+    const auto now = std::chrono::system_clock::now();
+    int64_t pending = 0;
+    int64_t without_local_disk = 0;
+    std::optional<std::chrono::system_clock::time_point> oldest;
+    // Each store's registration is looked up once per walk.
+    std::unordered_map<UUID, bool, boost::hash<UUID>> registered;
+    auto has_local_disk = [&](const UUID& client_id) {
+        auto [it, inserted] = registered.try_emplace(client_id, false);
+        if (inserted) {
+            it->second = HasMountedLocalDiskSegment(client_id);
+        }
+        return it->second;
+    };
+
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (const auto& [key, task] : tenant_state.offloading_tasks) {
+                    ++pending;
+                    if (!oldest || task.start_time < *oldest) {
+                        oldest = task.start_time;
+                    }
+                    // No target store can take or report it any more: the
+                    // pinned source is freed only when the task expires.
+                    if (std::none_of(task.mirror_clients.begin(),
+                                     task.mirror_clients.end(),
+                                     has_local_disk)) {
+                        ++without_local_disk;
+                    }
+                }
+            }
+        }
+    }
+
+    int64_t oldest_age_seconds = 0;
+    if (oldest) {
+        oldest_age_seconds = std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::seconds>(now - *oldest)
+                   .count());
+    }
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_offload_tasks_pending(pending);
+    metrics.set_offload_tasks_without_local_disk(without_local_disk);
+    metrics.set_offload_task_oldest_age_seconds(oldest_age_seconds);
+}
+
+namespace {
+
+double ToSeconds(std::chrono::nanoseconds duration) {
+    return std::max(0.0, std::chrono::duration<double>(duration).count());
+}
+
+double SecondsSincePutStart(const ObjectMetadata& metadata) {
+    return ToSeconds(std::chrono::system_clock::now() -
+                     metadata.put_start_time);
+}
+
+}  // namespace
+
+void MasterService::SampleReuseReference(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const char* op) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const auto reuse = reuse_sampler_->RecordReference(
+        fingerprint, ReuseSampler::Clock::now());
+    if (!reuse) {
+        return;
+    }
+    auto& metrics = MasterMetricManager::instance();
+    if (reuse->since_memory_eviction) {
+        metrics.observe_reuse_sampler_memory_reuse_age(
+            reuse->disk_copy_present ? "disk" : "none", op,
+            ToSeconds(*reuse->since_memory_eviction));
+    }
+    if (reuse->since_disk_eviction) {
+        metrics.observe_reuse_sampler_disk_reuse_age(
+            op, ToSeconds(*reuse->since_disk_eviction));
+    }
+}
+
+void MasterService::SampleMemoryEviction(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const ObjectMetadata& metadata) {
+    // A memory replica that survived (pinned for offload, or being
+    // written) keeps the key in memory: nothing left the cache yet.
+    if (metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.status() != ReplicaStatus::REMOVED;
+        })) {
+        return;
+    }
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const bool disk_copy_kept = metadata.HasReplica([](const Replica& replica) {
+        return !replica.is_memory_replica() &&
+               replica.status() != ReplicaStatus::REMOVED;
+    });
+    reuse_sampler_->RecordMemoryEviction(fingerprint, disk_copy_kept,
+                                         ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "memory", SecondsSincePutStart(metadata));
+}
+
+void MasterService::SampleDiskEviction(const TenantId& tenant_id,
+                                       const std::string& user_key,
+                                       const ObjectMetadata& metadata) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    reuse_sampler_->RecordDiskEviction(fingerprint, ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "disk", SecondsSincePutStart(metadata));
 }
 
 bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
@@ -10546,6 +11216,7 @@ void MasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
+    auto next_offload_stall_metrics_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
@@ -10577,6 +11248,15 @@ void MasterService::EvictionThreadFunc() {
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
+        }
+
+        if (offload_stall_metrics_) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_offload_stall_metrics_time) {
+                UpdateOffloadStallMetrics();
+                next_offload_stall_metrics_time =
+                    steady_now + kOffloadStallMetricsInterval;
+            }
         }
 
         // Tenant-scoped watermark. Intentionally outside the branch above:
@@ -10627,6 +11307,14 @@ void MasterService::EvictionThreadFunc() {
         // its own check and the decision to trim, so there is no interval
         // state for this loop to carry.
         MaybeTrimHeap();
+
+        // offload_admission_second_put: zero the generation the last
+        // rotation retired, a slice per iteration, so that PutEnd never
+        // zeroes or allocates.
+        if (offload_admission_filter_) {
+            offload_admission_filter_->PrepareSpare(
+                kOffloadAdmissionPrepareBytesPerIteration);
+        }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
@@ -11064,6 +11752,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
             auto metadata_it = tenant_state.metadata.find(task_it->first);
             LOG(WARNING) << "Offloading task expired for key: "
                          << task_it->first << " tenant=" << tenant_it->first;
+            if (offload_stall_metrics_) {
+                MasterMetricManager::instance().inc_offload_tasks_expired();
+            }
             auto expired_it = task_it++;
             ReleaseOffloadingTask(tenant_state,
                                   metadata_it != tenant_state.metadata.end()
@@ -11506,8 +12197,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
         return metadata.HasReplica(is_evictable_memory_replica);
     };
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    // A disk replica hidden by a pending unmount sweep is no disk copy: the
+    // sweep erases it (as the synchronous sweep already would have).
+    auto has_local_disk_replica = [this](const ObjectMetadata& metadata) {
+        return metadata.HasReplica([this](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   !IsDiskReplicaOfSweepingOwner(replica);
+        });
     };
     auto evict_replicas =
         [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
@@ -11540,6 +12236,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;
     long offload_push_failed_forced = 0;
+    long offload_no_local_disk_evicted = 0;
+    // #objects evicted without a disk copy because they were never read
+    // (offload_admission_read_since_put)
+    long offload_unread_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
@@ -11565,16 +12265,25 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
+        // offload_admission_read_since_put: nobody read it from memory since
+        // its PutEnd, so evict it without a disk copy as eager mode would.
+        if (offload_admission_read_since_put_ &&
+            metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            ++offload_unread_evicted;
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
         if (offload_force_evict_ && offload_queued_this_call >= offload_cap) {
             ++offload_cap_forced_count;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
         bool queued = false;
+        OffloadPushFailures push_failures;
         metadata.VisitReplicas(
             is_evictable_memory_replica,
             [this, &key, &normalized_tenant, &tenant_state, &queued,
-             &now](Replica& replica) {
+             &push_failures, &now](Replica& replica) {
                 if (queued) {
                     return;
                 }
@@ -11596,6 +12305,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                  .source_clients = std::move(source_clients),
                                  .task_id = task_id});
                     queued = true;
+                } else {
+                    push_failures.Record(result.error());
                 }
             });
 
@@ -11605,6 +12316,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
+        if (offload_evict_without_local_disk_ &&
+            push_failures.OnlyNoLocalDisk()) {
+            ++offload_no_local_disk_evicted;
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
         if (offload_force_evict_) {
             ++offload_push_failed_forced;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
@@ -11643,6 +12359,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             if (!metadata.IsGrouped()) {
                 uint64_t freed = try_evict_or_offload(
                     key, metadata, tenant_state, deferred_replicas);
+                if (reuse_sampler_ && freed > 0) {
+                    SampleMemoryEviction(normalized_tenant, key, metadata);
+                }
                 TenantQuotaEvictionResult result{
                     .freed_bytes = freed,
                     .evicted_objects = freed > 0 ? 1U : 0U};
@@ -11677,6 +12396,10 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                       MetadataShardAccessorRW& accessor) -> EvictMemberOutcome {
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
+            if (reuse_sampler_ && freed > 0) {
+                SampleMemoryEviction(normalized_tenant, member_key,
+                                     member_metadata);
+            }
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0) {
@@ -11787,6 +12510,23 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                      << "; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload.";
     }
+    if (offload_unread_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_admission_unread_evicted(
+            offload_unread_evicted);
+        VLOG(1) << "[TENANT-EVICT] tenant=" << normalized_tenant
+                << ", offload_unread_evicted=" << offload_unread_evicted;
+    }
+    if (offload_stall_metrics_ && offload_no_local_disk_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_no_local_disk_evicted(
+            offload_no_local_disk_evicted);
+    }
+    if (offload_no_local_disk_evicted > 0) {
+        LOG(INFO) << "[TENANT-EVICT] Evicted " << offload_no_local_disk_evicted
+                  << " object(s) of tenant " << normalized_tenant
+                  << " without disk offload: their store has no LOCAL_DISK "
+                     "tier taking offloads "
+                     "(offload_evict_without_local_disk=true).";
+    }
     if (offload_push_failed_forced > 0) {
         LOG(WARNING) << "[TENANT-EVICT] PushOffloadingQueue failed for tenant "
                      << normalized_tenant << " on "
@@ -11861,13 +12601,43 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long offload_deferred_count = 0;
     long offload_cap_forced_count = 0;    // #keys force-evicted due to cap
     long offload_push_failed_forced = 0;  // #keys force-evicted on push fail
+    // #keys evicted because no LOCAL_DISK tier takes their offload
+    long offload_no_local_disk_evicted = 0;
+    // #keys kept in memory for the same reason (opt-in off). A pass tries a
+    // key at most once, but the second pass may retry a key the first pass
+    // kept, so the stall gauge reports the larger of the two passes.
+    long offload_no_local_disk_skipped = 0;
+    // offload_evict_frontier_only: the first pass queues offloads only for
+    // the frontier, its oldest-lease candidates. try_evict_or_offload reads
+    // this gate; the passes below clear it for every key past the frontier.
+    const bool frontier_only = offload_evict_frontier_only_;
+    bool offload_queue_allowed = true;
+    // offload_admission_read_since_put drops unread keys only in the first
+    // pass's frontier, the oldest leases; the passes below clear this gate.
+    bool unread_drop_allowed = true;
+    // Whether the key being tried is in the first pass's frontier.
+    bool offload_in_frontier = true;
+    // offload_evict_frontier_only: frontier keys whose push failed (kept in
+    // memory, unpinned), and keys past the frontier queued in their place.
+    long offload_frontier_push_failed = 0;
+    long offload_queued_past_frontier = 0;
+    // #keys past the frontier kept in memory because they have no disk copy
+    long offload_beyond_frontier_kept = 0;
+    // #keys evicted without a disk copy because they were never read
+    // (offload_admission_read_since_put)
+    long offload_unread_evicted = 0;
     const long offload_cap =
         offload_on_evict_
             ? static_cast<long>(offloading_queue_limit_ * offload_cap_ratio_)
             : 0;
 
-    auto has_local_disk_replica = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    // A disk replica hidden by a pending unmount sweep is no disk copy: the
+    // sweep erases it (as the synchronous sweep already would have).
+    auto has_local_disk_replica = [this](const ObjectMetadata& metadata) {
+        return metadata.HasReplica([this](const Replica& replica) {
+            return replica.is_local_disk_replica() &&
+                   !IsDiskReplicaOfSweepingOwner(replica);
+        });
     };
 
     // Returns freed bytes. Returns 0 if offload-queued and no additional
@@ -11897,6 +12667,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
+        // Past the frontier (offload_evict_frontier_only): queue nothing. A
+        // key without a disk copy stays in memory, so a recently read key is
+        // not sent to disk ahead of older ones.
+        if (!offload_queue_allowed) {
+            offload_beyond_frontier_kept++;
+            return 0;
+        }
+
+        // offload_admission_read_since_put: nobody read it from memory since
+        // its PutEnd, so evict it without a disk copy as eager mode would.
+        // Only in the frontier: past it a key is newer than keys the cycle
+        // has not freed, so it is not dropped ahead of them (it stays in
+        // memory with frontier_only, and is queued as before without it).
+        if (offload_admission_read_since_put_ && unread_drop_allowed &&
+            metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            offload_unread_evicted++;
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
         // Force-evict cap: if force_evict enabled and cap reached, force
         // delete. Warning is aggregated at the end of the cycle to avoid log
         // flooding.
@@ -11907,9 +12696,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
+        OffloadPushFailures push_failures;
         metadata.VisitReplicas(
-            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
-                                          &queued, &now](Replica& replica) {
+            is_evictable_memory_replica,
+            [this, &tenant_id, &key, &tenant_state, &queued, &push_failures,
+             &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 std::vector<UUID> mirror_clients;
                 const L4TaskId task_id = NextL4TaskId();
@@ -11929,15 +12720,32 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                  .source_clients = std::move(source_clients),
                                  .task_id = task_id});
                     queued = true;
+                } else {
+                    push_failures.Record(result.error());
                 }
             });
 
         if (queued) {
             offload_queued_this_cycle++;
             offload_deferred_count++;
+            if (frontier_only && !offload_in_frontier) {
+                offload_queued_past_frontier++;
+            }
             // Any remaining MEMORY replicas with refcnt==0 are redundant copies
             // (data survives via the pinned replica → disk). Evict them now to
             // reclaim memory immediately rather than waiting another cycle.
+            return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+
+        // Every push failed because no LOCAL_DISK tier takes the offload
+        // (none registered, fenced, unmounted, offloading disabled). When
+        // opted in, evict as the eager mode would. Offloading disabled also
+        // covers a store whose disk is over its key or size limit, where
+        // waiting could help; those objects are evicted too
+        // (OffloadPushFailures).
+        if (offload_evict_without_local_disk_ &&
+            push_failures.OnlyNoLocalDisk()) {
+            offload_no_local_disk_evicted++;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
         }
 
@@ -11948,6 +12756,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
         if (offload_force_evict_) {
             offload_push_failed_forced++;
             return evict_replicas(tenant_state, metadata, deferred_replicas);
+        }
+        if (push_failures.OnlyNoLocalDisk()) {
+            offload_no_local_disk_skipped++;
+        }
+        if (frontier_only && offload_in_frontier) {
+            offload_frontier_push_failed++;
         }
         return 0;
     };
@@ -12072,6 +12886,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
                 uint64_t freed = try_evict_or_offload(
                     tenant_id, key, metadata, tenant_state, deferred_replicas);
+                if (reuse_sampler_ && freed > 0) {
+                    SampleMemoryEviction(tenant_id, key, metadata);
+                }
                 EvictionResult result{.freed_bytes = freed,
                                       .evicted_objects = freed > 0 ? 1 : 0};
                 if (!enable_oplog_ && freed > 0) {
@@ -12113,6 +12930,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             const uint64_t freed =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
                                      state, deferred_replicas);
+            if (reuse_sampler_ && freed > 0) {
+                SampleMemoryEviction(tenant_id, member_key, member_metadata);
+            }
             EvictMemberOutcome outcome{.freed_bytes = freed,
                                        .evicted_objects = freed > 0 ? 1 : 0};
             if (freed > 0 && !enable_oplog_) {
@@ -12420,28 +13240,126 @@ void MasterService::BatchEvict(double evict_ratio_target,
     if (!candidates.empty()) {
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
+        auto earlier_lease = [](const Candidate& a, const Candidate& b) {
+            return a.lease_timeout < b.lease_timeout;
+        };
         std::nth_element(candidates.begin(),
                          candidates.begin() + (evict_num - 1), candidates.end(),
-                         [](const Candidate& a, const Candidate& b) {
-                             return a.lease_timeout < b.lease_timeout;
-                         });
+                         earlier_lease);
+
+        // The frontier is every candidate of the compact path (the reserve
+        // cutoff bounds them) and otherwise the evict_num oldest, which
+        // nth_element just put first. offload_evict_frontier_only walks it
+        // from the oldest lease, so the offload queue receives keys in lease
+        // order, and queues offloads only for it.
+        const size_t frontier_size = compact_frontier_used
+                                         ? candidates.size()
+                                         : static_cast<size_t>(evict_num);
+
+        // offload_evict_frontier_only walks a batch in lease order, ordered
+        // lazily: a WalkOrder holds (lease, batch index) pairs of the part
+        // still to walk, and when the walk reaches the end of its ordered
+        // prefix the next slice is selected (nth_element) and sorted. Slices
+        // double from kFrontierOrderSlice. Ordering 16-byte pairs instead of
+        // the candidates themselves, and only as far as the walk goes, keeps
+        // a walk that stops early cheap (900K candidates: about 15 ms for 1%
+        // of the frontier, 85 ms for all of it, against 115 ms for sorting
+        // the whole frontier of candidates).
+        struct WalkOrder {
+            // (A local class cannot have static data members.)
+            enum : size_t { kFrontierOrderSlice = 4096 };
+            std::vector<std::pair<int64_t, uint32_t>> pairs;
+            size_t base = 0;         // batch position of pairs[0]
+            size_t ordered_end = 0;  // positions below it are ordered
+            size_t slice = kFrontierOrderSlice;
+            bool active = false;
+
+            // Order the batch positions [from, to) for the walk.
+            void Start(const std::vector<Candidate>& batch, size_t from,
+                       size_t to) {
+                pairs.clear();
+                pairs.reserve(to - from);
+                for (size_t j = from; j < to; ++j) {
+                    pairs.emplace_back(
+                        batch[j].lease_timeout.time_since_epoch().count(),
+                        static_cast<uint32_t>(j));
+                }
+                base = from;
+                ordered_end = from;
+                slice = kFrontierOrderSlice;
+                active = true;
+            }
+            bool Covers(size_t pos) const {
+                return active && pos >= base && pos - base < pairs.size();
+            }
+            // Make position `pos` hold the next oldest pair.
+            void OrderUpTo(size_t pos) {
+                if (pos < ordered_end) return;
+                const auto first = pairs.begin() + (pos - base);
+                const size_t left = pairs.size() - (pos - base);
+                const size_t take = std::min(left, slice);
+                if (take < left) {
+                    std::nth_element(first, first + (take - 1), pairs.end());
+                }
+                std::sort(first, first + take);
+                ordered_end = pos + take;
+                slice *= 2;
+            }
+            size_t BatchIndex(size_t pos) const {
+                return pairs[pos - base].second;
+            }
+        };
 
         // Treat evict_num as a minimum: if re-validation skips a candidate,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
+        // The first `frontier_end` candidates of a batch are its frontier:
+        // only they may be dropped as unread
+        // (offload_admission_read_since_put), and with
+        // offload_evict_frontier_only only they are queued, in lease order,
+        // except that each frontier key whose push failed (and so stays a
+        // candidate, unpinned) passes its slot to the next oldest key past
+        // the frontier. Otherwise a store whose keys cannot be queued (full
+        // mailbox, no local disk, fence) could fill the frontier every cycle
+        // and keep every other store from being evicted.
         long evicted_this_pass = 0;
-        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
-            for (auto& c : batch) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch,
+                                         size_t frontier_end) {
+            WalkOrder order;
+            if (frontier_only && frontier_end > 0) {
+                order.Start(batch, 0, frontier_end);
+            }
+            for (size_t i = 0; i < batch.size(); ++i) {
                 if (stop_eviction_scan || stopping()) break;
                 // Stop once the target object count is reached. Grouped
                 // eviction is all-or-none, so evicting a group can overshoot
                 // evict_num by at most one group; using evict_num (rather than
                 // the per-object lease cutoff) bounds that overshoot and keeps
-                // the eviction ratio close to the target.
+                // the eviction ratio close to the target. (The rest of an
+                // ordered walk is not sorted for this.)
                 if (evicted_this_pass >= evict_num) {
-                    no_pin_objects.push_back(c.lease_timeout);
+                    no_pin_objects.push_back(
+                        batch[order.Covers(i) ? order.BatchIndex(i) : i]
+                            .lease_timeout);
                     continue;
                 }
+                offload_in_frontier = i < frontier_end;
+                unread_drop_allowed = offload_in_frontier;
+                offload_queue_allowed = true;
+                if (frontier_only && !offload_in_frontier) {
+                    offload_queue_allowed = offload_frontier_push_failed >
+                                            offload_queued_past_frontier;
+                    // The first slot passed on starts a lease-order walk of
+                    // the rest of the batch.
+                    if (offload_queue_allowed && !order.Covers(i)) {
+                        order.Start(batch, i, batch.size());
+                    }
+                }
+                const bool ordered = order.Covers(i);
+                if (ordered && offload_queue_allowed) {
+                    order.OrderUpTo(i);
+                }
+                auto& c = batch[ordered ? order.BatchIndex(i) : i];
                 auto evict_result = try_evict_group_or_object(
                     c.tenant_id, c.key, c.shard_idx,
                     /*allow_soft_pinned=*/false, deferred_replicas);
@@ -12464,7 +13382,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
         };
 
-        evict_candidate_batch(candidates);
+        evict_candidate_batch(candidates, frontier_size);
 
         // Metadata may change after the frontier is materialized. If the
         // reserve is exhausted before the target is met, refill from the
@@ -12476,9 +13394,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
-            evict_candidate_batch(refill_candidates);
+            // Every refill key is newer than the frontier.
+            evict_candidate_batch(refill_candidates, /*frontier_end=*/0);
         }
+        offload_queue_allowed = true;
     }
+
+    const long first_pass_no_local_disk_skipped = offload_no_local_disk_skipped;
 
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
@@ -12495,7 +13417,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
-    // evict_ratio_lowerbound.
+    // evict_ratio_lowerbound. Its keys are not in the frontier.
+    offload_queue_allowed = !frontier_only;
+    unread_drop_allowed = false;
+    offload_in_frontier = false;
     if (!stop_eviction_scan && target_evict_num > 0 && !stopping()) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
@@ -12565,6 +13490,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 const size_t shard_idx = (start_idx + i) % kNumShards;
                 {
                     std::vector<std::pair<TenantId, std::string>> to_evict;
+                    std::vector<bool> soft_pinned_to_evict;
                     {
                         MetadataShardAccessorRW shard(this, shard_idx);
                         for (auto tenant_it = shard->tenants.begin();
@@ -12577,17 +13503,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     !can_evict_replicas(it->second)) {
                                     continue;
                                 }
-                                if (!IsSoftPinActive(it->second, now) ||
+                                const bool soft_pinned =
+                                    IsSoftPinActive(it->second, now);
+                                if (!soft_pinned ||
                                     it->second.EvictionDeadline() <=
                                         soft_target_timeout) {
                                     to_evict.emplace_back(tenant_it->first,
                                                           it->first);
+                                    soft_pinned_to_evict.push_back(soft_pinned);
                                 }
                             }
                         }
                     }
-                    for (auto& c : to_evict) {
+                    for (size_t j = 0; j < to_evict.size(); ++j) {
+                        auto& c = to_evict[j];
                         if (target_evict_num <= 0 || stop_eviction_scan) break;
+                        // offload_evict_frontier_only: the first pass never
+                        // sees a soft-pinned key, so this pass is its only
+                        // chance to be queued. The soft-pinned keys here are
+                        // the oldest (deadline <= soft_target_timeout); the
+                        // others are of any age and are not queued.
+                        if (frontier_only) {
+                            offload_queue_allowed = soft_pinned_to_evict[j];
+                        }
                         auto evict_result = try_evict_group_or_object(
                             c.first, c.second, shard_idx,
                             /*allow_soft_pinned=*/true, deferred_replicas);
@@ -12651,6 +13589,17 @@ void MasterService::BatchEvict(double evict_ratio_target,
             << ", offload_deferred=" << offload_deferred_count
             << ", offload_cap_forced=" << offload_cap_forced_count
             << ", offload_push_failed_forced=" << offload_push_failed_forced
+            << (offload_evict_without_local_disk_
+                    ? ", offload_no_local_disk_evicted=" +
+                          std::to_string(offload_no_local_disk_evicted)
+                    : std::string())
+            << (frontier_only ? ", offload_beyond_frontier_kept=" +
+                                    std::to_string(offload_beyond_frontier_kept)
+                              : std::string())
+            << (offload_admission_read_since_put_
+                    ? ", offload_unread_evicted=" +
+                          std::to_string(offload_unread_evicted)
+                    : std::string())
             << ", total_freed_size=" << total_freed_size
             << ", eviction_base=" << total_eviction_base
             << ", actual_evict_ratio="
@@ -12687,11 +13636,33 @@ void MasterService::BatchEvict(double evict_ratio_target,
                      << ") reached; force-evicted " << offload_cap_forced_count
                      << " object(s) without disk offload this cycle.";
     }
+    if (offload_no_local_disk_evicted > 0) {
+        LOG(INFO) << "[EVICT] Evicted " << offload_no_local_disk_evicted
+                  << " object(s) without disk offload: their store has no "
+                     "LOCAL_DISK tier taking offloads "
+                     "(offload_evict_without_local_disk=true).";
+    }
     if (offload_push_failed_forced > 0) {
         LOG(WARNING) << "[EVICT] PushOffloadingQueue failed for "
                      << offload_push_failed_forced
                      << " object(s); force-evicted without disk offload "
                         "(offload_force_evict=true).";
+    }
+    if (offload_unread_evicted > 0) {
+        MasterMetricManager::instance().inc_offload_admission_unread_evicted(
+            offload_unread_evicted);
+    }
+    if (offload_stall_metrics_ && offload_on_evict_) {
+        const long second_pass_no_local_disk_skipped =
+            offload_no_local_disk_skipped - first_pass_no_local_disk_skipped;
+        MasterMetricManager::instance()
+            .set_offload_no_local_disk_skipped_objects(
+                std::max(first_pass_no_local_disk_skipped,
+                         second_pass_no_local_disk_skipped));
+        if (offload_no_local_disk_evicted > 0) {
+            MasterMetricManager::instance().inc_offload_no_local_disk_evicted(
+                offload_no_local_disk_evicted);
+        }
     }
 }
 

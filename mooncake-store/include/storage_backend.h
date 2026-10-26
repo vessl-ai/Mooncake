@@ -865,6 +865,23 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::vector<std::string>>& buckets_keys,
         std::vector<std::string>* deferred_keys = nullptr);
 
+    /**
+     * @brief Same grouping as AllocateOffloadingBuckets, but buckets are
+     * filled in the order of `offloading_objects` (keep_queue_order): each
+     * bucket takes the next keys of the list, and each bucket's keys keep
+     * that order. Keys must be unique. The ungrouped pool still leads the
+     * first bucket, as it holds the tail of the previous call.
+     */
+    tl::expected<void, ErrorCode> AllocateOffloadingBucketsInOrder(
+        const std::vector<std::pair<std::string, int64_t>>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys = nullptr);
+
+    // MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER.
+    bool KeepsQueueOrder() const {
+        return bucket_backend_config_.keep_queue_order;
+    }
+
     void ClearUngroupedOffloadingObjects();
 
     /**
@@ -958,6 +975,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::vector<std::string>>& buckets_keys,
         std::vector<std::string>* deferred_keys = nullptr);
 
+    // The grouping itself, walking `offloading_objects` (a map or an ordered
+    // list of key/size pairs) in its iteration order. Defined and
+    // instantiated in storage_backend.cpp only.
+    template <typename Objects>
+    tl::expected<void, ErrorCode> GroupOffloadingKeysInIterationOrder(
+        const Objects& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys,
+        std::vector<std::string>* deferred_keys);
+
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
@@ -1004,7 +1030,24 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        // Only with read_pending_eviction: counts the key reads this
+        // eviction served from its buckets before commit or restore. Also
+        // tags this eviction's entries in pending_eviction_reads_.
+        std::shared_ptr<std::atomic<int64_t>> pending_reads;
     };
+
+    // Where a key removed from the index by a prepared eviction can still be
+    // read. Holds the bucket metadata so a reader takes a BucketReadGuard on
+    // the same object FinalizeEviction waits on.
+    struct PendingEvictionRead {
+        StorageObjectMetadata metadata;
+        std::shared_ptr<BucketMetadata> bucket;
+        std::shared_ptr<std::atomic<int64_t>> pending_reads;
+    };
+
+    // Drops this eviction's entries from pending_eviction_reads_ and returns
+    // how many key reads they served. Caller holds mutex_ exclusively.
+    int64_t ForgetPendingEvictionReadsLocked(const PendingEviction& pending);
 
     /**
      * @brief Phase 1 of eviction: under exclusive lock, select and remove
@@ -1088,6 +1131,20 @@ class BucketStorageBackend : public StorageBackendInterface {
         test_datasync_failure_.store(enabled, std::memory_order_relaxed);
     }
 
+    // Test-only: keys a prepared eviction keeps readable
+    // (read_pending_eviction), i.e. entries of pending_eviction_reads_.
+    size_t PendingEvictionReadableKeysForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        return pending_eviction_reads_.size();
+    }
+
+    // Test-only: called by BatchLoad after it has taken its bucket read
+    // guards and released mutex_, before any file I/O. Set it before reads
+    // start; it is not synchronized with concurrent BatchLoad calls.
+    void SetBatchLoadAfterPlanHookForTest(std::function<void()> hook) {
+        test_batch_load_after_plan_hook_ = std::move(hook);
+    }
+
    private:
     void NotifyDiskError(int err, const char* op) const {
         if (err != 0 && disk_error_observer_) disk_error_observer_(err, op);
@@ -1095,6 +1152,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     DiskErrorObserver disk_error_observer_;
     std::atomic<bool> test_datasync_failure_{false};
+    std::function<void()> test_batch_load_after_plan_hook_;
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
 
@@ -1132,6 +1190,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
+    // Only filled with read_pending_eviction: keys of prepared evictions that
+    // BatchLoad may still read until CommitPreparedEviction or
+    // RestorePreparedEviction removes them.
+    std::unordered_map<std::string, PendingEvictionRead> GUARDED_BY(mutex_)
+        pending_eviction_reads_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
     int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
     int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;

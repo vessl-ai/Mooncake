@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <functional>
+#include <string>
 #include <utility>
 
 #include "master_service.h"
@@ -50,6 +53,65 @@ class MasterServiceTestPeer {
     // Drive one eviction cycle synchronously, without the periodic worker.
     void RunBatchEvictForTesting(double evict_ratio_target,
                                  double evict_ratio_lowerbound);
+
+    // offload_admission_second_put: zero the retired filter generation now
+    // (the eviction thread does it in slices). No-op when the mode is off.
+    void PrepareOffloadAdmissionSpareForTesting();
+
+    // offload_admission_second_put: AdmitEagerOffload for an existing key, as
+    // a PutEnd calls it (after the write's first End: that End's answer).
+    bool AdmitEagerOffloadForTesting(const std::string& key);
+
+    // The reuse sampler, or nullptr when enable_reuse_sampler is off.
+    ReuseSampler* GetReuseSamplerForTesting() const;
+
+    // Recompute the offload stall gauges synchronously.
+    void RunOffloadStallMetricsUpdateForTesting();
+
+    // ---- Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep).
+
+    // Called on the sweep thread before each shard step with the shard
+    // index, no lock held; it may block to pin an interleaving. Set it before
+    // the first unmount.
+    void SetDiskUnmountSweepShardHookForTesting(
+        std::function<void(size_t)> hook);
+
+    // Waits until no unmount sweep is pending. False on timeout.
+    bool WaitForDiskUnmountSweepsForTesting(std::chrono::milliseconds timeout);
+
+    bool DiskUnmountSweepPendingForTesting(const UUID& owner) const;
+
+    bool DiskUnmountSweepStoppingForTesting() const {
+        return service_.disk_unmount_sweep_stopping_.load();
+    }
+
+    bool AsyncDiskUnmountSweepEnabledForTesting() const {
+        return service_.async_disk_unmount_sweep_;
+    }
+
+    // Inserts a complete object of `size` bytes whose only replica is a
+    // LOCAL_DISK replica of `owner` (a disk-only object), with the shard and
+    // cache accounting a registration does. Bulk setup for scale tests; the
+    // owner must have a LOCAL_DISK registration.
+    void InsertDiskOnlyObjectForTesting(const std::string& key, uint64_t size,
+                                        const UUID& owner,
+                                        const std::string& endpoint);
+
+    // Lock holds summed over the shards of one synchronous owner sweep (the
+    // ClearLocalDiskHandlesOwnedBy predicate), for the benchmark.
+    struct OwnerSweepStats {
+        uint64_t keys_scanned = 0;
+        uint64_t removed_replicas = 0;
+        uint64_t scan_hold_ns = 0;
+        uint64_t max_scan_hold_ns = 0;
+        uint64_t batch_hold_ns = 0;
+        uint64_t max_batch_hold_ns = 0;
+    };
+    OwnerSweepStats SweepLocalDiskOwnerWithStatsForTesting(const UUID& owner);
+
+    // Drive the expiry sweep of every shard, as the eviction thread does once
+    // put_start_release_timeout_sec has passed, at the given time.
+    void RunDiscardExpiredForTesting(std::chrono::system_clock::time_point now);
 
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);

@@ -901,6 +901,15 @@ struct ClientMetric {
     // two are told apart by the scrape target's job/instance labels.
     ylt::metric::gauge_t build_info;
     MasterHeartbeatMetric master_heartbeat_metric;
+    // Fork-only: memory segments Client::UnmountMemorySegmentsForDrain took
+    // off the master. Serialized only once a drain has been called, so the
+    // default /metrics carries no such series.
+    ylt::metric::gauge_t memory_segments_drained;
+
+    void ReportMemorySegmentsDrained(size_t drained) {
+        memory_segments_drained.update(static_cast<int64_t>(drained));
+        memory_drain_reported_.store(true, std::memory_order_release);
+    }
 
     /**
      * @brief Creates a ClientMetric instance based on environment variables
@@ -946,6 +955,7 @@ struct ClientMetric {
     std::atomic<bool> should_stop_metrics_thread_{false};
     uint64_t metrics_interval_seconds_{0};
     bool bandwidth_reporting_enabled_{true};
+    std::atomic<bool> memory_drain_reported_{false};
     bool master_rpc_metrics_enabled_{true};
     std::mutex snapshot_mutex_;
     std::optional<TransferSnapshot> last_report_snapshot_;

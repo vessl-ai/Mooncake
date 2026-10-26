@@ -1325,6 +1325,67 @@ TEST_F(MasterServiceTenantQuotaTest, TenantEvictionWatermarkDefaultsToOn) {
         << "the pass must run without an explicit watermark setting";
 }
 
+// offload_admission_read_since_put on the tenant eviction path (INF-651):
+// an object nobody read is evicted without a disk copy, a read one is queued.
+// Off, offload_on_evict queues every candidate and frees nothing.
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionReadSincePutDropsOnlyUnreadObjects) {
+    const TenantId tenant("tenant-a");
+    for (const bool read_since_put : {false, true}) {
+        SCOPED_TRACE(read_since_put);
+        auto config = MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                /*watermark=*/std::nullopt,
+                                                /*eviction_ratio=*/0.05);
+        config.enable_offload = true;
+        config.offload_on_evict = true;
+        config.offload_admission_read_since_put = read_since_put;
+        MasterService service(config);
+        UUID client_id = MountSegment(service, /*size=*/4096);
+        ASSERT_TRUE(service.MountLocalDiskSegment(client_id, true));
+        ASSERT_TRUE(service.ReportSsdCapacity(client_id, 1LL << 30));
+        for (int i = 0; i < 4; ++i) {
+            PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                        240);
+        }
+        // key-0 and key-1 are read from memory.
+        for (int i = 0; i < 2; ++i) {
+            ASSERT_TRUE(
+                service.GetReplicaList("key-" + std::to_string(i), tenant));
+        }
+        const int64_t unread_before =
+            MasterMetricManager::instance()
+                .get_offload_admission_unread_evicted();
+
+        RunTenantEvictionPass(service);
+
+        auto taken = service.OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        for (const auto& item : taken.value()) {
+            if (read_since_put) {
+                EXPECT_TRUE(item.key == "key-0" || item.key == "key-1")
+                    << item.key;
+            }
+        }
+        const int64_t unread_evicted =
+            MasterMetricManager::instance()
+                .get_offload_admission_unread_evicted() -
+            unread_before;
+        if (read_since_put) {
+            EXPECT_GE(unread_evicted, 1);
+            EXPECT_LE(Snapshot(service, tenant).charged_bytes, 720u);
+            for (int i = 0; i < 2; ++i) {
+                EXPECT_TRUE(
+                    service.GetReplicaList("key-" + std::to_string(i), tenant))
+                    << i;
+            }
+        } else {
+            EXPECT_EQ(unread_evicted, 0);
+            EXPECT_EQ(taken->size(), 4u);
+            EXPECT_EQ(Snapshot(service, tenant).charged_bytes, 960u);
+        }
+    }
+}
+
 TEST_F(MasterServiceTenantQuotaTest,
        TenantEvictionWatermarkOfZeroDisablesThePass) {
     const TenantId tenant("tenant-a");

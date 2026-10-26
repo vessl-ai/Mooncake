@@ -36,6 +36,43 @@ bool CheckNeedsSyncfs(const char* op) {
     return op_name != "preadv" && op_name != "read";
 }
 
+// keep_queue_order: the drained objects in the order the master queued them.
+// The master draws an item's task id right before it queues the item, so the
+// sequence number of the id is the queue order; the items of one drain come
+// from one master (one id epoch). An item without an id sorts first, in drain
+// order. Each storage key appears once, with its size from `sizes` (the map
+// the default grouping walks).
+std::vector<std::pair<std::string, int64_t>> ObjectsInQueueOrder(
+    const std::vector<OffloadTaskItem>& items,
+    const std::unordered_map<std::string, int64_t>& sizes) {
+    std::vector<const OffloadTaskItem*> sorted;
+    sorted.reserve(items.size());
+    for (const auto& item : items) {
+        sorted.push_back(&item);
+    }
+    auto seq = [](const OffloadTaskItem* item) -> uint64_t {
+        return item->task_id.has_value() ? item->task_id->seq : 0;
+    };
+    std::stable_sort(
+        sorted.begin(), sorted.end(),
+        [&seq](const OffloadTaskItem* a, const OffloadTaskItem* b) {
+            return seq(a) < seq(b);
+        });
+    std::vector<std::pair<std::string, int64_t>> ordered;
+    ordered.reserve(sizes.size());
+    std::unordered_set<std::string> seen;
+    seen.reserve(sizes.size());
+    for (const auto* item : sorted) {
+        auto storage_key = TenantId(item->tenant_id).MakeScopedKey(item->key);
+        if (!seen.insert(storage_key).second) {
+            continue;
+        }
+        const int64_t size = sizes.at(storage_key);
+        ordered.emplace_back(std::move(storage_key), size);
+    }
+    return ordered;
+}
+
 }  // namespace
 
 FileStorage::DiskErrorAction FileStorage::ClassifyDiskErrno(int err) {
@@ -387,6 +424,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
     auto bucket_backend =
         std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    const bool keep_queue_order =
+        bucket_backend != nullptr && bucket_backend->KeepsQueueOrder();
 
     // Merge in tasks carried across a bucket deferral (see
     // deferred_task_by_storage_key_): the backend's ungrouped pool will
@@ -418,8 +457,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::vector<std::vector<std::string>> buckets_keys;
     std::vector<std::string> deferred_keys;
     if (bucket_backend) {
-        auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys, &deferred_keys);
+        auto allocate_res =
+            keep_queue_order
+                ? bucket_backend->AllocateOffloadingBucketsInOrder(
+                      ObjectsInQueueOrder(offloading_objects,
+                                          storage_object_sizes),
+                      buckets_keys, &deferred_keys)
+                : bucket_backend->AllocateOffloadingBuckets(
+                      storage_object_sizes, buckets_keys, &deferred_keys);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();

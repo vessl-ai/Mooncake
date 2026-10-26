@@ -641,4 +641,163 @@ TEST(MasterServiceOffloadScenarioTest,
         .Then(Objects(3, 15).NamedBy(key).AreReadable());
 }
 
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadOnEvictWithoutLocalDiskFreesMemoryWhenOptedIn) {
+    // The opt-in pair of OffloadOnEvictWithoutLocalDiskPreservesMemory: the
+    // store has no local disk, so the object is evicted as in eager mode and
+    // the write goes through, without offload_force_evict.
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_b3_" + std::to_string(index);
+    };
+    MasterServiceConfig config = PressureOffloadOnEvictConfig();
+    config.offload_evict_without_local_disk = true;
+    MasterScenario scenario(
+        "offload_evict_without_local_disk frees memory of a store without a "
+        "local disk",
+        config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(key(14)))
+        .Then(Objects(0, 3).NamedBy(key).DoNotExist())
+        .Then(Objects(3, 15).NamedBy(key).AreReadable());
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadOnEvictWithLocalDiskIgnoresTheOptIn) {
+    // With a local disk the opt-in changes nothing: eviction still queues
+    // instead of freeing, exactly as OffloadOnEvictQueuesInsteadOfFreeing.
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_b4_" + std::to_string(index);
+    };
+    MasterServiceConfig config = PressureOffloadOnEvictConfig();
+    config.offload_evict_without_local_disk = true;
+    MasterScenario scenario(
+        "offload_evict_without_local_disk keeps queueing on a store with a "
+        "local disk",
+        config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        // One eviction cycle, driven directly rather than waited for: it
+        // queues the copies and frees nothing.
+        .When(EvictMemory(1.0))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(OffloadHeartbeat("node").ExpectSomeTasks())
+        .Then(Objects(0, 14).NamedBy(key).AreReadable());
+}
+
+namespace {
+
+// Two 8-object stores, "disk" with a local disk and "nodisk" without, both
+// full of expired one-megabyte objects, so a 3 MB write fits nowhere.
+std::vector<std::string> MixedKeys(const std::string& prefix, size_t count) {
+    std::vector<std::string> keys;
+    for (size_t index = 0; index < count; ++index) {
+        keys.push_back(prefix + std::to_string(index));
+    }
+    return keys;
+}
+
+void GivenMixedStores(MasterScenario& scenario, const std::string& prefix) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto expired =
+        std::chrono::system_clock::now() - std::chrono::hours(1);
+    scenario.Given(MemoryNode("disk").Capacity(8 * kLargeObject))
+        .Given(MemoryNode("nodisk").Capacity(8 * kLargeObject))
+        .When(MountLocalDisk("disk"))
+        .Given(ObjectsSpec<>(MixedKeys(prefix + "d_", 7))
+                   .Size(kLargeObject)
+                   .By("disk")
+                   .CompleteOn("disk")
+                   .ExpiredFrom(expired))
+        .Given(ObjectsSpec<>(MixedKeys(prefix + "n_", 7))
+                   .Size(kLargeObject)
+                   .By("nodisk")
+                   .CompleteOn("nodisk")
+                   .ExpiredFrom(expired));
+}
+
+}  // namespace
+
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadOnEvictMixedStoresFreezeOnlyTheStoreWithoutLocalDisk) {
+    // Only the store with a disk frees memory, once its copies complete. The
+    // store without one keeps every object, and new writes land on the store
+    // that freed memory.
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    MasterScenario scenario(
+        "offload_on_evict frees only the store that has a local disk",
+        PressureOffloadOnEvictConfig());
+    GivenMixedStores(scenario, "mix_");
+    scenario
+        .When(PutStart("mix_new", 3 * kLargeObject)
+                  .By("disk")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(EvictMemory(1.0))
+        .When(CompleteOffload(MixedKeys("mix_d_", 7))
+                  .By("disk")
+                  .OnNode("disk")
+                  .OfSize(kLargeObject))
+        .When(EvictMemory(1.0));
+    for (const auto& key : MixedKeys("mix_d_", 7)) {
+        scenario.Then(Object(key).HasMemoryReplicas(0).HasLocalDiskReplicas(1));
+    }
+    for (const auto& key : MixedKeys("mix_n_", 7)) {
+        scenario.Then(Object(key).HasMemoryReplicas(1).HasLocalDiskReplicas(0));
+    }
+    scenario
+        .When(PutStart("mix_new", 3 * kLargeObject)
+                  .By("disk")
+                  .ExpectMemoryNodes({"disk"}))
+        .When(PutEnd("mix_new").By("disk"));
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadOnEvictMixedStoresEvictTheStoreWithoutLocalDiskWhenOptedIn) {
+    // With the opt-in the store without a disk is evicted as in eager mode,
+    // while the store with a disk still only queues.
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    MasterServiceConfig config = PressureOffloadOnEvictConfig();
+    config.offload_evict_without_local_disk = true;
+    MasterScenario scenario(
+        "offload_evict_without_local_disk evicts only the store without a "
+        "local disk",
+        config);
+    GivenMixedStores(scenario, "mixo_");
+    scenario.When(EvictMemory(1.0));
+    for (const auto& key : MixedKeys("mixo_n_", 7)) {
+        scenario.Then(Object(key).DoesNotExist());
+    }
+    for (const auto& key : MixedKeys("mixo_d_", 7)) {
+        scenario.Then(Object(key).HasMemoryReplicas(1).HasLocalDiskReplicas(0));
+    }
+    scenario
+        .When(PutStart("mixo_new", 3 * kLargeObject)
+                  .By("disk")
+                  .ExpectMemoryNodes({"nodisk"}))
+        .When(PutEnd("mixo_new").By("disk"))
+        .When(OffloadHeartbeat("disk").ExpectTasks(MixedKeys("mixo_d_", 7),
+                                                   kLargeObject));
+}
+
 }  // namespace mooncake::test

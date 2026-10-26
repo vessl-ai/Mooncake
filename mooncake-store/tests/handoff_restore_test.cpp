@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +20,7 @@
 #include "handoff/handoff_format.h"
 #include "handoff/handoff_writer.h"
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "tenant_quota_policy_store.h"
 
 namespace mooncake::test {
@@ -663,6 +667,192 @@ TEST_F(HandoffRestoreTest, L4StateIsRestoredAndGatedUntilTheOwnerShowsUp) {
     EXPECT_TRUE(HasDisk(master, "after", stores_[0].client_id));
 }
 
+// async_disk_unmount_sweep: a store unmounted its disk tier and the master
+// rolls while the background sweep of its replicas is still running. The
+// unmounted store is no longer registered, so the export drops its disk
+// replicas; nothing of the handed-back disk is readable on the new master.
+TEST_F(HandoffRestoreTest, L4UnmountSweepInProgressAtTheRollIsNotCarried) {
+    TempDir dir;
+    std::vector<std::string> leaving_disk_only;
+    std::vector<std::string> staying_disk_only;
+    for (int i = 0; i < 5; ++i) {
+        leaving_disk_only.push_back("leaving-disk-only-" + std::to_string(i));
+        staying_disk_only.push_back("staying-disk-only-" + std::to_string(i));
+    }
+    {
+        // Parks the sweep thread before its fourth shard step.
+        std::mutex mutex;
+        std::condition_variable cv;
+        size_t steps = 0;
+        bool released = false;
+        auto release = [&] {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                released = true;
+            }
+            cv.notify_all();
+        };
+        MasterServiceConfig config = MakeL4Config();
+        config.async_disk_unmount_sweep = true;
+        MasterService old_master(config);
+        struct Releaser {
+            std::function<void()> fn;
+            ~Releaser() { fn(); }
+        } release_on_exit{release};
+        MasterServiceTestPeer peer(old_master);
+        ASSERT_TRUE(peer.AsyncDiskUnmountSweepEnabledForTesting());
+        peer.SetDiskUnmountSweepShardHookForTesting([&](size_t) {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++steps;
+            cv.notify_all();
+            if (steps > 3) cv.wait(lock, [&] { return released; });
+        });
+        for (int s = 0; s < 2; ++s) {
+            Store store{generate_uuid(), {MakeSegment(s)}};
+            ASSERT_TRUE(
+                old_master.MountSegment(store.segments[0], store.client_id)
+                    .has_value());
+            stores_.push_back(store);
+            EnableL4(old_master, store);
+        }
+        for (int i = 0; i < 20; ++i) Put(old_master, stores_[0], Key(0, i));
+        ASSERT_EQ(Offload(old_master, stores_[0], "disk-0", 20).size(), 20u);
+        PutDiskOnly(old_master, stores_[0], leaving_disk_only, "disk-0");
+        PutDiskOnly(old_master, stores_[1], staying_disk_only, "disk-1");
+
+        ASSERT_TRUE(old_master.UnmountLocalDiskSegment(stores_[0].client_id)
+                        .has_value());
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(60),
+                                    [&] { return steps > 3; }));
+        }
+        // The roll quiesces the background work; the parked step is freed
+        // once the stop flag is set, so the sweep stops right there.
+        std::thread quiesce([&] { old_master.QuiesceBackgroundWork(); });
+        while (!peer.DiskUnmountSweepStoppingForTesting()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        release();
+        quiesce.join();
+        ASSERT_TRUE(
+            peer.DiskUnmountSweepPendingForTesting(stores_[0].client_id));
+        for (const auto& key : leaving_disk_only) {
+            EXPECT_FALSE(Readable(old_master, key)) << key;
+        }
+
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.local_disk_clients, 1u);
+        // Only the staying store's disk replicas are carried.
+        EXPECT_EQ(written.stats.local_disk_replicas, staying_disk_only.size());
+        EXPECT_EQ(written.stats.disk_only_objects, staying_disk_only.size());
+    }
+
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {3});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->local_disk_clients, 1u);
+    EXPECT_EQ(restored->local_disk_replicas, staying_disk_only.size());
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    ASSERT_TRUE(Remount(master, stores_[1]));
+
+    // The unmounted store's disk-only objects are gone; its objects with a
+    // memory copy come back with that copy only.
+    for (const auto& key : leaving_disk_only) {
+        auto r = master.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(r.has_value()) << key;
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+    for (int i = 0; i < 20; ++i) {
+        auto replicas = Replicas(master, Key(0, i));
+        ASSERT_EQ(replicas.size(), 1u) << Key(0, i);
+        EXPECT_TRUE(replicas[0].is_memory_replica());
+    }
+    // Its registration was not carried: its next heartbeat registers anew
+    // (and the store drops its files).
+    auto unmounted = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_FALSE(unmounted.has_value());
+    EXPECT_EQ(unmounted.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    // The staying store's disk-only objects open with its heartbeat.
+    ASSERT_TRUE(
+        master.OffloadObjectHeartbeat(stores_[1].client_id, true).has_value());
+    for (const auto& key : staying_disk_only) {
+        EXPECT_TRUE(HasDisk(master, key, stores_[1].client_id)) << key;
+    }
+}
+
+// The store preStop drain (Client::UnmountMemorySegmentsForDrain, then
+// /api/unmount_local_disk): a store took its memory segment off the master
+// and handed back its disk tier, and the master rolls before the store
+// process is gone. Nothing of that store is carried: the new master has
+// neither its segment nor any of its replicas, and the remount its
+// heartbeat sends (no segment, since the drained one is no longer the
+// client's) brings nothing back.
+TEST_F(HandoffRestoreTest, StoreDrainedBeforeTheRollIsNotCarried) {
+    TempDir dir;
+    {
+        MasterService old_master(MakeL4Config());
+        for (int s = 0; s < 2; ++s) {
+            Store store{generate_uuid(), {MakeSegment(s)}};
+            ASSERT_TRUE(
+                old_master.MountSegment(store.segments[0], store.client_id)
+                    .has_value());
+            stores_.push_back(store);
+            EnableL4(old_master, store);
+            for (int i = 0; i < 10; ++i) Put(old_master, store, Key(s, i));
+        }
+        // Half of the leaving store's objects also have a disk copy.
+        ASSERT_EQ(Offload(old_master, stores_[0], "disk-0", 5).size(), 5u);
+
+        ASSERT_TRUE(
+            old_master
+                .UnmountSegment(stores_[0].segments[0].id, stores_[0].client_id)
+                .has_value());
+        // Memory gone: only the disk copies are still named, and only
+        // until the disk tier is handed back.
+        size_t named = 0;
+        for (int i = 0; i < 10; ++i) {
+            if (Readable(old_master, Key(0, i))) ++named;
+        }
+        EXPECT_EQ(named, 5u);
+        ASSERT_TRUE(old_master.UnmountLocalDiskSegment(stores_[0].client_id)
+                        .has_value());
+        for (int i = 0; i < 10; ++i) {
+            EXPECT_FALSE(Readable(old_master, Key(0, i))) << Key(0, i);
+        }
+
+        // As the roll does: the memory segment's metadata sweep may or may
+        // not have run by now; the export must not carry its replicas
+        // either way.
+        old_master.QuiesceBackgroundWork();
+        auto written = Write(old_master, dir.path());
+        EXPECT_EQ(written.local_disk_clients, 1u);
+        EXPECT_EQ(written.stats.local_disk_replicas, 0u);
+    }
+
+    MasterService master(MakeL4Config());
+    auto restored = master.RestoreFromHandoff(dir.path(), {3});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    EXPECT_EQ(restored->segments, 1u);
+    EXPECT_EQ(restored->objects, 10u);
+    // The drained store's heartbeat remount carries no segment.
+    ASSERT_TRUE(master.ReMountSegment({}, stores_[0].client_id).has_value());
+    ASSERT_TRUE(Remount(master, stores_[1]));
+
+    for (int i = 0; i < 10; ++i) {
+        auto r = master.GetReplicaList(Key(0, i), TenantId::Default());
+        ASSERT_FALSE(r.has_value()) << Key(0, i);
+        EXPECT_EQ(r.error(), ErrorCode::OBJECT_NOT_FOUND);
+        EXPECT_TRUE(Readable(master, Key(1, i))) << Key(1, i);
+    }
+    auto leaving_segment = master.QuerySegments(stores_[0].segments[0].name);
+    EXPECT_TRUE(!leaving_segment.has_value() || leaving_segment->second == 0);
+    // Its disk tier was not carried either.
+    auto heartbeat = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+    ASSERT_FALSE(heartbeat.has_value());
+    EXPECT_EQ(heartbeat.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
 TEST_F(HandoffRestoreTest, L4GateOpensOnPing) {
     TempDir dir;
     WriteL4Snapshot(dir.path());
@@ -756,6 +946,77 @@ TEST_F(HandoffRestoreTest, L4SnapshotNeedsOffloadOnTheNewMaster) {
     EXPECT_NE(restored.error().find("offload is disabled"), std::string::npos)
         << restored.error();
     ExpectEmpty(master);
+}
+
+// Offload admission state (INF-651 C4-1) is not in the snapshot. A restored
+// object counts as read, so offload_admission_read_since_put offloads it at
+// eviction as plain offload_on_evict would. The second-put filter starts
+// empty, so a key put once before the roll is a first put again.
+TEST_F(HandoffRestoreTest, OffloadAdmissionStateIsNotCarried) {
+    auto unread = [](MasterService& service, const std::string& key) {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists()) << key;
+        return accessor.Exists() &&
+               accessor.Get().unread_since_put.load(std::memory_order_relaxed);
+    };
+    {
+        auto config = MakeL4Config();
+        config.offload_on_evict = true;
+        config.offload_admission_read_since_put = true;
+        TempDir dir;
+        {
+            MasterService old_master(config);
+            Populate(old_master, 1, 20);
+            for (int i = 0; i < 20; ++i) {
+                EXPECT_TRUE(unread(old_master, Key(0, i)));
+            }
+            Write(old_master, dir.path());
+        }
+        MasterService master(config);
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+        ASSERT_TRUE(Remount(master, stores_[0]));
+        for (int i = 0; i < 20; ++i) {
+            EXPECT_FALSE(unread(master, Key(0, i)));
+        }
+        Put(master, stores_[0], "after-roll");
+        EXPECT_TRUE(unread(master, "after-roll"));
+    }
+    stores_.clear();
+    {
+        auto config = MakeL4Config();
+        config.offload_admission_second_put = true;
+        config.offload_admission_window_puts = 1024;
+        TempDir dir;
+        {
+            MasterService old_master(config);
+            Populate(old_master, 1, 20);  // first puts: nothing queued
+            Write(old_master, dir.path());
+        }
+        MasterService master(config);
+        ASSERT_TRUE(master.RestoreFromHandoff(dir.path(), {2}).has_value());
+        ASSERT_TRUE(Remount(master, stores_[0]));
+        EnableL4(master, stores_[0]);
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE(master.Remove(Key(0, i), TenantId::Default(),
+                                      /*force=*/true));
+            Put(master, stores_[0], Key(0, i));
+        }
+        // The new master never saw the old puts: these are first puts.
+        auto taken = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_TRUE(taken->empty());
+        // The next put of each key is written.
+        for (int i = 0; i < 20; ++i) {
+            ASSERT_TRUE(master.Remove(Key(0, i), TenantId::Default(),
+                                      /*force=*/true));
+            Put(master, stores_[0], Key(0, i));
+        }
+        taken = master.OffloadObjectHeartbeat(stores_[0].client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        EXPECT_EQ(taken->size(), 20u);
+    }
 }
 
 TEST_F(HandoffRestoreTest, OlderSchemasAreRefused) {
@@ -1655,6 +1916,109 @@ TEST_F(HandoffRestoreTest, RollCarriesNoOffloadStateAndRefusesOldReports) {
                     .has_value());
     for (int i = 1; i < 5; ++i) {
         EXPECT_TRUE(HasDisk(master, Key(0, i), stores_[0].client_id)) << i;
+    }
+}
+
+TEST_F(HandoffRestoreTest, OffloadOnEvictTaskIsQueuedAgainAfterTheRoll) {
+    // offload_on_evict: eviction, not PutEnd, queues the offload. The store
+    // takes the tasks and is still copying when the old master stops. No
+    // offload state crosses the roll, so on the new master the objects are
+    // unpinned memory objects; the old takes' reports are refused, and the
+    // next eviction queues new tasks of the new master's epoch. If the store
+    // NACKs them (it keeps the file of the refused report and skips a key it
+    // already holds: the orphan), every cycle queues them again and their
+    // memory is never freed. A copy reported for the new task registers, and
+    // the cycle after frees the memory.
+    const auto config = [] {
+        MasterServiceConfig c = MakeL4Config();
+        c.offload_on_evict = true;
+        c.default_kv_lease_ttl = 0;
+        return c;
+    };
+    const auto evict = [](MasterService& service) {
+        MasterServiceTestPeer(service).RunBatchEvictForTesting(1.0, 1.0);
+    };
+    const auto has_memory = [](MasterService& service, const std::string& key) {
+        for (const auto& d : Replicas(service, key)) {
+            if (d.is_memory_replica()) return true;
+        }
+        return false;
+    };
+    constexpr int kKeys = 3;
+    TempDir dir;
+    std::vector<OffloadTaskItem> old_taken;
+    uint64_t old_epoch = 0;
+    {
+        MasterService old_master(config());
+        old_epoch = old_master.L4TaskEpoch();
+        Store store{generate_uuid(), {MakeSegment(0)}};
+        ASSERT_TRUE(old_master.MountSegment(store.segments[0], store.client_id)
+                        .has_value());
+        stores_.push_back(store);
+        EnableL4(old_master, store);
+        for (int i = 0; i < kKeys; ++i) Put(old_master, store, Key(0, i));
+        auto at_put_end =
+            old_master.OffloadObjectHeartbeat(store.client_id, true);
+        ASSERT_TRUE(at_put_end.has_value());
+        ASSERT_TRUE(at_put_end->empty());
+        evict(old_master);
+        auto taken = old_master.OffloadObjectHeartbeat(store.client_id, true);
+        ASSERT_TRUE(taken.has_value());
+        ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys));
+        old_taken = *taken;
+        Write(old_master, dir.path());
+    }
+
+    MasterService master(config());
+    ASSERT_NE(master.L4TaskEpoch(), old_epoch);
+    auto restored = master.RestoreFromHandoff(dir.path(), {1});
+    ASSERT_TRUE(restored.has_value()) << restored.error();
+    ASSERT_TRUE(Remount(master, stores_[0]));
+    const UUID client = stores_[0].client_id;
+
+    for (const auto& item : old_taken) {
+        ASSERT_TRUE(
+            master.NotifyOffloadSuccess(client, {item}, {DiskMeta("disk-0")})
+                .has_value());
+    }
+    for (int i = 0; i < kKeys; ++i) {
+        EXPECT_FALSE(HasDisk(master, Key(0, i), client)) << i;
+        EXPECT_TRUE(has_memory(master, Key(0, i))) << i;
+    }
+
+    std::vector<OffloadTaskItem> previous;
+    for (int round = 0; round < 2; ++round) {
+        evict(master);
+        auto taken = master.OffloadObjectHeartbeat(client, true);
+        ASSERT_TRUE(taken.has_value());
+        ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys)) << round;
+        for (const auto& item : *taken) {
+            ASSERT_TRUE(item.task_id.has_value());
+            EXPECT_EQ(item.task_id->epoch, master.L4TaskEpoch());
+            for (const auto& old : previous) {
+                if (old.key == item.key) EXPECT_NE(*old.task_id, *item.task_id);
+            }
+        }
+        previous = *taken;
+        StorageObjectMetadata nack;
+        nack.data_size = -1;
+        std::vector<StorageObjectMetadata> nacks(taken->size(), nack);
+        ASSERT_TRUE(master.NotifyOffloadSuccess(client, *taken, nacks));
+        for (int i = 0; i < kKeys; ++i) {
+            EXPECT_TRUE(has_memory(master, Key(0, i))) << i;
+        }
+    }
+
+    evict(master);
+    auto taken = master.OffloadObjectHeartbeat(client, true);
+    ASSERT_TRUE(taken.has_value());
+    ASSERT_EQ(taken->size(), static_cast<size_t>(kKeys));
+    std::vector<StorageObjectMetadata> metas(taken->size(), DiskMeta("disk-0"));
+    ASSERT_TRUE(master.NotifyOffloadSuccess(client, *taken, metas));
+    evict(master);
+    for (int i = 0; i < kKeys; ++i) {
+        EXPECT_TRUE(HasDisk(master, Key(0, i), client)) << i;
+        EXPECT_FALSE(has_memory(master, Key(0, i))) << i;
     }
 }
 

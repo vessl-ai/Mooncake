@@ -44,8 +44,10 @@
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
+#include "offload_admission_filter.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "reuse_sampler.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
@@ -721,6 +723,10 @@ class MasterService {
      * registration and writes the replica inside one shared-lock section,
      * which therefore falls entirely before the deregistration (registered,
      * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     *
+     * With async_disk_unmount_sweep the call returns right after the
+     * deregistration and the sweep runs in the background; the replicas are
+     * unreadable from the return on (see DiskUnmountSweepJob).
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -1139,6 +1145,30 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    // Ghost-key reuse-age sampler hooks (enable_reuse_sampler). Callers
+    // check reuse_sampler_ first, so with the sampler off each hook costs one
+    // branch. The sampler's own locks are leaf locks, so the eviction hooks
+    // may run while a metadata shard lock is held.
+    //
+    // A reference (ExistKey with lease, GetReplicaList, PutStart) of `key`.
+    // `op` is the metric label: "exist", "get" or "put_start".
+    void SampleReuseReference(const TenantId& tenant_id,
+                              const std::string& user_key, const char* op);
+    // An eviction just freed memory replicas of `metadata`. Records a ghost
+    // when no memory replica is left.
+    void SampleMemoryEviction(const TenantId& tenant_id,
+                              const std::string& user_key,
+                              const ObjectMetadata& metadata);
+    // A disk eviction removed the last replica of `metadata`.
+    void SampleDiskEviction(const TenantId& tenant_id,
+                            const std::string& user_key,
+                            const ObjectMetadata& metadata);
+
+    // Recomputes the offload stall gauges by walking every shard's offload
+    // tasks (enable_offload_stall_metrics). Takes snapshot_mutex_ shared and
+    // each metadata shard lock in turn.
+    void UpdateOffloadStallMetrics();
+
     // Background pass: evict any tenant that is over its own watermark down to
     // (watermark - eviction_ratio) of its effective quota. Called from
     // EvictionThreadFunc, and a no-op unless multi-tenancy and
@@ -1179,6 +1209,22 @@ class MasterService {
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    // Lock holds and removals of one ClearStaleHandlesInShard call.
+    struct StaleHandleShardStats {
+        uint64_t keys_scanned = 0;
+        uint64_t removed_replicas = 0;
+        uint64_t scan_hold_ns = 0;       // pass 1, shard lock shared
+        uint64_t max_batch_hold_ns = 0;  // pass 2, longest exclusive hold
+        uint64_t batch_hold_ns = 0;      // pass 2, all exclusive holds
+    };
+    // One shard of ClearStaleHandles. `on_removed` (optional) sees each
+    // replica the shard's cleanup removes, before it is erased; `stats`
+    // (optional) gets the shard's lock holds. With HA oplog the cleanup is
+    // only persisted here, so neither callback nor counts see it.
+    std::optional<ErrorCode> ClearStaleHandlesInShard(
+        size_t shard_index, const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const Replica&)>* on_removed = nullptr,
+        StaleHandleShardStats* stats = nullptr);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     bool ShouldSkipSnapshotForClientOffboarding() const {
         return client_offboarding_worker_.HasPending();
@@ -1637,6 +1683,15 @@ class MasterService {
                           const std::string& writer_host_id)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
+    // --placement_key_hrw: when the config names a placement key
+    // (placement_key.h), rebuilds `preferred_segments` with each key replaced
+    // by the serving segments in its HRW order. Leaves it unchanged
+    // otherwise. Called under the allocator access of AllocateReplicas.
+    void ExpandPlacementKeys(
+        const ReplicateConfig& config,
+        const ScopedAllocatorAccess& allocator_access,
+        std::vector<std::string>& preferred_segments) const;
+
     auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
                         const std::string& key, uint64_t value_length,
                         const ReplicateConfig& config,
@@ -1695,6 +1750,23 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
+    // offload_admission_read_since_put: a read served from memory clears the
+    // object's unread mark. Loads first so that a hot object's cache line is
+    // not written on every read.
+    static void MarkReadFromMemory(const ObjectMetadata& metadata) {
+        if (metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            metadata.unread_since_put.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // offload_admission_second_put: whether a PutEnd may queue its eager
+    // offload. True when the mode is off. Otherwise the first call of a write
+    // records the put in the admission filter, answers whether the key was
+    // put before and keeps the answer in `metadata`; a later call of the same
+    // write (metadata.eager_offload_judged) returns that kept answer.
+    bool AdmitEagerOffload(const ObjectIdentity& object_id,
+                           ObjectMetadata& metadata);
+
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
     // appended to it on success.
@@ -1740,6 +1812,64 @@ class MasterService {
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
     const bool enable_async_segment_cleanup_;
+
+    // ---- Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep).
+    //
+    // With it on, UnmountLocalDiskSegment drops the registration and records
+    // the owner here in the same snapshot_mutex_ (exclusive) section, then
+    // returns; disk_unmount_sweep_worker_ erases the owner's replicas. Until
+    // an owner's sweep has visited every shard after its unmount:
+    //   - its LOCAL_DISK replicas are never readable
+    //     (TryGetReadableReplicaDescriptor), so no reader is sent to a disk
+    //     the store has handed back;
+    //   - PutStart, UpsertStart and Remove treat them as stale;
+    //   - the same client cannot mount a LOCAL_DISK tier again
+    //     (MountLocalDiskSegment refuses with UNAVAILABLE_IN_CURRENT_STATUS),
+    //     so a new registration never coexists with replicas of the old one,
+    //     exactly as after the synchronous sweep.
+    // No replica of an unregistered owner can be added (NotifyOffloadSuccess
+    // checks the registration under snapshot_mutex_), so a sweep that has
+    // visited every shard once has erased them all.
+    struct DiskUnmountSweepJob {
+        UUID owner;
+        std::chrono::steady_clock::time_point started;
+        size_t shards_left = kNumShards;
+        uint64_t removed_replicas = 0;
+        uint64_t max_scan_hold_ns = 0;
+        uint64_t max_batch_hold_ns = 0;
+    };
+    // True when async_disk_unmount_sweep is on and effective (offload on;
+    // HA, snapshot and CXL off, as for enable_async_segment_cleanup_).
+    bool async_disk_unmount_sweep_{false};
+    // --placement_key_hrw (fork-only, default off; placement_key.h).
+    bool placement_key_hrw_{false};
+    // Guards disk_unmount_sweep_jobs_. A leaf lock: taken under shard locks
+    // (readers) and under snapshot_mutex_ (unmount, mount); nothing is
+    // acquired while it is held.
+    mutable std::shared_mutex disk_unmount_sweep_mutex_;
+    std::condition_variable_any disk_unmount_sweep_cv_;
+    std::vector<DiskUnmountSweepJob> disk_unmount_sweep_jobs_;
+    // Fast path for readers: number of entries in disk_unmount_sweep_jobs_.
+    std::atomic<size_t> disk_unmount_sweep_owner_count_{0};
+    std::atomic<bool> disk_unmount_sweep_stopping_{false};
+    // Next shard the worker visits; only the worker thread touches it.
+    size_t disk_unmount_sweep_cursor_{0};
+    // Test hook: called on the worker thread before each shard step, with
+    // the shard index, no lock held.
+    std::function<void(size_t)> disk_unmount_sweep_shard_hook_;
+    BackgroundWorker disk_unmount_sweep_worker_;
+
+    // True if `owner`'s unmount sweep is pending.
+    bool DiskUnmountSweepPending(const UUID& owner) const;
+    // True for a LOCAL_DISK replica whose owner's unmount sweep is pending.
+    bool IsDiskReplicaOfSweepingOwner(const Replica& replica) const;
+    // True when every replica of the object is REMOVED or hidden by a pending
+    // unmount sweep: readers then get OBJECT_NOT_FOUND, as after the
+    // synchronous sweep. Always false with the flag off.
+    bool OnlyReplicasOfSweepingOwners(const ObjectMetadata& metadata) const;
+    // Worker body: visits shards until no sweep is pending or it stops.
+    void RunDiskUnmountSweeps();
+    void PublishDiskUnmountSweepProgressLocked() const;
 
     /**
      * @brief Mirror of PushOffloadingQueue for promotion-on-hit. Inserts an
@@ -1842,6 +1972,14 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // offload_admission_second_put: bytes the eviction thread zeroes per
+    // iteration while preparing the next filter generation (a 256 MiB
+    // generation at the default window takes 8 iterations).
+    // Upper bound of offload_admission_window_puts (24 bytes per window put:
+    // 6 GiB).
+    static constexpr size_t kMaxOffloadAdmissionWindowPuts = 1ULL << 28;
+    static constexpr size_t kOffloadAdmissionPrepareBytesPerIteration =
+        32ULL * 1024 * 1024;
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
     // The eviction thread wakes every 10 ms, but the tenant pass has to walk
@@ -2261,6 +2399,35 @@ class MasterService {
     // exceeded (config: offload_force_evict, only effective when
     // offload_on_evict_=true)
     bool offload_force_evict_{false};
+    // Evict-without-disk: with offload_on_evict, evict a key at once (no
+    // disk copy, as the eager mode does) when its offload push fails because
+    // the owning store has no LOCAL_DISK tier taking offloads. Other push
+    // failures still skip the key. (config: offload_evict_without_local_disk,
+    // only effective when offload_on_evict_=true)
+    bool offload_evict_without_local_disk_{false};
+    // Frontier-only offload: with offload_on_evict, BatchEvict queues
+    // offloads only for its eviction frontier (the oldest-lease candidates the
+    // target asks for), walked from the oldest lease. Other keys a cycle
+    // visits are freed only when they already have a disk copy. (config:
+    // offload_evict_frontier_only, only effective when offload_on_evict_=true)
+    bool offload_evict_frontier_only_{false};
+    // Second-put admission: in eager mode PutEnd queues an offload only for a
+    // key the filter has seen put before. Null when off. (config:
+    // offload_admission_second_put, offload_admission_window_puts,
+    // offload_admission_bloom_filter; only with enable_offload_ and
+    // offload_on_evict_=false)
+    std::unique_ptr<OffloadAdmissionFilter> offload_admission_filter_;
+    // Read-since-put admission: with offload_on_evict, eviction drops
+    // without a disk copy an object marked unread_since_put. (config:
+    // offload_admission_read_since_put, only with offload_on_evict_=true)
+    bool offload_admission_read_since_put_{false};
+
+    // Offload stall metrics (config: enable_offload_stall_metrics).
+    bool offload_stall_metrics_{false};
+
+    // Ghost-key reuse-age sampler (config: enable_reuse_sampler). Null when
+    // off; set once in the constructor and never changed.
+    std::unique_ptr<ReuseSampler> reuse_sampler_;
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.
