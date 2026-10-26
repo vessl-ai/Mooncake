@@ -7,6 +7,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "offload_read_guard.h"
+#include "offload_read_miss_evictor.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
 
@@ -95,6 +96,11 @@ class FileStorage {
 
     // The read guard (config_.offload_read_deadline_ms > 0), else nullptr.
     const OffloadReadGuard* read_guard() const { return read_guard_.get(); }
+    // The read-miss evictor (read guard on and
+    // config_.offload_read_miss_evict), else nullptr.
+    const OffloadReadMissEvictor* read_miss_evictor() const {
+        return read_miss_evictor_.get();
+    }
 
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
@@ -247,6 +253,13 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
         const std::vector<std::string>& evicted_keys);
+
+    // The read-miss evictor's master call: drops this store's LOCAL_DISK
+    // replicas of `storage_keys` like NotifyEvictedDiskReplicas, but without
+    // a log line per key (a master outage fails every key of the batch).
+    // Returns the first error other than OBJECT_NOT_FOUND.
+    tl::expected<void, ErrorCode> DropDiskReplicasAfterReadMiss(
+        const std::vector<std::string>& storage_keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
@@ -419,6 +432,14 @@ class FileStorage {
     // Bounds BatchGet (peer offload reads) when configured. Reset first in
     // the destructor: its late reads release buffers through this object.
     std::unique_ptr<OffloadReadGuard> read_guard_;
+    // Test-only replacement for DropDiskReplicasAfterReadMiss in the
+    // read-miss evictor. Set before the first BatchGet.
+    std::function<tl::expected<void, ErrorCode>(
+        const std::vector<std::string>&)>
+        test_read_miss_evict_;
+    // Drops the master's LOCAL_DISK replicas of keys whose guarded read
+    // failed. Reset in the destructor before the client goes away.
+    std::unique_ptr<OffloadReadMissEvictor> read_miss_evictor_;
 
     tl::expected<BatchGetResult, ErrorCode> BatchGetUnguarded(
         const std::vector<std::string>& keys,

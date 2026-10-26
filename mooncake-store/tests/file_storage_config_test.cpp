@@ -75,6 +75,7 @@ struct FileStorageEnvironment {
     ScopedEnvVar offload_read_deadline{"MOONCAKE_OFFLOAD_READ_DEADLINE_MS"};
     ScopedEnvVar offload_read_shed{"MOONCAKE_OFFLOAD_READ_SHED_MS"};
     ScopedEnvVar offload_read_threads{"MOONCAKE_OFFLOAD_READ_THREADS"};
+    ScopedEnvVar offload_read_miss_evict{"MOONCAKE_OFFLOAD_READ_MISS_EVICT"};
     ScopedEnvVar offload_read_parallelism{"MOONCAKE_OFFLOAD_READ_PARALLELISM"};
     ScopedEnvVar offload_read_io_threads{"MOONCAKE_OFFLOAD_READ_IO_THREADS"};
 };
@@ -98,6 +99,7 @@ void ExpectDefaultFileStorageConfig(const FileStorageConfig& config) {
     EXPECT_EQ(config.offload_read_deadline_ms, 0u);
     EXPECT_EQ(config.offload_read_shed_ms, 5000u);
     EXPECT_EQ(config.offload_read_threads, 64u);
+    EXPECT_FALSE(config.offload_read_miss_evict);
     EXPECT_EQ(config.offload_read_parallelism, 1u);
     EXPECT_EQ(config.offload_read_io_threads, 64u);
 }
@@ -182,6 +184,25 @@ TEST_F(FileStorageConfigTest, ReadsOffloadReadGuardValues) {
     // The guard's limits only matter while it is on.
     config.offload_read_threads = 0;
     config.offload_read_deadline_ms = 0;
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST_F(FileStorageConfigTest, ReadsOffloadReadMissEvict) {
+    env.offload_read_miss_evict.Set("true");
+    EXPECT_TRUE(FileStorageConfig::FromEnvironment().offload_read_miss_evict);
+    env.offload_read_miss_evict.Set("false");
+    EXPECT_FALSE(FileStorageConfig::FromEnvironment().offload_read_miss_evict);
+    env.offload_read_miss_evict.Set("1");
+    EXPECT_TRUE(FileStorageConfig::FromEnvironment().offload_read_miss_evict);
+    // Strict parsing, as for MOONCAKE_OFFLOAD_USE_URING: other words keep the
+    // default (off).
+    env.offload_read_miss_evict.Set("yes");
+    EXPECT_FALSE(FileStorageConfig::FromEnvironment().offload_read_miss_evict);
+
+    // Without the read deadline it does nothing, which is not an error.
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path.string();
+    config.offload_read_miss_evict = true;
     EXPECT_TRUE(config.Validate());
 }
 

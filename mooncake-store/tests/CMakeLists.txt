@@ -319,6 +319,8 @@ add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(file_storage_config_test file_storage_config_test.cpp)
 add_store_test(offload_read_guard_test offload_read_guard_test.cpp)
+add_store_test(offload_read_miss_evictor_test
+               offload_read_miss_evictor_test.cpp)
 add_store_test(fileread_worker_pool_config_test
                fileread_worker_pool_config_test.cpp)
 add_store_test(fileread_worker_pool_test fileread_worker_pool_test.cpp)
