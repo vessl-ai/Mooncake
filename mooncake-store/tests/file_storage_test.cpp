@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <unordered_set>
 #include <string>
 #include <thread>
@@ -325,6 +326,7 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_READ_DEADLINE_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_READ_SHED_MS");
         UnsetEnv("MOONCAKE_OFFLOAD_READ_THREADS");
+        UnsetEnv("MOONCAKE_OFFLOAD_READ_MISS_EVICT");
         UnsetEnv("MOONCAKE_DISTRIBUTED_FS_TYPE");
         UnsetEnv("MOONCAKE_DFS_FS_ADAPTER");
         UnsetEnv("MOONCAKE_DISTRIBUTED_ROOT_DIR");
@@ -566,6 +568,14 @@ class FileStorageTest : public ::testing::Test {
         FileStorage& fileStorage) {
         return std::dynamic_pointer_cast<BucketStorageBackend>(
             fileStorage.storage_backend_);
+    }
+
+    // Replaces the master call of the read-miss evictor.
+    static void SetReadMissEvictHook(
+        FileStorage& fileStorage, std::function<tl::expected<void, ErrorCode>(
+                                      const std::vector<std::string>&)>
+                                      hook) {
+        fileStorage.test_read_miss_evict_ = std::move(hook);
     }
 
     // Offload read buffers not yet released (BatchGet results waiting for
@@ -1554,6 +1564,190 @@ TEST_F(FileStorageTest, BatchGetWithoutReadDeadlineWaitsForTheDisk) {
     EXPECT_FALSE(
         HasSample(metrics_text, "mooncake_ssd_read_deadline_miss_total"));
     EXPECT_FALSE(HasSample(metrics_text, "mooncake_ssd_read_shed_total"));
+}
+
+// With offload_read_miss_evict, the keys of a read that missed the deadline
+// and of a read that was shed are handed to the master call that drops this
+// store's LOCAL_DISK replicas. Only master metadata changes: the bytes stay
+// on the disk, so a reader that already had the disk replica (and read it
+// after the eviction) still gets the data. A read that succeeds evicts
+// nothing.
+TEST_F(FileStorageTest, BatchGetReadMissEvictDropsTheKeysOfFailedReads) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool gate_open = false;
+    std::atomic<int> disk_reads{0};
+    std::mutex evicted_mutex;
+    std::vector<std::vector<std::string>> evicted;
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    config.offload_read_deadline_ms = 1000;
+    config.offload_read_shed_ms = 300;
+    config.offload_read_threads = 2;
+    config.offload_read_miss_evict = true;
+    SsdMetric metric;
+    FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
+    ASSERT_NE(fileStorage.read_miss_evictor(), nullptr);
+    SetReadMissEvictHook(fileStorage,
+                         [&](const std::vector<std::string>& k)
+                             -> tl::expected<void, ErrorCode> {
+                             std::lock_guard<std::mutex> lock(evicted_mutex);
+                             evicted.push_back(k);
+                             return {};
+                         });
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    // Opens the gate if an assertion returns early, so the store's
+    // destructor does not wait forever for the parked read.
+    std::shared_ptr<void> open_gate_on_exit(nullptr, [&](void*) {
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            gate_open = true;
+        }
+        gate_cv.notify_all();
+    });
+    auto evicted_keys = [&] {
+        std::lock_guard<std::mutex> lock(evicted_mutex);
+        std::multiset<std::string> all;
+        for (const auto& batch : evicted)
+            all.insert(batch.begin(), batch.end());
+        return all;
+    };
+    const std::multiset<std::string> once(keys.begin(), keys.end());
+
+    // A successful read evicts nothing.
+    auto first = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(first->batch_id));
+
+    auto backend = BucketBackendOf(fileStorage);
+    ASSERT_NE(backend, nullptr);
+    backend->SetBatchLoadAfterPlanHookForTest([&] {
+        ++disk_reads;
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return gate_open; });
+    });
+
+    // Deadline miss: every key of the read is evicted, once.
+    auto late = fileStorage.BatchGet(keys, sizes);
+    ASSERT_FALSE(late);
+    EXPECT_EQ(late.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ASSERT_TRUE(WaitUntil([&] { return disk_reads.load() == 1; }));
+    ASSERT_TRUE(WaitUntil([&] { return evicted_keys() == once; }));
+    EXPECT_EQ(metric.ssd_read_miss_evict_keys.value(),
+              static_cast<int64_t>(keys.size()));
+
+    // Shed: the keys are queued again (the master then finds no replica of
+    // this store: OBJECT_NOT_FOUND if the object is gone, a no-op if another
+    // replica is left; the store ignores both).
+    auto shed = fileStorage.BatchGet(keys, sizes);
+    ASSERT_FALSE(shed);
+    EXPECT_EQ(disk_reads.load(), 1);
+    ASSERT_TRUE(
+        WaitUntil([&] { return evicted_keys().size() == 2 * keys.size(); }));
+    EXPECT_EQ(metric.ssd_read_miss_evict_keys.value(),
+              static_cast<int64_t>(2 * keys.size()));
+    EXPECT_EQ(metric.ssd_read_miss_evict_dropped_keys.value(), 0);
+
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(WaitUntil(
+        [&] { return fileStorage.read_guard()->late_running() == 0; }));
+    ASSERT_TRUE(WaitUntil([&] {
+        return !fileStorage.read_guard()->ShouldShed(
+            OffloadReadGuard::Clock::now());
+    }));
+
+    // The store kept the bytes: a reader that holds the old disk replica
+    // still reads the data, and that successful read evicts nothing more.
+    auto ok = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(ok->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(std::string(reinterpret_cast<char*>(ok->pointers[i]),
+                              static_cast<size_t>(sizes[i])),
+                  batch_data.at(keys[i]));
+    }
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(ok->batch_id));
+    EXPECT_EQ(evicted_keys().size(), 2 * keys.size());
+    for (const auto& key : keys) {
+        auto exists = fileStorage.Exists(key);
+        ASSERT_TRUE(exists);
+        EXPECT_TRUE(exists.value());
+    }
+
+    std::string metrics_text;
+    metric.serialize(metrics_text);
+    EXPECT_TRUE(
+        HasSample(metrics_text, "mooncake_ssd_read_miss_evict_keys_total"));
+}
+
+// Off by default: with the read guard on and offload_read_miss_evict unset,
+// a failed read evicts nothing and the evictor's metrics are not exported.
+TEST_F(FileStorageTest, BatchGetReadMissEvictIsOffByDefault) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool gate_open = false;
+    std::atomic<int> evict_calls{0};
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    config.offload_read_deadline_ms = 300;
+    config.offload_read_shed_ms = 100;
+    config.offload_read_threads = 2;
+    ASSERT_FALSE(config.offload_read_miss_evict);
+    SsdMetric metric;
+    FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
+    EXPECT_EQ(fileStorage.read_miss_evictor(), nullptr);
+    SetReadMissEvictHook(
+        fileStorage,
+        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            ++evict_calls;
+            return {};
+        });
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    std::shared_ptr<void> open_gate_on_exit(nullptr, [&](void*) {
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            gate_open = true;
+        }
+        gate_cv.notify_all();
+    });
+    auto backend = BucketBackendOf(fileStorage);
+    ASSERT_NE(backend, nullptr);
+    backend->SetBatchLoadAfterPlanHookForTest([&] {
+        std::unique_lock<std::mutex> lock(gate_mutex);
+        gate_cv.wait(lock, [&] { return gate_open; });
+    });
+
+    ASSERT_FALSE(fileStorage.BatchGet(keys, sizes));
+    ASSERT_FALSE(fileStorage.BatchGet(keys, sizes));
+    {
+        std::lock_guard<std::mutex> lock(gate_mutex);
+        gate_open = true;
+    }
+    gate_cv.notify_all();
+    ASSERT_TRUE(WaitUntil(
+        [&] { return fileStorage.read_guard()->late_running() == 0; }));
+    EXPECT_EQ(evict_calls.load(), 0);
+
+    std::string metrics_text;
+    metric.serialize(metrics_text);
+    EXPECT_TRUE(
+        HasSample(metrics_text, "mooncake_ssd_read_deadline_miss_total"));
+    EXPECT_FALSE(
+        HasSample(metrics_text, "mooncake_ssd_read_miss_evict_keys_total"));
 }
 
 TEST_F(FileStorageTest, AllocateBatchAvoidsDirectIoPaddingForPosixReads) {

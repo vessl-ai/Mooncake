@@ -1264,6 +1264,115 @@ TEST_F(MasterServiceSSDTest, OffloadCompletionWithAnotherSizeIsRefused) {
     EXPECT_TRUE(replicas->replicas[0].is_memory_replica());
 }
 
+// The store's offload_read_miss_evict (OffloadReadMissEvictor) relies on
+// this master behavior, through the RPC a store already uses when it evicts
+// disk data: a key that has only a LOCAL_DISK replica exists, so a put of it
+// is refused as OBJECT_ALREADY_EXISTS (and a client that checks exists first
+// does not even try); once the owning store drops that replica the key is
+// absent and the next put lands in memory. Only the owner's replica is
+// dropped, and an eviction that arrives after the key was removed or written
+// again leaves the newer object alone.
+class ReadMissEvictContractTest : public MasterServiceSSDTest {
+   protected:
+    void SetUp() override {
+        MasterServiceSSDTest::SetUp();
+        service_ = CreateSsdAwareOffloadService();
+        MountMemoryAndLocalDisk(*service_, store_, kSegment, 0xd00000000);
+    }
+
+    void MakeDiskOnly(const std::string& key) {
+        Replica replica(store_, kSize, kSegment, ReplicaStatus::COMPLETE);
+        ASSERT_TRUE(
+            service_->AddReplica(store_, key, TenantId::Default(), replica)
+                .has_value());
+        auto replicas = service_->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        ASSERT_TRUE(replicas->replicas[0].is_local_disk_replica());
+    }
+
+    bool Exists(const std::string& key) {
+        auto exists = service_->ExistKey(key, TenantId::Default());
+        return exists.has_value() && exists.value();
+    }
+
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> StartPut(
+        const std::string& key) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        return service_->PutStart(store_, key, TenantId::Default(), kSize,
+                                  config);
+    }
+
+    tl::expected<void, ErrorCode> DropDiskReplica(const UUID& store,
+                                                  const std::string& key) {
+        return service_->EvictDiskReplica(store, key, TenantId::Default(),
+                                          ReplicaType::LOCAL_DISK);
+    }
+
+    static constexpr int64_t kSize = 1024;
+    static constexpr const char* kSegment = "read_miss_segment";
+    std::unique_ptr<MasterService> service_;
+    UUID store_ = generate_uuid();
+};
+
+TEST_F(ReadMissEvictContractTest,
+       PutLandsInMemoryAfterTheDiskReplicaIsDropped) {
+    const std::string key = "read_miss_key";
+    MakeDiskOnly(key);
+    EXPECT_TRUE(Exists(key));
+    auto refused = StartPut(key);
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    ASSERT_TRUE(DropDiskReplica(store_, key).has_value());
+    EXPECT_FALSE(Exists(key));
+    auto gone = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_FALSE(gone.has_value());
+    EXPECT_EQ(gone.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    auto started = StartPut(key);
+    ASSERT_TRUE(started.has_value());
+    ASSERT_EQ(started->size(), 1u);
+    EXPECT_TRUE(started->front().is_memory_replica());
+    ASSERT_TRUE(
+        service_->PutEnd(store_, key, TenantId::Default(), ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_TRUE(Exists(key));
+    ExpectMemoryOnly(*service_, key);
+}
+
+TEST_F(ReadMissEvictContractTest, AnotherStoreCannotDropTheReplica) {
+    const std::string key = "read_miss_other_store_key";
+    MakeDiskOnly(key);
+    const UUID other = generate_uuid();
+    ASSERT_TRUE(service_->MountLocalDiskSegment(other, true).has_value());
+
+    EXPECT_TRUE(DropDiskReplica(other, key).has_value());
+    EXPECT_TRUE(Exists(key));
+    auto replicas = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
+}
+
+TEST_F(ReadMissEvictContractTest, LateDropLeavesARemovedOrRewrittenKeyAlone) {
+    const std::string key = "read_miss_late_key";
+    MakeDiskOnly(key);
+    ASSERT_TRUE(service_->Remove(key, TenantId::Default()).has_value());
+    // The store ignores OBJECT_NOT_FOUND (NotifyEvictedDiskReplicas).
+    auto removed = DropDiskReplica(store_, key);
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    // Written again (memory only) before a queued drop arrives: the drop
+    // finds no LOCAL_DISK replica of this store and the new object stays.
+    PutMemoryObject(*service_, store_, key, kSize);
+    EXPECT_TRUE(DropDiskReplica(store_, key).has_value());
+    EXPECT_TRUE(Exists(key));
+    ExpectMemoryOnly(*service_, key);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

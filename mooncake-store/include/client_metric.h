@@ -556,6 +556,21 @@ struct SsdMetric {
                              "Keys of peer offload reads refused without "
                              "disk I/O after a read deadline miss",
                              labels),
+          ssd_read_miss_evict_keys(
+              "mooncake_ssd_read_miss_evict_keys_total",
+              "Keys of failed peer offload reads queued to drop this "
+              "store's LOCAL_DISK replica at the master",
+              labels),
+          ssd_read_miss_evict_dropped_keys(
+              "mooncake_ssd_read_miss_evict_dropped_keys_total",
+              "Keys of failed peer offload reads not queued because the "
+              "queue was full",
+              labels),
+          ssd_read_miss_evict_failed_keys(
+              "mooncake_ssd_read_miss_evict_failed_keys_total",
+              "Queued keys whose master call to drop the LOCAL_DISK replica "
+              "failed (not retried)",
+              labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -578,6 +593,11 @@ struct SsdMetric {
     ylt::metric::counter_t ssd_read_shed;
     ylt::metric::counter_t ssd_read_shed_keys;
     std::atomic<bool> read_guard_enabled{false};
+    // FileStorageConfig::offload_read_miss_evict; exported only while on.
+    ylt::metric::counter_t ssd_read_miss_evict_keys;
+    ylt::metric::counter_t ssd_read_miss_evict_dropped_keys;
+    ylt::metric::counter_t ssd_read_miss_evict_failed_keys;
+    std::atomic<bool> read_miss_evict_enabled{false};
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -599,6 +619,11 @@ struct SsdMetric {
             ssd_read_deadline_miss_keys.serialize(str);
             ssd_read_shed.serialize(str);
             ssd_read_shed_keys.serialize(str);
+        }
+        if (read_miss_evict_enabled.load(std::memory_order_relaxed)) {
+            ssd_read_miss_evict_keys.serialize(str);
+            ssd_read_miss_evict_dropped_keys.serialize(str);
+            ssd_read_miss_evict_failed_keys.serialize(str);
         }
     }
 

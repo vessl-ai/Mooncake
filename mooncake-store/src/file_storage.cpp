@@ -168,6 +168,29 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                   << config_.offload_read_deadline_ms
                   << ", shed_ms=" << config_.offload_read_shed_ms
                   << ", threads=" << config_.offload_read_threads;
+        if (config_.offload_read_miss_evict) {
+            // Bounds memory if the master stops answering: a queued key
+            // costs ~200 B (a 64+ character key in a hash set node).
+            constexpr size_t kMaxPendingKeys = 1 << 20;
+            constexpr size_t kMaxBatchKeys = 4096;
+            read_miss_evictor_ = std::make_unique<OffloadReadMissEvictor>(
+                [this](const std::vector<std::string>& keys)
+                    -> tl::expected<void, ErrorCode> {
+                    auto result = test_read_miss_evict_
+                                      ? test_read_miss_evict_(keys)
+                                      : DropDiskReplicasAfterReadMiss(keys);
+                    if (!result && ssd_metric_) {
+                        ssd_metric_->ssd_read_miss_evict_failed_keys.inc(
+                            keys.size());
+                    }
+                    return result;
+                },
+                kMaxPendingKeys, kMaxBatchKeys);
+            if (ssd_metric_) ssd_metric_->read_miss_evict_enabled = true;
+            LOG(INFO) << "Offload read miss evict enabled: a deadline miss "
+                         "or shed read drops this store's LOCAL_DISK "
+                         "replicas of its keys at the master";
+        }
     }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
@@ -196,6 +219,8 @@ FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
     // Waits for late reads, which release their buffers through this object.
     read_guard_.reset();
+    // Its thread calls the master through client_.
+    read_miss_evictor_.reset();
     heartbeat_running_ = false;
     WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
@@ -347,6 +372,15 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         } else if (outcome == OffloadReadGuard::Outcome::kShed) {
             ssd_metric_->ssd_read_shed.inc();
             ssd_metric_->ssd_read_shed_keys.inc(keys.size());
+        }
+    }
+    if (read_miss_evictor_ &&
+        (outcome == OffloadReadGuard::Outcome::kDeadlineMiss ||
+         outcome == OffloadReadGuard::Outcome::kShed)) {
+        const auto added = read_miss_evictor_->Add(keys);
+        if (ssd_metric_) {
+            ssd_metric_->ssd_read_miss_evict_keys.inc(added.queued);
+            ssd_metric_->ssd_read_miss_evict_dropped_keys.inc(added.dropped);
         }
     }
     return result;
@@ -838,6 +872,36 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     if (first_error.has_value()) {
         return tl::make_unexpected(first_error.value());
     }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::DropDiskReplicasAfterReadMiss(
+    const std::vector<std::string>& storage_keys) {
+    if (!client_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
+        keys_by_tenant;
+    for (const auto& storage_key : storage_keys) {
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
+        keys_by_tenant[tenant_id].push_back(key);
+    }
+    std::optional<ErrorCode> first_error;
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
+                                                      ReplicaType::LOCAL_DISK);
+        if (results.size() != keys.size()) {
+            if (!first_error) first_error = ErrorCode::INTERNAL_ERROR;
+            continue;
+        }
+        for (const auto& result : results) {
+            // OBJECT_NOT_FOUND: removed meanwhile, or dropped by an earlier
+            // failed read of the same key.
+            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                !first_error) {
+                first_error = result.error();
+            }
+        }
+    }
+    if (first_error) return tl::make_unexpected(*first_error);
     return {};
 }
 

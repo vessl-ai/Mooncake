@@ -147,6 +147,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_OFFLOAD_READ_SHED_MS, config.offload_read_shed_ms);
     config.offload_read_threads = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_READ_THREADS, config.offload_read_threads);
+    config.offload_read_miss_evict = ParseStrictBoolOr(
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_READ_MISS_EVICT,
+                        std::string{}),
+        config.offload_read_miss_evict);
     config.offload_read_parallelism =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_READ_PARALLELISM,
                         config.offload_read_parallelism);
@@ -302,6 +306,11 @@ bool FileStorageConfig::Validate() const {
                          << ") is not below client_buffer_gc_ttl_ms ("
                          << client_buffer_gc_ttl_ms << ")";
         }
+    }
+    if (offload_read_miss_evict && offload_read_deadline_ms == 0) {
+        // Only the read guard reports read misses.
+        LOG(WARNING) << "FileStorageConfig: offload_read_miss_evict has no "
+                        "effect without offload_read_deadline_ms";
     }
     return true;
 }
