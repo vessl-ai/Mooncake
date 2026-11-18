@@ -63,6 +63,8 @@ class FakeStore:
         self.free_unmount_calls = []
         self.unmount_local_disk_calls = []
         self.fail_unmount_local_disk = False
+        self.fence_local_disk_calls = []
+        self.fence_local_disk_ret = 0
         self.setup_calls = []
 
     def setup(self, *args):
@@ -109,6 +111,10 @@ class FakeStore:
         self.unmount_local_disk_calls.append(grace_period_seconds)
         return -1 if self.fail_unmount_local_disk else 0
 
+    def fence_local_disk(self, reason):
+        self.fence_local_disk_calls.append(reason)
+        return self.fence_local_disk_ret
+
 
 class FakeRequest:
     def __init__(self, body, json_error=None):
@@ -131,6 +137,7 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.service.mounted_segment_ids = []
         self.service.last_mount_info = {}
         self.service._state_lock = asyncio.Lock()
+        self.service._fence_local_disk_in_flight = False
 
     async def test_start_store_service_passes_tenant_id_to_setup(self):
         fake_store = FakeStore()
@@ -574,6 +581,69 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         resp = await self.service.handle_unmount_local_disk(FakeRequest({}))
         self.assertEqual(resp.status, 500)
         self.assertEqual(self.fake_store.unmount_local_disk_calls, [0])
+
+    # ============= /api/fence_local_disk tests =============
+
+    async def test_fence_local_disk_malformed_json_rejected(self):
+        resp = await self.service.handle_fence_local_disk(
+            FakeRequest(None, json_error=json.JSONDecodeError("bad", "doc", 0))
+        )
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.fence_local_disk_calls, [])
+
+    async def test_fence_local_disk_rejects_non_object_body(self):
+        resp = await self.service.handle_fence_local_disk(FakeRequest(["dead"]))
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.fence_local_disk_calls, [])
+
+    async def test_fence_local_disk_rejects_invalid_reason(self):
+        for body in (
+            {},
+            {"reason": None},
+            {"reason": 1},
+            {"reason": ""},
+            {"reason": "nvme0\ndead"},
+            {"reason": "x" * 257},
+        ):
+            with self.subTest(body=body):
+                resp = await self.service.handle_fence_local_disk(FakeRequest(body))
+                self.assertEqual(resp.status, 400)
+        self.assertEqual(self.fake_store.fence_local_disk_calls, [])
+
+    async def test_fence_local_disk_fenced_and_unmounted(self):
+        reason = "x" * 256
+        resp = await self.service.handle_fence_local_disk(
+            FakeRequest({"reason": reason})
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.text), {"status": "fenced", "unmounted": True})
+        self.assertEqual(self.fake_store.fence_local_disk_calls, [reason])
+
+    async def test_fence_local_disk_unmount_not_confirmed(self):
+        self.fake_store.fence_local_disk_ret = -900  # RPC_FAIL
+        resp = await self.service.handle_fence_local_disk(
+            FakeRequest({"reason": "nvme0 dead"})
+        )
+        self.assertEqual(resp.status, 503)
+        body = json.loads(resp.text)
+        self.assertEqual(body["status"], "fenced")
+        self.assertFalse(body["unmounted"])
+        self.assertEqual(self.fake_store.fence_local_disk_calls, ["nvme0 dead"])
+
+    async def test_fence_local_disk_without_disk_tier(self):
+        self.fake_store.fence_local_disk_ret = -1300  # UNABLE_OFFLOAD
+        resp = await self.service.handle_fence_local_disk(
+            FakeRequest({"reason": "nvme0 dead"})
+        )
+        self.assertEqual(resp.status, 409)
+
+    async def test_fence_local_disk_call_in_progress(self):
+        self.service._fence_local_disk_in_flight = True
+        resp = await self.service.handle_fence_local_disk(
+            FakeRequest({"reason": "nvme0 dead"})
+        )
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(self.fake_store.fence_local_disk_calls, [])
 
     # ==================== /api/put tests ====================
 
