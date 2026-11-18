@@ -1620,6 +1620,10 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<uint32_t, ErrorCode> WrappedMasterService::GetHeartbeatRpcPort() {
+    return heartbeat_rpc_port_.load();
+}
+
 TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
     const {
     return master_service_.GetStorageUsageSnapshot();
@@ -2103,6 +2107,7 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &WrappedMasterService::QuerySegmentStatus,
         &WrappedMasterService::QuerySegmentStatusById,
         &WrappedMasterService::GetStorageConfig,
+        &WrappedMasterService::GetHeartbeatRpcPort,
         &WrappedMasterService::BatchExistKey,
         &WrappedMasterService::BatchProbeKey,
         &WrappedMasterService::MountLocalDiskSegment,
@@ -2153,6 +2158,15 @@ void RegisterRpcService(coro_rpc::coro_rpc_server& server,
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::RegisterPrefetchTask>(
+        &wrapped_master_service);
+}
+
+void RegisterHeartbeatRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&mooncake::WrappedMasterService::Ping>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
 }
 
