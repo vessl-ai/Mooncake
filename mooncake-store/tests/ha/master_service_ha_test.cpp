@@ -5509,14 +5509,16 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ASSERT_EQ(tasks->front().key, key);
     ASSERT_TRUE(tasks->front().task_id.has_value());
 
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 2, batch));
+
     StorageObjectMetadata disk_copy;
     disk_copy.data_size = 1024;
     disk_copy.transport_endpoint = "offload_completion_disk";
     ASSERT_TRUE(
         service.NotifyOffloadSuccess(mounted.client_id, *tasks, {disk_copy}));
 
-    OpLogBatchStorage storage(cluster_id, *backend);
-    OpLogBatchRecord batch;
     ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 3, batch));
     MockMetadataStore standby;
     OpLogApplier applier(&standby, cluster_id);
@@ -7053,7 +7055,10 @@ TEST_F(MasterServiceHATest,
     ReadBatchEventually(storage, 3, batch);
     ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, first_key,
+                               std::chrono::system_clock::time_point{});
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, second_key,
+                               std::chrono::system_clock::time_point{});
     {
         auto held_reservation = ReserveBatchSlotForTesting(service);
         ASSERT_TRUE(held_reservation.has_value())
@@ -7120,7 +7125,10 @@ TEST_F(MasterServiceHATest,
                        "batch_evict_fenced_segment");
     ReadBatchEventually(storage, 3, batch);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, first_key,
+                               std::chrono::system_clock::time_point{});
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, second_key,
+                               std::chrono::system_clock::time_point{});
     backend->SetTxnError(ErrorCode::ETCD_TRANSACTION_FAIL);
     ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END,
                                         kDefaultTenant,
@@ -7187,7 +7195,10 @@ TEST_F(MasterServiceHATest, BatchEvictCommitFailureRestoresRemovedReplicas) {
                        "batch_evict_commit_failure_segment");
     ReadBatchEventually(storage, 3, batch);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, first_key,
+                               std::chrono::system_clock::time_point{});
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, second_key,
+                               std::chrono::system_clock::time_point{});
     writer->RejectCommitsWith(ErrorCode::INVALID_PARAMS);
     SetNeedMemEvictionForTesting(service, true);
     ::testing::internal::CaptureStderr();
@@ -7227,7 +7238,7 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
                               .set_cluster_id(cluster_id)
                               .set_oplog_batch_max_entries(1)
                               .set_put_start_discard_timeout_sec(1)
-                              .set_put_start_release_timeout_sec(2)
+                              .set_put_start_release_timeout_sec(120)
                               .build();
     MasterService service(service_config);
     ASSERT_EQ(
@@ -7238,7 +7249,7 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
         PrepareSimpleSegment(service, "batch_put_start_cleanup_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 1, batch));
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -7247,12 +7258,18 @@ TEST_F(MasterServiceHATest, PutStartExpiredOverwriteWritesBatchRecordOpLog) {
     ASSERT_TRUE(service.PutStart(client_id, key, kDefaultTenant, 1024, config)
                     .has_value());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    {
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            &service,
+            MasterServiceTestPeer::ObjectIdentity{kDefaultTenant, key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().put_start_time = std::chrono::system_clock::time_point{};
+    }
     const UUID next_client_id = generate_uuid();
     ASSERT_TRUE(
         service.PutStart(next_client_id, key, kDefaultTenant, 1024, config)
             .has_value());
-    ReadBatchEventually(storage, 2, batch);
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 2, batch));
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
