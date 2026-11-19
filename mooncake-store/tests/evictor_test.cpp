@@ -565,14 +565,15 @@ TEST_F(EvictorTest, AScopedRunStaysInItsNamespace) {
 // Accepts the first `capacity` offloads.
 class FakeOffloadQueue final : public eviction::OffloadQueue {
    public:
-    bool Push(const TenantId&, const std::string& key, Replica&,
-              std::vector<UUID>* mirror_clients) override {
+    std::optional<L4TaskId> Push(const TenantId&, const std::string& key,
+                                 Replica&,
+                                 std::vector<UUID>* mirror_clients) override {
         if (pushed.size() >= capacity) {
-            return false;
+            return std::nullopt;
         }
         pushed.push_back(key);
         mirror_clients->push_back(UUID{7, 7});
-        return true;
+        return L4TaskId{.epoch = 1, .seq = pushed.size()};
     }
 
     size_t capacity = SIZE_MAX;

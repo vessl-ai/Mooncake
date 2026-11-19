@@ -454,6 +454,10 @@ class ObjectRoute {
     // the cursor keeps `ref()` and goes through Write(ref).
     [[nodiscard]] Cursor<LockMode::kRead> ReadCursor() const;
     [[nodiscard]] Cursor<LockMode::kWrite> WriteCursor();
+    // A read cursor over the objects of one stripe (< kStripeCount) only.
+    // Every object is in exactly one stripe, so cursors over all stripes,
+    // run in parallel, together cover the route.
+    [[nodiscard]] Cursor<LockMode::kRead> ReadCursor(size_t stripe) const;
 
     // The member keys of one group, as a snapshot to resolve again: a key in
     // it may hold a different object by the time the caller reads it, or none.
@@ -637,7 +641,9 @@ class ObjectRoute::Cursor {
    private:
     friend class ObjectRoute;
 
-    explicit Cursor(const ObjectRoute& route) : route_(route) {
+    explicit Cursor(const ObjectRoute& route, size_t first_stripe = 0,
+                    size_t end_stripe = kStripeCount)
+        : route_(route), stripe_(first_stripe), end_stripe_(end_stripe) {
 #ifndef NDEBUG
         route_.live_cursors_.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -654,7 +660,7 @@ class ObjectRoute::Cursor {
     // the end. The position is always past the slot stood on, so this
     // resumes from it whichever phase the cursor is in.
     void Settle() NO_THREAD_SAFETY_ANALYSIS {
-        for (; stripe_ < kStripeCount; ++stripe_) {
+        for (; stripe_ < end_stripe_; ++stripe_) {
             Stripe& stripe = route_.stripes_[stripe_];
             if (!stripe_lock_.owns_lock()) {
                 AssertNotInCursor();
@@ -719,7 +725,8 @@ class ObjectRoute::Cursor {
     }
 
     const ObjectRoute& route_;
-    size_t stripe_ = 0;
+    size_t stripe_;
+    const size_t end_stripe_;
     std::shared_lock<std::shared_mutex> stripe_lock_;
     // The next slot to try in the stripe held.
     typename SlotMap::iterator slot_it_;
@@ -839,6 +846,12 @@ inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor() const {
 
 inline ObjectRoute::Cursor<LockMode::kWrite> ObjectRoute::WriteCursor() {
     return Cursor<LockMode::kWrite>(*this);
+}
+
+inline ObjectRoute::Cursor<LockMode::kRead> ObjectRoute::ReadCursor(
+    size_t stripe) const {
+    assert(stripe < kStripeCount);
+    return Cursor<LockMode::kRead>(*this, stripe, stripe + 1);
 }
 
 inline void ObjectRoute::RebuildGroupState() {

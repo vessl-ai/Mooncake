@@ -29,14 +29,24 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
 
     for (const ReplicaID id : plan.release) {
         Replica* source = metadata.GetReplicaByID(id);
+        if (source == nullptr) {
+            continue;
+        }
         std::vector<UUID> mirror_clients;
-        if (source == nullptr ||
-            !queue_.Push(ns.id(), hold.key(), *source, &mirror_clients)) {
+        const auto task_id =
+            queue_.Push(ns.id(), hold.key(), *source, &mirror_clients);
+        if (!task_id) {
             continue;
         }
         source->inc_refcnt();
+        // Only this replica was pushed, so every mirror copies from it.
+        std::vector<UUID> source_clients = mirror_clients;
         hold.state().offloading_task =
-            OffloadingTask{id, Clock::now(), std::move(mirror_clients)};
+            OffloadingTask{.source_id = id,
+                           .start_time = Clock::now(),
+                           .mirror_clients = std::move(mirror_clients),
+                           .source_clients = std::move(source_clients),
+                           .task_id = *task_id};
 
         Plan rest;
         for (const ReplicaID other : plan.release) {

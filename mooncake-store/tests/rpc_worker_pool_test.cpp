@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -30,16 +31,19 @@ class TestService {
     int Block() {
         blocked_.store(true);
         release_.wait();
+        completed_.store(true);
         return 1;
     }
 
     int Ping() { return 0; }
 
     bool blocked() const { return blocked_.load(); }
+    bool completed() const { return completed_.load(); }
     void Release() { release_promise_.set_value(); }
 
    private:
     std::atomic<bool> blocked_{false};
+    std::atomic<bool> completed_{false};
     std::promise<void> release_promise_;
     std::shared_future<void> release_ = release_promise_.get_future().share();
 };
@@ -122,6 +126,44 @@ TEST_F(RpcWorkerPoolTest, BlockedPooledHandlerLeavesIoThreadFree) {
 
     service.Release();
     slow_caller.join();
+}
+
+TEST_F(RpcWorkerPoolTest, StoppingTheListenerLeavesAHandlerToDrain) {
+    TestService service;
+    auto pool = std::make_unique<RpcWorkerPool>(1);
+    coro_rpc::coro_rpc_server server(1, port_, "127.0.0.1",
+                                     std::chrono::seconds(0), true);
+    pool->Register<&TestService::Block>(server, service);
+    ASSERT_NO_FATAL_FAILURE(Start(server));
+    coro_rpc::coro_rpc_client client;
+    ASSERT_NO_FATAL_FAILURE(Connect(client));
+    std::thread caller([&] {
+        syncAwait(
+            client.call_for<&TestService::Block>(std::chrono::seconds(5)));
+    });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!service.blocked() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(service.blocked());
+    std::promise<void> listener_stopped;
+    auto stopped = listener_stopped.get_future();
+    auto drained = std::async(std::launch::async, [&] {
+        server.stop();
+        listener_stopped.set_value();
+        pool.reset();
+    });
+    EXPECT_EQ(stopped.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_EQ(drained.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_FALSE(service.completed());
+    service.Release();
+    drained.get();
+    EXPECT_TRUE(service.completed());
+    caller.join();
 }
 
 }  // namespace

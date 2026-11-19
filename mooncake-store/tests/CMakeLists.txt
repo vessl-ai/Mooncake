@@ -68,6 +68,7 @@ set_tests_properties(replica_selection_env_opt_in_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
+add_store_test(l4_task_id_wire_test l4_task_id_wire_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(session_tag_test session_tag_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
@@ -90,6 +91,8 @@ add_store_test(master_service_weight_management_test
 add_store_test(weight_group_lifecycle_test weight_group_lifecycle_test.cpp)
 add_store_test(weight_reconciliation_test weight_reconciliation_test.cpp)
 add_store_test(weight_management_rpc_test weight_management_rpc_test.cpp)
+add_store_test(handoff_restore_test handoff_restore_test.cpp)
+add_store_test(handoff_lifecycle_test handoff_lifecycle_test.cpp)
 add_store_test(master_service_group_test master_service_group_test.cpp)
 add_store_test(master_service_object_ref_test
                master_service_object_ref_test.cpp)

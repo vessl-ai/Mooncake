@@ -602,6 +602,27 @@ TEST(ObjectRouteTest, ReadCursorVisitsEveryObjectOnce) {
     EXPECT_EQ(count, 0u);
 }
 
+TEST(ObjectRouteTest, StripeCursorsTogetherVisitEveryObjectOnce) {
+    ObjectRoute route;
+    std::vector<std::string> expected;
+    for (int i = 0; i < 3000; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        PublishObject(route, key, "");
+        expected.push_back(key);
+    }
+    std::vector<std::string> keys;
+    size_t stripes_with_objects = 0;
+    for (size_t stripe = 0; stripe < ObjectRoute::kStripeCount; ++stripe) {
+        const size_t before = keys.size();
+        for (auto object : route.ReadCursor(stripe)) {
+            keys.push_back(object.key());
+        }
+        stripes_with_objects += keys.size() > before ? 1 : 0;
+    }
+    EXPECT_EQ(Sorted(keys), Sorted(expected));
+    EXPECT_GT(stripes_with_objects, 1u);
+}
+
 TEST(ObjectRouteTest, WriteCursorChangesMetadataAndState) {
     ObjectRoute route;
     for (const char* key : {"k1", "k2"}) {

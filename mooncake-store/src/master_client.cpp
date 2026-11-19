@@ -258,6 +258,11 @@ struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyOffloadTaskSuccess> {
+    static constexpr const char* value = "NotifyOffloadTaskSuccess";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
@@ -285,6 +290,21 @@ struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccess> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailure> {
     static constexpr const char* value = "NotifyPromotionFailure";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionTaskAllocStart> {
+    static constexpr const char* value = "PromotionTaskAllocStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionTaskSuccess> {
+    static constexpr const char* value = "NotifyPromotionTaskSuccess";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionTaskFailure> {
+    static constexpr const char* value = "NotifyPromotionTaskFailure";
 };
 
 template <>
@@ -1289,18 +1309,6 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(keys.size());
-    for (const auto& key : keys) {
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = tenant_id_.value(), .key = key, .size = 0});
-    }
-    return NotifyOffloadSuccess(client_id, tasks, metadatas);
-}
-
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
@@ -1309,6 +1317,18 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadTaskSuccess(
+    const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadTaskSuccess");
+    timer.LogRequest("client_id=", client_id, ", tasks_count=", tasks.size());
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyOffloadTaskSuccess, void>(
+            client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1387,6 +1407,45 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
     auto result =
         invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
             client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+MasterClient::PromotionTaskAllocStart(
+    const UUID& client_id, const PromotionTaskItem& item,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionTaskAllocStart");
+    timer.LogRequest("client_id=", client_id, ", key=", item.key,
+                     ", tenant_id=", item.tenant_id, ", size=", item.size,
+                     ", preferred_count=", preferred_segments.size());
+    auto result = invoke_rpc<&WrappedMasterService::PromotionTaskAllocStart,
+                             PromotionAllocStartResponse>(client_id, item,
+                                                          preferred_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionTaskSuccess(
+    const UUID& client_id, const PromotionTaskItem& item) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionTaskSuccess");
+    timer.LogRequest("client_id=", client_id, ", key=", item.key,
+                     ", tenant_id=", item.tenant_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionTaskSuccess, void>(
+            client_id, item);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionTaskFailure(
+    const UUID& client_id, const PromotionTaskItem& item) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionTaskFailure");
+    timer.LogRequest("client_id=", client_id, ", key=", item.key,
+                     ", tenant_id=", item.tenant_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::NotifyPromotionTaskFailure, void>(
+            client_id, item);
     timer.LogResponseExpected(result);
     return result;
 }

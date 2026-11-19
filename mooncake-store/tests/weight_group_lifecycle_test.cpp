@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -62,18 +63,35 @@ class WeightGroupLifecycleTest : public MasterServiceTest {
         return *ready;
     }
 
-    static void AddLocalDiskReplica(MasterService& service,
-                                    const UUID& client_id,
-                                    const std::string& key, int64_t size,
-                                    const std::string& endpoint) {
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = "default", .key = key, .size = size}};
+    // Completes the key's offload task as the store would; a key with no task
+    // (put while no local disk was mounted) gets its disk copy directly,
+    // since NotifyOffloadSuccess registers only the completion of a task.
+    void AddLocalDiskReplica(MasterService& service, const UUID& client_id,
+                             const std::string& key, int64_t size,
+                             const std::string& endpoint) {
+        auto drained = service.OffloadObjectHeartbeat(client_id, true);
+        ASSERT_TRUE(drained.has_value());
+        for (auto& item : *drained) {
+            drained_offloads_.insert_or_assign(item.key, std::move(item));
+        }
+        auto task = drained_offloads_.find(key);
+        if (task == drained_offloads_.end()) {
+            Replica replica(client_id, static_cast<uint64_t>(size), endpoint,
+                            ReplicaStatus::COMPLETE);
+            ASSERT_TRUE(service.AddReplica(client_id, key, TenantId::Default(),
+                                           replica));
+            return;
+        }
         StorageObjectMetadata metadata;
         metadata.key_size = key.size();
         metadata.data_size = size;
         metadata.transport_endpoint = endpoint;
-        ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, tasks, {metadata}));
+        ASSERT_TRUE(
+            service.NotifyOffloadSuccess(client_id, {task->second}, {metadata}));
+        drained_offloads_.erase(task);
     }
+
+    std::map<std::string, OffloadTaskItem> drained_offloads_;
 };
 
 TEST_F(WeightGroupLifecycleTest, LeaseBlocksOperationAndDelete) {
@@ -357,10 +375,10 @@ TEST_F(WeightGroupLifecycleTest, RehydrateQueuesAndCompletesWholeManagedGroup) {
         ASSERT_TRUE(pending.has_value());
         ASSERT_FALSE(pending->empty());
         for (const auto& task : *pending) {
-            ASSERT_TRUE(service.PromotionAllocStart(
-                client_id, task.key, TenantId(task.tenant_id), task.size, {}));
-            ASSERT_TRUE(service.NotifyPromotionSuccess(
-                client_id, task.key, TenantId(task.tenant_id)));
+            ASSERT_TRUE(service.PromotionTaskAllocStart(
+                client_id, task, TenantId(task.tenant_id), {}));
+            ASSERT_TRUE(service.NotifyPromotionTaskSuccess(
+                client_id, task, TenantId(task.tenant_id)));
             ++promoted;
         }
     }
@@ -494,10 +512,10 @@ TEST_F(WeightGroupLifecycleTest, MemberBudgetBoundsEvictionAndPromotion) {
         ASSERT_TRUE(pending);
         ASSERT_EQ(1, pending->size());
         const auto& task = pending->front();
-        ASSERT_TRUE(service.PromotionAllocStart(
-            client_id, task.key, TenantId(task.tenant_id), task.size, {}));
-        ASSERT_TRUE(service.NotifyPromotionSuccess(client_id, task.key,
-                                                   TenantId(task.tenant_id)));
+        ASSERT_TRUE(service.PromotionTaskAllocStart(
+            client_id, task, TenantId(task.tenant_id), {}));
+        ASSERT_TRUE(service.NotifyPromotionTaskSuccess(
+            client_id, task, TenantId(task.tenant_id)));
     }
     MasterServiceTestPeer(service).RunWeightReconciliationForTesting(
         ready.updated_at_ms + 5, 1);

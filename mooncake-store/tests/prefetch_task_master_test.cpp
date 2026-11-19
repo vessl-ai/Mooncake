@@ -59,24 +59,17 @@ class PrefetchTaskMasterTest : public ::testing::Test {
         return client_id;
     }
 
-    // Inject a synthetic LOCAL_DISK-only key, the same way
-    // promotion_on_hit_test does, without running the offload pipeline.
+    // Inject a synthetic LOCAL_DISK-only key via AddReplica, the same way
+    // promotion_on_hit_test does, without running the offload pipeline;
+    // NotifyOffloadSuccess only registers the completion of an offload task
+    // the client took.
     bool InjectLocalDiskOnlyKey(MasterService& service, const UUID& client_id,
                                 const std::string& key, int64_t size,
                                 const std::string& transport_endpoint) {
-        std::vector<OffloadTaskItem> tasks{
-            OffloadTaskItem{.tenant_id = std::string(TenantId::kDefaultValue),
-                            .key = key,
-                            .size = size}};
-        StorageObjectMetadata sm;
-        sm.bucket_id = 0;
-        sm.offset = 0;
-        sm.key_size = static_cast<int64_t>(key.size());
-        sm.data_size = size;
-        sm.transport_endpoint = transport_endpoint;
-        std::vector<StorageObjectMetadata> metas{sm};
-        auto res = service.NotifyOffloadSuccess(client_id, tasks, metas);
-        return res.has_value();
+        Replica replica(client_id, static_cast<uint64_t>(size),
+                        transport_endpoint, ReplicaStatus::COMPLETE);
+        return service.AddReplica(client_id, key, TenantId::Default(), replica)
+            .has_value();
     }
 
     void PutObject(MasterService& service, const UUID& client_id,

@@ -48,6 +48,10 @@ class WrappedMasterService {
 
     ~WrappedMasterService();
 
+    // Shutdown handoff (INF-600, fork-only): restore at startup and export at
+    // SIGTERM run directly on the wrapped service, outside any RPC.
+    MasterService& GetMasterServiceForHandoff() { return master_service_; }
+
     tl::expected<bool, ErrorCode> ExistKey(
         const std::string& key, const std::string& tenant_id = "default");
 
@@ -260,6 +264,13 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // Offload reports (completions and NACKs) of a store that echoes task
+    // ids. The only RPC through which a completion is registered; the one
+    // above takes NACKs only (see its definition).
+    tl::expected<void, ErrorCode> NotifyOffloadTaskSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
@@ -285,6 +296,19 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    // Promotion RPCs that name their task by the drained item's task id (see
+    // MasterService::PromotionTaskAllocStart). The tenant is the item's.
+    tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionTaskAllocStart(const UUID& client_id,
+                            const PromotionTaskItem& item,
+                            const std::vector<std::string>& preferred_segments);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskSuccess(
+        const UUID& client_id, const PromotionTaskItem& item);
+
+    tl::expected<void, ErrorCode> NotifyPromotionTaskFailure(
+        const UUID& client_id, const PromotionTaskItem& item);
 
     // Admin-only, grow-only DFS capacity management. Existing placements remain
     // valid.
@@ -437,6 +461,10 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    // Fails with the first offload report whose tenant is invalid.
+    tl::expected<void, ErrorCode> CheckOffloadReportTenants(
+        const std::vector<OffloadTaskItem>& tasks) const;
+
     MasterService master_service_;
     std::atomic<uint32_t> heartbeat_rpc_port_{0};
 };

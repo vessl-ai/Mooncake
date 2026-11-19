@@ -829,6 +829,17 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
+    // The task id of every seeded promotion task; SeededPromotionItem
+    // carries it, as the holder's drained item would.
+    static constexpr L4TaskId kSeededPromotionTaskId{1, 1};
+    static PromotionTaskItem SeededPromotionItem(const TenantId& tenant,
+                                                 const std::string& key) {
+        return PromotionTaskItem{.tenant_id = tenant.value(),
+                                 .key = key,
+                                 .size = 0,
+                                 .task_id = kSeededPromotionTaskId};
+    }
+
     // Use the test peer to seed an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
     // going through the on-hit admission gate (which is currently
@@ -845,7 +856,8 @@ class MasterServiceHATest : public ::testing::Test {
             .alloc_id = alloc_id,
             .object_size = object_size,
             .start_time = std::chrono::system_clock::now(),
-            .holder_id = holder_id};
+            .holder_id = holder_id,
+            .task_id = kSeededPromotionTaskId};
     }
 
     static bool NeedMemoryEvictionForTesting(const MasterService& service) {
@@ -5364,13 +5376,13 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_e2e_partial_evict_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "batch_e2e_partial_evict_disk";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024,
+                         "batch_e2e_partial_evict_disk",
+                         ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+        service.AddReplica(mounted.client_id, key, kDefaultTenant, disk_replica)
             .has_value());
     ReadBatchEventually(storage, 3, batch);
 
@@ -5470,6 +5482,63 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
+       OffloadTaskCompletionReplaysDiskReplica) {
+    const std::string cluster_id = "test_batch_record_offload_completion";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_enable_offload(true)
+                      .set_cluster_id(cluster_id)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+
+    const std::string segment = "offload_completion_segment";
+    const auto mounted = PrepareSimpleSegment(service, segment);
+    ASSERT_TRUE(service.MountLocalDiskSegment(mounted.client_id, true));
+    const std::string key = "offload_completion_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment);
+
+    auto tasks = service.OffloadObjectHeartbeat(mounted.client_id, true);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    ASSERT_EQ(tasks->front().key, key);
+    ASSERT_TRUE(tasks->front().task_id.has_value());
+
+    StorageObjectMetadata disk_copy;
+    disk_copy.data_size = 1024;
+    disk_copy.transport_endpoint = "offload_completion_disk";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, *tasks, {disk_copy}));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 3, batch));
+    MockMetadataStore standby;
+    OpLogApplier applier(&standby, cluster_id);
+    OpLogBatchStandbyReader reader(cluster_id, *backend, applier);
+    auto replay = reader.PollOnce();
+    ASSERT_EQ(replay.error, ErrorCode::OK);
+    EXPECT_EQ(replay.applied_entries, 3u);
+    const auto restored = standby.GetMetadata(kDefaultTenant.value(), key);
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->replicas.size(), 2u);
+    const auto disk =
+        std::find_if(restored->replicas.begin(), restored->replicas.end(),
+                     [](const auto& r) { return r.is_local_disk_replica(); });
+    ASSERT_NE(disk, restored->replicas.end());
+    EXPECT_EQ(disk->get_local_disk_descriptor().client_id, mounted.client_id);
+    EXPECT_EQ(disk->get_local_disk_descriptor().transport_endpoint,
+              disk_copy.transport_endpoint);
+    EXPECT_EQ(disk->get_local_disk_descriptor().object_size,
+              disk_copy.data_size);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
        OffloadAndPromotionSuccessRemainFunctional) {
     const std::string cluster_id = "test_batch_record_e2e_offload_promotion";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
@@ -5496,14 +5565,14 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                        "batch_e2e_offload_promotion_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = offload_key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "batch_e2e_offload_endpoint";
-    ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
-            .has_value());
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "batch_e2e_offload_endpoint",
+                         ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service
+                    .AddReplica(mounted.client_id, offload_key, kDefaultTenant,
+                                disk_replica)
+                    .has_value());
     ReadBatchEventually(storage, 3, batch);
 
     auto offload_replicas = service.GetReplicaList(offload_key, kDefaultTenant);
@@ -5527,8 +5596,10 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     ASSERT_TRUE(service
-                    .NotifyPromotionSuccess(mounted.client_id, promotion_key,
-                                            kDefaultTenant)
+                    .NotifyPromotionTaskSuccess(
+                        mounted.client_id,
+                        SeededPromotionItem(kDefaultTenant, promotion_key),
+                        kDefaultTenant)
                     .has_value());
     ReadBatchEventually(storage, 4, batch);
 
@@ -5949,8 +6020,7 @@ TEST_F(MasterServiceHATest,
               object_size);
 }
 
-TEST_F(MasterServiceHATest,
-       NotifyOffloadSuccessFallbackWritesBatchRecordOpLog) {
+TEST_F(MasterServiceHATest, AddDiskReplicaWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_offload_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -5990,13 +6060,12 @@ TEST_F(MasterServiceHATest,
     }
     ASSERT_EQ(ErrorCode::OK, read_err);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "local_disk_endpoint";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "local_disk_endpoint",
+                         ReplicaStatus::COMPLETE);
     ASSERT_TRUE(
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+        service.AddReplica(mounted.client_id, key, kDefaultTenant, disk_replica)
             .has_value());
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
     ASSERT_TRUE(replicas.has_value());
@@ -6022,8 +6091,7 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(batch.entries[0].payload.empty());
 }
 
-TEST_F(MasterServiceHATest,
-       NotifyOffloadSuccessFallbackVisibleBeforeBatchRecordDurable) {
+TEST_F(MasterServiceHATest, AddDiskReplicaVisibleBeforeBatchRecordDurable) {
     const std::string cluster_id = "test_batch_record_offload_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -6048,15 +6116,14 @@ TEST_F(MasterServiceHATest,
                        "batch_offload_visible_seg");
     ReadBatchEventually(storage, 2, batch);
 
-    OffloadTaskItem task{
-        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
-    StorageObjectMetadata metadata;
-    metadata.data_size = 1024;
-    metadata.transport_endpoint = "local_disk_visible_endpoint";
+    // A disk replica registered through AddReplica (NotifyOffloadSuccess
+    // only registers the completion of an offload task the client took).
+    Replica disk_replica(mounted.client_id, 1024, "local_disk_visible_endpoint",
+                         ReplicaStatus::COMPLETE);
 
     backend->BlockTxn();
-    auto offload =
-        service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata});
+    auto offload = service.AddReplica(mounted.client_id, key, kDefaultTenant,
+                                      disk_replica);
     EXPECT_TRUE(offload.has_value());
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);
@@ -6169,8 +6236,9 @@ TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {
     SeedPromotionTaskForTesting(&service, kDefaultTenant, key,
                                 mounted.client_id, put_start->front().id, 1024);
 
-    auto res =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto res = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     ASSERT_TRUE(res.has_value());
 
     for (int i = 0; i < 50; ++i) {
@@ -6223,8 +6291,9 @@ TEST_F(MasterServiceHATest,
                                 mounted.client_id, put_start->front().id, 1024);
 
     backend->BlockTxn();
-    auto promotion =
-        service.NotifyPromotionSuccess(mounted.client_id, key, kDefaultTenant);
+    auto promotion = service.NotifyPromotionTaskSuccess(
+        mounted.client_id, SeededPromotionItem(kDefaultTenant, key),
+        kDefaultTenant);
     EXPECT_TRUE(promotion.has_value());
 
     auto replicas = service.GetReplicaList(key, kDefaultTenant);

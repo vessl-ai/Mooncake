@@ -17,6 +17,7 @@
 //   force_evict lets it go without one. With force_evict, a run that has
 //   queued `cap` offloads lets the rest go without one too.
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,10 +35,12 @@ namespace eviction {
 class OffloadQueue {
    public:
     // Queues `source`, a memory replica of the object `key` names, for a copy
-    // to its host's local disk. True when it was queued, in which case the
-    // destinations are appended to `mirror_clients`.
-    virtual bool Push(const TenantId& tenant_id, const std::string& key,
-                      Replica& source, std::vector<UUID>* mirror_clients) = 0;
+    // to its host's local disk. When it was queued, returns the id every
+    // queued item carries and appends the destinations to `mirror_clients`.
+    virtual std::optional<L4TaskId> Push(const TenantId& tenant_id,
+                                         const std::string& key,
+                                         Replica& source,
+                                         std::vector<UUID>* mirror_clients) = 0;
 
    protected:
     ~OffloadQueue() = default;
