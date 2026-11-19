@@ -9198,6 +9198,7 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    bool refused_task_report = false;
     // Completions refused because they are not the report of a task this
     // client took (re-registrations from a rescan or a store start, late
     // completions of dropped tasks); and task-backed completions refused
@@ -9420,6 +9421,7 @@ auto MasterService::NotifyOffloadSuccess(
                 }
             }
             if (!task_backed) {
+                refused_task_report |= task.task_id.has_value();
                 if (!segment_mounted) {
                     // Keeps a rescan racing a deregistration from going on.
                     refused_unmounted = true;
@@ -9461,6 +9463,9 @@ auto MasterService::NotifyOffloadSuccess(
                      << ", action=notify_offload_success_refused"
                      << ", error=no_local_disk_segment";
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    if (refused_task_report || refused_stale > 0) {
+        return tl::make_unexpected(ErrorCode::INVALID_READ);
     }
     return {};
 }

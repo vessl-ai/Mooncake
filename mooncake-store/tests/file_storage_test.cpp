@@ -2764,7 +2764,7 @@ TEST_F(FileStorageTest, CompletionsRegisterOnlyThroughTheTaskRpc) {
     rig.Stop();
 }
 
-TEST_F(FileStorageTest, RejectedCompletionRollsTheBucketBack) {
+TEST_F(FileStorageTest, UndispatchedCompletionRollsTheBucketBack) {
     OffloadRig rig;
     rig.Start();
     rig.Put("rollback_key", std::string(128, 'r'));
@@ -2783,7 +2783,7 @@ TEST_F(FileStorageTest, RejectedCompletionRollsTheBucketBack) {
         file_storage, [&completion_calls](const auto&, const auto&) {
             ++completion_calls;
             return tl::expected<void, ErrorCode>(
-                tl::make_unexpected(ErrorCode::INVALID_READ));
+                tl::make_unexpected(ErrorCode::OFFLOAD_NOT_DISPATCHED));
         });
     (void)FileStorageProcessDrainedOffloads(file_storage, items);
 
@@ -2822,6 +2822,51 @@ TEST_F(FileStorageTest, LostCompletionReplyKeepsRegisteredBucket) {
     EXPECT_TRUE(StorageKeyExists(file_storage, "rollback_key"));
     EXPECT_EQ(rig.DiskReplicas("rollback_key"), 1u);
     EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));
+    rig.Stop();
+}
+
+TEST_F(FileStorageTest, MixedCompletionKeepsThePublishedDiskCopyReadable) {
+    OffloadRig rig;
+    rig.Start();
+    std::string value(128, 'v');
+    rig.Put("accepted", value);
+    rig.Put("rejected", value);
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 2u);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "2");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/mixed_completion_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(storage));
+    int completion_calls = 0;
+    SetOffloadCompletionRpc(storage, [&](const auto& tasks, auto metadata) {
+        ++completion_calls;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            if (tasks[i].key == "rejected") {
+                --metadata[i].data_size;
+            }
+        }
+        auto result = rig.client->NotifyOffloadTaskSuccess(tasks, metadata);
+        EXPECT_EQ(result, tl::unexpected(ErrorCode::INVALID_READ));
+        return result;
+    });
+
+    ASSERT_TRUE(FileStorageProcessDrainedOffloads(storage, items));
+    EXPECT_EQ(completion_calls, 1);
+    EXPECT_EQ(rig.DiskReplicas("accepted"), 1u);
+    EXPECT_EQ(rig.DiskReplicas("rejected"), 0u);
+    EXPECT_FALSE(rig.HasOffloadTask("rejected"));
+    const auto key = TenantId::Default().MakeScopedKey("accepted");
+    auto loaded = storage.BatchGet({key}, {static_cast<int64_t>(value.size())});
+    ASSERT_TRUE(loaded);
+    ASSERT_EQ(loaded->pointers.size(), 1u);
+    EXPECT_EQ(
+        std::string_view(reinterpret_cast<const char*>(loaded->pointers[0]),
+                         value.size()),
+        value);
     rig.Stop();
 }
 
@@ -3225,7 +3270,8 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
             .transport_endpoint = local_rpc_addr,
         });
     }
-    ASSERT_TRUE(client.value()->NotifyOffloadTaskSuccess(tasks, metadatas));
+    ASSERT_EQ(client.value()->NotifyOffloadTaskSuccess(tasks, metadatas),
+              tl::unexpected(ErrorCode::INVALID_READ));
     DropMemoryCopies(master, *client.value(), {key}, source_segment);
 
     for (const auto& task : tasks) {

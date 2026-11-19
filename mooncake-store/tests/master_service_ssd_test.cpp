@@ -731,8 +731,8 @@ TEST_F(MasterServiceSSDTest, LateCompletionOfARemovedObjectIsRefused) {
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, *first, {file}).has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(client_id, *first, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     ExpectMemoryOnly(*service, "aba_key");
     ASSERT_EQ(OffloadTaskId(*service, "aba_key"), *second->front().task_id);
 
@@ -771,8 +771,8 @@ TEST_F(MasterServiceSSDTest, CompletionOvertakenByItsNackIsRefused) {
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, *first, {file}).has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(client_id, *first, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     ExpectMemoryOnly(*service, "nack_key");
     ASSERT_TRUE(
         service->NotifyOffloadSuccess(client_id, *second, {file}).has_value());
@@ -834,9 +834,8 @@ TEST_F(MasterServiceSSDTest, LateCompletionAfterOrphanSkipIsRefused) {
     ASSERT_TRUE(item3.has_value());
     ASSERT_EQ(item3->size(), 1u);
     // 5.
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, held_completion, {file})
-            .has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(client_id, held_completion, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     ExpectMemoryOnly(*service, key);
     // T3 is untouched; the store's NACK ends it.
     ASSERT_EQ(OffloadTaskId(*service, key), *item3->front().task_id);
@@ -908,8 +907,8 @@ TEST_F(MasterServiceSSDTest, TaskIdsDifferAcrossMasterInstances) {
     StorageObjectMetadata file;
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
-    ASSERT_TRUE(second->NotifyOffloadSuccess(client_id, *from_first, {file})
-                    .has_value());
+    EXPECT_EQ(second->NotifyOffloadSuccess(client_id, *from_first, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     ExpectMemoryOnly(*second, "epoch_key");
     ASSERT_TRUE(second->NotifyOffloadSuccess(client_id, *from_second, {file})
                     .has_value());
@@ -982,8 +981,8 @@ TEST_F(MasterServiceSSDTest, OffloadIsTakenRightAfterAColdStart) {
     ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {previous}, {file})
                     .has_value());
     previous.task_id = L4TaskId{service->L4TaskEpoch() ^ 1, 1};
-    ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {previous}, {file})
-                    .has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(client_id, {previous}, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     ExpectMemoryOnly(*service, "cold_key");
 
     auto taken = service->OffloadObjectHeartbeat(client_id, true);
@@ -1039,15 +1038,15 @@ TEST_F(MasterServiceSSDTest, OnlyTheSourceOwnersCompletionIsRegistered) {
     file.data_size = 4096;
     file.transport_endpoint = "disk_endpoint";
     // The other mirror reports first: refused, and it ends the task.
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(other, other_items, {file}).has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(other, other_items, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     auto after_other =
         service->GetReplicaList("mirror_key", TenantId::Default());
     ASSERT_TRUE(after_other.has_value());
     EXPECT_EQ(after_other->replicas.size(), 2u);
     // The source owner's report now finds no task it took: refused as well.
-    ASSERT_TRUE(service->NotifyOffloadSuccess(source, source_items, {file})
-                    .has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(source, source_items, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     auto after_source =
         service->GetReplicaList("mirror_key", TenantId::Default());
     ASSERT_TRUE(after_source.has_value());
@@ -1159,8 +1158,8 @@ TEST_F(MasterServiceSSDTest, CompletionWithAnotherTaskIdIsRefused) {
                                  L4TaskId{current.epoch ^ 1, current.seq}}) {
         auto item = drained->front();
         item.task_id = other;
-        ASSERT_TRUE(service->NotifyOffloadSuccess(client_id, {item}, {file})
-                        .has_value());
+        EXPECT_EQ(service->NotifyOffloadSuccess(client_id, {item}, {file}),
+                  tl::unexpected(ErrorCode::INVALID_READ));
         ExpectMemoryOnly(*service, "other_id_key");
         ASSERT_EQ(OffloadTaskId(*service, "other_id_key"), current);
     }
@@ -1247,8 +1246,8 @@ TEST_F(MasterServiceSSDTest, OffloadCompletionWithAnotherSizeIsRefused) {
     StorageObjectMetadata file;
     file.data_size = 2048;
     file.transport_endpoint = "disk_endpoint";
-    ASSERT_TRUE(
-        service->NotifyOffloadSuccess(client_id, *tasks, {file}).has_value());
+    EXPECT_EQ(service->NotifyOffloadSuccess(client_id, *tasks, {file}),
+              tl::unexpected(ErrorCode::INVALID_READ));
     auto replicas = service->GetReplicaList("size_key", TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
     ASSERT_EQ(replicas->replicas.size(), 1u);

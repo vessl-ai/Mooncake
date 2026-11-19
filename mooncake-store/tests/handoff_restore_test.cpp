@@ -1874,11 +1874,10 @@ TEST_F(HandoffRestoreTest, RollCarriesNoOffloadStateAndRefusesOldReports) {
     EXPECT_TRUE(HasDisk(master, Key(0, 0), stores_[0].client_id));
 
     auto late = [&](int i) {
-        ASSERT_TRUE(master
-                        .NotifyOffloadSuccess(stores_[0].client_id,
+        EXPECT_EQ(master.NotifyOffloadSuccess(stores_[0].client_id,
                                               {old_items.at(Key(0, i))},
-                                              {DiskMeta("disk-0")})
-                        .has_value());
+                                              {DiskMeta("disk-0")}),
+                  tl::unexpected(ErrorCode::INVALID_READ));
     };
     // Late reports of the old takes: the objects exist, without a task.
     for (int i = 1; i < 4; ++i) late(i);
@@ -1974,9 +1973,9 @@ TEST_F(HandoffRestoreTest, OffloadOnEvictTaskIsQueuedAgainAfterTheRoll) {
     const UUID client = stores_[0].client_id;
 
     for (const auto& item : old_taken) {
-        ASSERT_TRUE(
-            master.NotifyOffloadSuccess(client, {item}, {DiskMeta("disk-0")})
-                .has_value());
+        EXPECT_EQ(
+            master.NotifyOffloadSuccess(client, {item}, {DiskMeta("disk-0")}),
+            tl::unexpected(ErrorCode::INVALID_READ));
     }
     for (int i = 0; i < kKeys; ++i) {
         EXPECT_FALSE(HasDisk(master, Key(0, i), client)) << i;
