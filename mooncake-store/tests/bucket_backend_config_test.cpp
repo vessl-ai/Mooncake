@@ -51,6 +51,9 @@ struct BucketBackendEnvironment {
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar flush_partial_buckets{
         "MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS"};
+    ScopedEnvVar read_pending_eviction{
+        "MOONCAKE_OFFLOAD_BUCKET_READ_PENDING_EVICTION"};
+    ScopedEnvVar keep_queue_order{"MOONCAKE_OFFLOAD_BUCKET_KEEP_QUEUE_ORDER"};
 };
 
 class BucketBackendConfigTest : public ::testing::Test {
@@ -68,6 +71,8 @@ TEST_F(BucketBackendConfigTest, UsesExistingDefaultsWhenEnvironmentIsUnset) {
     EXPECT_EQ(config.disk_scan_cache_ms, 500);
     EXPECT_EQ(config.eviction_policy, BucketEvictionPolicy::FIFO);
     EXPECT_FALSE(config.flush_partial_buckets);
+    EXPECT_FALSE(config.read_pending_eviction);
+    EXPECT_FALSE(config.keep_queue_order);
 }
 
 TEST_F(BucketBackendConfigTest, ReadsPartialFlushBooleanValues) {
@@ -94,6 +99,28 @@ TEST_F(BucketBackendConfigTest, PartialFlushIsReadPerConfiguration) {
     env.flush_partial_buckets.Unset();
     EXPECT_FALSE(BucketBackendConfig::FromEnvironment().flush_partial_buckets);
     EXPECT_TRUE(enabled.flush_partial_buckets);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsTheKeepQueueOrderOptIn) {
+    env.keep_queue_order.Set("true");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+
+    env.keep_queue_order.Set("false");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+
+    env.keep_queue_order.Set("not-a-bool");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().keep_queue_order);
+}
+
+TEST_F(BucketBackendConfigTest, ReadsTheReadPendingEvictionOptIn) {
+    env.read_pending_eviction.Set("true");
+    EXPECT_TRUE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
+
+    env.read_pending_eviction.Set("false");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
+
+    env.read_pending_eviction.Set("not-a-bool");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().read_pending_eviction);
 }
 
 TEST_F(BucketBackendConfigTest, ReadsIndependentValidValues) {

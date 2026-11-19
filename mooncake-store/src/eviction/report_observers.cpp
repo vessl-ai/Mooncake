@@ -18,6 +18,12 @@ int64_t Saturated(uint64_t value) {
         value, static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
 }
 
+// ", name=value" for a count only the opt-in offload options move, so the
+// line reads as before while they are off.
+std::string OptionalField(const char* name, uint64_t value) {
+    return value > 0 ? name + std::to_string(value) : std::string();
+}
+
 }  // namespace
 
 void MetricsObserver::OnRunEnd(const Scope& scope, const Report& report) {
@@ -45,6 +51,12 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
                 << ", offload_cap_forced=" << report.offload_cap_drops
                 << ", offload_push_failed_forced="
                 << report.offload_rejected_drops
+                << OptionalField(", offload_no_local_disk_evicted=",
+                                 report.offload_no_local_disk_drops)
+                << OptionalField(", offload_beyond_frontier_kept=",
+                                 report.offload_beyond_frontier_kept)
+                << OptionalField(", offload_unread_evicted=",
+                                 report.offload_unread_drops)
                 << ", total_freed_size=" << report.released_bytes
                 << ", eviction_base=" << report.filed
                 << ", actual_evict_ratio=" << actual_evict_ratio;
@@ -67,6 +79,13 @@ void LogObserver::OnRunEnd(const Scope& scope, const Report& report) {
         LOG(WARNING) << prefix << "Offload cap (" << offload_cap_ << ") reached"
                      << whose << "; force-evicted " << report.offload_cap_drops
                      << " object(s) without disk offload.";
+    }
+    if (report.offload_no_local_disk_drops > 0) {
+        LOG(INFO) << prefix << "Evicted " << report.offload_no_local_disk_drops
+                  << " object(s)" << whose
+                  << " without disk offload: their store has no LOCAL_DISK "
+                     "tier taking offloads "
+                     "(offload_evict_without_local_disk=true).";
     }
     if (report.offload_rejected_drops > 0) {
         LOG(WARNING) << prefix << "PushOffloadingQueue failed" << whose

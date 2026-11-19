@@ -1607,6 +1607,15 @@ BucketStorageBackend::BucketStorageBackend(
         LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
                   << " bytes aligned buffer at " << buf;
     }
+    if (bucket_backend_config_.read_pending_eviction) {
+        LOG(INFO) << "BucketStorageBackend: read_pending_eviction enabled; "
+                     "keys stay readable until the master acknowledges "
+                     "their eviction";
+    }
+    if (bucket_backend_config_.keep_queue_order) {
+        LOG(INFO) << "BucketStorageBackend: keep_queue_order enabled; "
+                     "offload buckets are filled in the master's queue order";
+    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -1849,6 +1858,41 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
     // BucketReadGuard tracks inflight reads - one guard per bucket being read
     std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
     std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
+    // The value offset the span reads from, once the span fits the value.
+    const auto span_value_offset =
+        [require_exact_size](const std::string& key,
+                             const StorageValueSpan& span,
+                             const StorageObjectMetadata& metadata)
+        -> tl::expected<int64_t, ErrorCode> {
+        if (span.offset >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+            metadata.data_size < 0) {
+            LOG(ERROR) << "Invalid span for key: " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto value_offset = static_cast<int64_t>(span.offset);
+        const Slice& dest_slice = span.slice;
+        // A full BatchLoad still requires the destination to be the whole
+        // value. A span read may be any window inside it.
+        if (require_exact_size) {
+            if (value_offset != 0 ||
+                metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
+                LOG(ERROR) << "Size mismatch for key: " << key
+                           << ", expected: " << metadata.data_size
+                           << ", got: " << dest_slice.size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        } else if (value_offset > metadata.data_size ||
+                   static_cast<int64_t>(dest_slice.size) >
+                       metadata.data_size - value_offset) {
+            LOG(ERROR) << "Span out of range for key: " << key
+                       << ", offset=" << value_offset
+                       << ", length=" << dest_slice.size
+                       << ", data_size=" << metadata.data_size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return value_offset;
+    };
 
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
@@ -1857,6 +1901,37 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             // Lookup key -> metadata
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end()) {
+                if (bucket_backend_config_.read_pending_eviction) {
+                    // A prepared eviction removed the key from the index but
+                    // the master may not have dropped the replica yet. The
+                    // file is deleted only after CommitPreparedEviction
+                    // removes this entry (under mutex_) and FinalizeEviction
+                    // waits for the guard taken here.
+                    auto pending_it = pending_eviction_reads_.find(key);
+                    if (pending_it != pending_eviction_reads_.end()) {
+                        const auto& pending_read = pending_it->second;
+                        const auto& metadata = pending_read.metadata;
+                        const auto value_offset =
+                            span_value_offset(key, span, metadata);
+                        if (!value_offset) {
+                            return tl::make_unexpected(value_offset.error());
+                        }
+                        if (bucket_read_plans.find(metadata.bucket_id) ==
+                            bucket_read_plans.end()) {
+                            bucket_guards.emplace_back(pending_read.bucket);
+                        }
+                        pending_read.pending_reads->fetch_add(
+                            1, std::memory_order_relaxed);
+                        VLOG(1) << "Reading key from a bucket pending "
+                                   "eviction: "
+                                << key << ", bucket_id=" << metadata.bucket_id;
+                        bucket_read_plans[metadata.bucket_id].push_back(
+                            ReadPlan{key, metadata.bucket_id, metadata.offset,
+                                     metadata.key_size, metadata.data_size,
+                                     *value_offset, dest_slice});
+                        continue;
+                    }
+                }
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
@@ -1870,32 +1945,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
                 return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
             }
 
-            if (span.offset > static_cast<uint64_t>(
-                                  std::numeric_limits<int64_t>::max()) ||
-                metadata.data_size < 0) {
-                LOG(ERROR) << "Invalid span for key: " << key;
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            }
-            const auto value_offset = static_cast<int64_t>(span.offset);
-            // A full BatchLoad still requires the destination to be the whole
-            // value. A span read may be any window inside it.
-            if (require_exact_size) {
-                if (value_offset != 0 ||
-                    metadata.data_size !=
-                        static_cast<int64_t>(dest_slice.size)) {
-                    LOG(ERROR) << "Size mismatch for key: " << key
-                               << ", expected: " << metadata.data_size
-                               << ", got: " << dest_slice.size;
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-            } else if (value_offset > metadata.data_size ||
-                       static_cast<int64_t>(dest_slice.size) >
-                           metadata.data_size - value_offset) {
-                LOG(ERROR) << "Span out of range for key: " << key
-                           << ", offset=" << value_offset
-                           << ", length=" << dest_slice.size
-                           << ", data_size=" << metadata.data_size;
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            const auto value_offset = span_value_offset(key, span, metadata);
+            if (!value_offset) {
+                return tl::make_unexpected(value_offset.error());
             }
 
             // Create guard for this bucket if not already guarded
@@ -1918,12 +1970,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
             // Copy metadata into read plan
             bucket_read_plans[metadata.bucket_id].push_back(ReadPlan{
                 key, metadata.bucket_id, metadata.offset, metadata.key_size,
-                metadata.data_size, value_offset, dest_slice});
+                metadata.data_size, *value_offset, dest_slice});
         }
     }
     // Lock released here - bucket files protected by BucketReadGuards
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
+    if (test_batch_load_after_plan_hook_) {
+        test_batch_load_after_plan_hook_();
+    }
 
     // Step 2: Perform IO without holding any locks
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
@@ -2451,6 +2506,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
                                        deferred_keys);
 }
 
+tl::expected<void, ErrorCode>
+BucketStorageBackend::AllocateOffloadingBucketsInOrder(
+    const std::vector<std::pair<std::string, int64_t>>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysInIterationOrder(offloading_objects, buckets_keys,
+                                               deferred_keys);
+}
+
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
@@ -2469,6 +2533,16 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys,
+    std::vector<std::string>* deferred_keys) {
+    return GroupOffloadingKeysInIterationOrder(offloading_objects, buckets_keys,
+                                               deferred_keys);
+}
+
+template <typename Objects>
+tl::expected<void, ErrorCode>
+BucketStorageBackend::GroupOffloadingKeysInIterationOrder(
+    const Objects& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys,
     std::vector<std::string>* deferred_keys) {
     MutexLocker offloading_locker(&offloading_mutex_);
@@ -3073,6 +3147,10 @@ BucketStorageBackend::PrepareEviction(
         }
     }
 
+    if (bucket_backend_config_.read_pending_eviction) {
+        result.pending_reads = std::make_shared<std::atomic<int64_t>>(0);
+    }
+
     size_t evict_count = 0;
     constexpr size_t kMaxEvictionBuckets = 1000;
     uint64_t accumulated_freed_space = 0;
@@ -3151,6 +3229,13 @@ BucketStorageBackend::PrepareEviction(
                     obj_it->second.data_size + obj_it->second.key_size;
                 total_size_ -= object_size;
                 evicted_size += object_size;
+                if (result.pending_reads) {
+                    // The file stays on disk until FinalizeEviction, which
+                    // waits for readers holding a guard on evict_meta.
+                    pending_eviction_reads_.insert_or_assign(
+                        key, PendingEvictionRead{obj_it->second, evict_meta,
+                                                 result.pending_reads});
+                }
                 object_bucket_map_.erase(obj_it);
                 pending_eviction_keys_.insert(key);
                 result.keys.push_back(key);
@@ -3197,6 +3282,16 @@ void BucketStorageBackend::RestorePreparedEviction(PendingEviction&& pending) {
 void BucketStorageBackend::RestorePreparedEvictionLocked(
     PendingEviction&& pending) {
     ReleasePreparedWriteLocked(pending);
+    if (pending.pending_reads) {
+        // The keys go back into object_bucket_map_ below, under the same
+        // lock, so a reader sees them in one place or the other.
+        const int64_t served = ForgetPendingEvictionReadsLocked(pending);
+        if (served > 0) {
+            LOG(INFO) << "[Evict] restored: " << served
+                      << " key read(s) were served from buckets pending "
+                         "eviction";
+        }
+    }
 
     CHECK_GE(pending_eviction_size_, pending.evicted_size);
     pending_eviction_size_ -= pending.evicted_size;
@@ -3240,12 +3335,36 @@ void BucketStorageBackend::CommitPreparedEviction(
         return;
     }
 
-    SharedMutexLocker lock(&mutex_);
-    CHECK_GE(pending_eviction_size_, pending.evicted_size);
-    pending_eviction_size_ -= pending.evicted_size;
-    for (const auto& key : pending.keys) {
-        pending_eviction_keys_.erase(key);
+    int64_t served = 0;
+    {
+        SharedMutexLocker lock(&mutex_);
+        CHECK_GE(pending_eviction_size_, pending.evicted_size);
+        pending_eviction_size_ -= pending.evicted_size;
+        for (const auto& key : pending.keys) {
+            pending_eviction_keys_.erase(key);
+        }
+        if (pending.pending_reads) {
+            // From here on BatchLoad cannot take a new guard on these
+            // buckets, so FinalizeEviction's wait covers every reader.
+            served = ForgetPendingEvictionReadsLocked(pending);
+        }
     }
+    if (served > 0) {
+        LOG(INFO) << "[Evict] committed: " << served
+                  << " key read(s) were served from buckets pending eviction";
+    }
+}
+
+int64_t BucketStorageBackend::ForgetPendingEvictionReadsLocked(
+    const PendingEviction& pending) {
+    for (const auto& key : pending.keys) {
+        auto it = pending_eviction_reads_.find(key);
+        if (it != pending_eviction_reads_.end() &&
+            it->second.pending_reads == pending.pending_reads) {
+            pending_eviction_reads_.erase(it);
+        }
+    }
+    return pending.pending_reads->load(std::memory_order_relaxed);
 }
 
 void BucketStorageBackend::ReleasePreparedWrite(

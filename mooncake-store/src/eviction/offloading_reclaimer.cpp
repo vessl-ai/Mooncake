@@ -7,14 +7,23 @@
 namespace mooncake {
 namespace eviction {
 
+namespace {
+
+bool InFrontier(const Report& so_far) {
+    return !so_far.frontier_end || so_far.Taken() < *so_far.frontier_end;
+}
+
+}  // namespace
+
 tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
     metadata::Namespace& ns, const route::WriteGuard& hold, const Plan& plan,
     const Report& so_far) {
     ObjectMetadata& metadata = hold.metadata();
     // A local-disk replica whose removal awaits durability no longer keeps
     // the data, so it does not spare the object its offload.
-    if (metadata.HasReplica([](const Replica& replica) {
-            return replica.is_local_disk_replica() && replica.is_completed();
+    if (metadata.HasReplica([this](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed() &&
+                   queue_.KeepsData(replica);
         })) {
         return inner_.Apply(ns, hold, plan, so_far);
     }
@@ -22,11 +31,23 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
     if (hold.state().offloading_task.has_value()) {
         return inner_.Apply(ns, hold, plan, so_far);
     }
+    const bool in_frontier = InFrontier(so_far);
+    if (options_.frontier_only && !in_frontier) {
+        Effect kept;
+        kept.keep_reason = KeepReason::kBeyondFrontier;
+        return kept;
+    }
+    if (options_.drop_unread && in_frontier &&
+        metadata.unread_since_put.load(std::memory_order_relaxed)) {
+        return WithoutOffload(ns, hold, plan, so_far, DropReason::kUnread);
+    }
     if (options_.force_evict && static_cast<long>(so_far.Count(
                                     Outcome::kOffloadQueued)) >= options_.cap) {
         return WithoutOffload(ns, hold, plan, so_far, DropReason::kOffloadCap);
     }
 
+    bool push_failed = false;
+    bool only_no_local_disk = true;
     for (const ReplicaID id : plan.release) {
         Replica* source = metadata.GetReplicaByID(id);
         if (source == nullptr) {
@@ -36,6 +57,9 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
         const auto task_id =
             queue_.Push(ns.id(), hold.key(), *source, &mirror_clients);
         if (!task_id) {
+            push_failed = true;
+            only_no_local_disk = only_no_local_disk &&
+                                 task_id.error() == ErrorCode::UNABLE_OFFLOADING;
             continue;
         }
         source->inc_refcnt();
@@ -64,11 +88,19 @@ tl::expected<Effect, ErrorCode> OffloadingReclaimer::Apply(
         return effect;
     }
 
+    const bool no_local_disk = push_failed && only_no_local_disk;
+    if (options_.evict_without_local_disk && no_local_disk) {
+        return WithoutOffload(ns, hold, plan, so_far, DropReason::kNoLocalDisk);
+    }
     if (options_.force_evict) {
         return WithoutOffload(ns, hold, plan, so_far,
                               DropReason::kOffloadRejected);
     }
-    return Effect{};
+    Effect kept;
+    if (no_local_disk) {
+        kept.keep_reason = KeepReason::kNoLocalDisk;
+    }
+    return kept;
 }
 
 tl::expected<Effect, ErrorCode> OffloadingReclaimer::WithoutOffload(

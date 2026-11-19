@@ -42,6 +42,118 @@ void MasterServiceTestPeer::RunBatchEvictForTesting(
     service_.BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
 
+void MasterServiceTestPeer::PrepareOffloadAdmissionSpareForTesting() {
+    if (service_.offload_admission_filter_) {
+        service_.offload_admission_filter_->PrepareSpare(SIZE_MAX);
+    }
+}
+
+bool MasterServiceTestPeer::AdmitEagerOffloadForTesting(
+    const std::string& key) {
+    const auto object_id =
+        service_.MakeObjectIdentity(key, TenantId::Default());
+    MasterService::MetadataAccessorRW accessor(&service_, object_id);
+    if (!accessor.Exists()) {
+        return false;
+    }
+    return service_.AdmitEagerOffload(object_id, accessor.Get());
+}
+
+ReuseSampler* MasterServiceTestPeer::GetReuseSamplerForTesting() const {
+    return service_.reuse_sampler_.get();
+}
+
+void MasterServiceTestPeer::RunOffloadStallMetricsUpdateForTesting() {
+    service_.UpdateOffloadStallMetrics();
+}
+
+void MasterServiceTestPeer::SetDiskUnmountSweepStripeHookForTesting(
+    std::function<void(size_t)> hook) {
+    service_.disk_unmount_sweep_stripe_hook_ = std::move(hook);
+}
+
+bool MasterServiceTestPeer::WaitForDiskUnmountSweepsForTesting(
+    std::chrono::milliseconds timeout) {
+    std::unique_lock<std::shared_mutex> lock(
+        service_.disk_unmount_sweep_mutex_);
+    return service_.disk_unmount_sweep_cv_.wait_for(lock, timeout, [this] {
+        return service_.disk_unmount_sweep_jobs_.empty();
+    });
+}
+
+bool MasterServiceTestPeer::DiskUnmountSweepPendingForTesting(
+    const UUID& owner) const {
+    return service_.DiskUnmountSweepPending(owner);
+}
+
+void MasterServiceTestPeer::InsertDiskOnlyObjectForTesting(
+    const std::string& key, uint64_t size, const UUID& owner,
+    const std::string& endpoint) {
+    std::shared_ptr<ClientLivenessRecord> record;
+    {
+        std::shared_lock<std::shared_mutex> client_lock(service_.client_mutex_);
+        const auto it = service_.client_liveness_records_.find(owner);
+        if (it != service_.client_liveness_records_.end()) {
+            record = it->second;
+        }
+    }
+    const TenantId tenant = TenantId::Default();
+    std::vector<Replica> replicas;
+    replicas.emplace_back(owner, size, endpoint, ReplicaStatus::COMPLETE,
+                          record);
+    std::shared_lock<std::shared_mutex> state_lock(
+        service_.master_state_mutex_);
+    MasterService::MetadataAccessorRW accessor(
+        &service_, MasterService::ObjectIdentity{tenant, key},
+        MasterService::MetadataAccessorRW::CreateKey{.cleanup_invalid = false});
+    assert(!accessor.IsPublished());
+    accessor.Publish(owner, std::chrono::system_clock::now(), size,
+                     std::move(replicas), std::nullopt, false,
+                     ObjectDataType::UNKNOWN, "", tenant, key);
+    MasterService::SyncCacheTotalAccounting(accessor.Get());
+    service_.local_ssd_manager_.AdjustUsedBytes(owner,
+                                                static_cast<int64_t>(size));
+}
+
+MasterServiceTestPeer::OwnerSweepStats
+MasterServiceTestPeer::SweepLocalDiskOwnerWithStatsForTesting(
+    const UUID& owner) {
+    const std::function<bool(const Replica&)> is_stale =
+        [&owner](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed() &&
+                   replica.get_local_disk_client_id() == owner;
+        };
+    OwnerSweepStats total;
+    const std::function<void(const Replica&)> on_removed =
+        [&total](const Replica&) { ++total.removed_replicas; };
+    std::optional<ErrorCode> persist_error;
+    for (size_t stripe = 0; stripe < kStripeCount; ++stripe) {
+        const auto start = std::chrono::steady_clock::now();
+        service_.VisitNamespaces(
+            [&](const TenantId& tenant_id, metadata::Namespace& ns) {
+                service_.ClearStaleHandlesIn(tenant_id, ns, stripe, is_stale,
+                                             &on_removed, persist_error);
+            });
+        const auto ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
+        total.stripe_ns += ns;
+        total.max_stripe_ns = std::max(total.max_stripe_ns, ns);
+    }
+    return total;
+}
+
+void MasterServiceTestPeer::RunDiscardExpiredForTesting(
+    std::chrono::system_clock::time_point now) {
+    std::shared_lock<std::shared_mutex> state_lock(
+        service_.master_state_mutex_);
+    service_.VisitNamespaces(
+        [&](const TenantId& /*tenant_id*/, metadata::Namespace& ns) {
+            service_.DiscardExpiredProcessingReplicas(ns, now);
+        });
+}
+
 void MasterServiceTestPeer::RunNoFBatchEvictForTesting(
     double evict_ratio_target, double evict_ratio_lowerbound) {
     service_.NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);

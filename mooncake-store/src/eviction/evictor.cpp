@@ -63,7 +63,14 @@ class Evictor::Pass {
           released_before_(report.released_bytes),
           aim_(aim),
           report_(report),
-          now_(now) {}
+          now_(now) {
+        report_.frontier_end =
+            aim.in_bytes ? std::nullopt
+                         : std::optional<uint64_t>(
+                               report_.Taken() +
+                               static_cast<uint64_t>(
+                                   std::ceil(filed_ * aim.target_ratio)));
+    }
 
     // Walks the cursor until the namespace's share of the target is met, then
     // the objects the policy deferred until its share of the minimum is; each

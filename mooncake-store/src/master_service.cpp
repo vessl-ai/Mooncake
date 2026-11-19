@@ -21,6 +21,7 @@
 #include <tuple>
 #include <regex>
 #include <unordered_set>
+#include <utility>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -82,6 +83,7 @@
 #include "eviction/evictor.h"
 #include "eviction/offloading_reclaimer.h"
 #include "eviction/report_observers.h"
+#include "placement_key.h"
 
 namespace mooncake {
 
@@ -351,16 +353,23 @@ struct MasterService::MemoryEviction {
        public:
         explicit OffloadQueue(MasterService& service) : service_(service) {}
 
-        std::optional<L4TaskId> Push(
+        tl::expected<L4TaskId, ErrorCode> Push(
             const TenantId& tenant_id, const std::string& key, Replica& source,
             std::vector<UUID>* mirror_clients) override {
             const L4TaskId task_id = service_.NextL4TaskId();
-            if (!service_.PushOffloadingQueue(ObjectIdentity{tenant_id, key},
-                                              source, task_id,
-                                              mirror_clients)) {
-                return std::nullopt;
+            auto pushed = service_.PushOffloadingQueue(
+                ObjectIdentity{tenant_id, key}, source, task_id,
+                mirror_clients);
+            if (!pushed) {
+                return tl::make_unexpected(pushed.error());
             }
             return task_id;
+        }
+
+        // A disk replica hidden by a pending unmount sweep is no disk copy:
+        // the sweep erases it, as the synchronous sweep already would have.
+        bool KeepsData(const Replica& replica) const override {
+            return !service_.IsDiskReplicaOfSweepingOwner(replica);
         }
 
        private:
@@ -388,6 +397,44 @@ struct MasterService::MemoryEviction {
         const char* medium_;
     };
 
+    // The eviction hooks of the reuse sampler and the offload admission and
+    // stall metrics, each only when its option is on.
+    class OffloadObserver final : public eviction::EvictionObserver {
+       public:
+        explicit OffloadObserver(MasterService& service) : service_(service) {}
+
+        void OnApplied(const eviction::ObjectView& view,
+                       const eviction::Effect& effect) override {
+            if (service_.reuse_sampler_ && effect.released_bytes > 0) {
+                service_.SampleMemoryEviction(view.tenant_id, view.key,
+                                              view.metadata);
+            }
+        }
+
+        void OnRunEnd(const eviction::Scope& scope,
+                      const eviction::Report& report) override {
+            auto& metrics = MasterMetricManager::instance();
+            if (report.offload_unread_drops > 0) {
+                metrics.inc_offload_admission_unread_evicted(
+                    static_cast<int64_t>(report.offload_unread_drops));
+            }
+            if (!service_.offload_stall_metrics_) {
+                return;
+            }
+            if (report.offload_no_local_disk_drops > 0) {
+                metrics.inc_offload_no_local_disk_evicted(
+                    static_cast<int64_t>(report.offload_no_local_disk_drops));
+            }
+            if (scope.tenant_id() == nullptr) {
+                metrics.set_offload_no_local_disk_skipped_objects(
+                    static_cast<int64_t>(report.offload_no_local_disk_kept));
+            }
+        }
+
+       private:
+        MasterService& service_;
+    };
+
     struct Settings {
         bool through_oplog = false;
         bool allow_evict_soft_pinned = false;
@@ -402,6 +449,7 @@ struct MasterService::MemoryEviction {
           offload_queue(service),
           offloading(immediate, offload_queue, settings.offload),
           kv_events(service),
+          offload_observer(service),
           log(settings.offload.cap),
           evictor(service.namespaces_, policy,
                   settings.through_oplog
@@ -418,7 +466,8 @@ struct MasterService::MemoryEviction {
 
     std::vector<eviction::EvictionObserver*> Observers(
         const Settings& settings) {
-        std::vector<eviction::EvictionObserver*> observers{&metrics, &log};
+        std::vector<eviction::EvictionObserver*> observers{
+            &metrics, &log, &offload_observer};
         if (!settings.through_oplog) {
             observers.push_back(&kv_events);
         }
@@ -431,6 +480,7 @@ struct MasterService::MemoryEviction {
     OffloadQueue offload_queue;
     eviction::OffloadingReclaimer offloading;
     KvEventObserver kv_events;
+    OffloadObserver offload_observer;
     eviction::MetricsObserver metrics;
     eviction::LogObserver log;
     // Last, so everything it refers to is built first.
@@ -522,6 +572,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           }
       }),
       kvcs_capacity_refresh_worker_([this] { RefreshKvcsDfsUsage(); }),
+      disk_unmount_sweep_worker_([this] { RunDiskUnmountSweeps(); }),
       enable_async_segment_cleanup_(!config.enable_ha && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -693,7 +744,116 @@ MasterService::MasterService(const MasterServiceConfig& config)
             LOG(INFO) << "Force-evict enabled: objects exceeding offload "
                          "cap will be evicted without disk offload";
         }
+        offload_evict_without_local_disk_ =
+            config.offload_evict_without_local_disk;
+        if (offload_evict_without_local_disk_) {
+            LOG(INFO) << "Evict-without-local-disk enabled: objects on a "
+                         "store with no LOCAL_DISK tier taking offloads will "
+                         "be evicted without disk offload";
+        }
+        offload_evict_frontier_only_ = config.offload_evict_frontier_only;
+        if (offload_evict_frontier_only_) {
+            LOG(INFO) << "Frontier-only offload enabled: an eviction run "
+                         "queues offloads only for its oldest-lease frontier, "
+                         "oldest first; other keys are freed only when they "
+                         "have a disk copy";
+        }
+        offload_admission_read_since_put_ =
+            config.offload_admission_read_since_put;
+        if (offload_admission_read_since_put_) {
+            LOG(INFO) << "Read-since-put offload admission enabled: eviction "
+                         "queues a disk offload only for an object read from "
+                         "memory since its PutEnd and evicts the others "
+                         "without a disk copy";
+        }
     }
+    if (config.offload_admission_read_since_put &&
+        !offload_admission_read_since_put_) {
+        LOG(WARNING) << "offload_admission_read_since_put ignored: it needs "
+                        "enable_offload and offload_on_evict";
+    }
+
+    // Second-put admission applies to the eager PutEnd offload only.
+    if (config.offload_admission_second_put) {
+        if (enable_offload_ && !offload_on_evict_) {
+            // A config file bypasses the flag validator, so check here.
+            if (config.offload_admission_window_puts == 0 ||
+                config.offload_admission_window_puts >
+                    kMaxOffloadAdmissionWindowPuts) {
+                LOG(ERROR) << "offload_admission_window_puts must be in [1, "
+                           << kMaxOffloadAdmissionWindowPuts << "], current "
+                           << config.offload_admission_window_puts;
+                throw std::invalid_argument(
+                    "Invalid offload_admission_window_puts");
+            }
+            offload_admission_filter_ =
+                std::make_unique<OffloadAdmissionFilter>(
+                    config.offload_admission_window_puts,
+                    config.offload_admission_bloom_filter
+                        ? OffloadAdmissionFilter::Kind::kBloom
+                        : OffloadAdmissionFilter::Kind::kCountMinSketch);
+            LOG(INFO) << "Second-put offload admission enabled: PutEnd "
+                         "queues a disk offload only for a key put before "
+                         "within the last "
+                      << offload_admission_filter_->window_puts()
+                      << " puts (filter "
+                      << offload_admission_filter_->MemoryBytes() << " bytes"
+                      << (config.offload_admission_bloom_filter ? ", Bloom"
+                                                                : "")
+                      << ")";
+        } else {
+            LOG(WARNING) << "offload_admission_second_put ignored: it needs "
+                            "enable_offload and offload_on_evict=false";
+        }
+    }
+    if (config.offload_admission_bloom_filter && !offload_admission_filter_) {
+        LOG(WARNING) << "offload_admission_bloom_filter ignored: it needs "
+                        "offload_admission_second_put in effect";
+    }
+
+    // Same conditions as the memory segment's deferred sweep: HA and CXL keep
+    // the synchronous sweep.
+    async_disk_unmount_sweep_ = enable_offload_ &&
+                                config.async_disk_unmount_sweep &&
+                                enable_async_segment_cleanup_;
+    if (async_disk_unmount_sweep_) {
+        LOG(INFO) << "Async disk unmount sweep enabled: "
+                     "UnmountLocalDiskSegment returns before its replica "
+                     "sweep, which runs in the background";
+    } else if (config.async_disk_unmount_sweep) {
+        LOG(WARNING) << "async_disk_unmount_sweep ignored: it needs "
+                        "enable_offload and no HA or CXL";
+    }
+
+    placement_key_hrw_ = config.placement_key_hrw;
+    if (placement_key_hrw_) {
+        LOG(INFO) << "Placement key HRW enabled: a preferred segment entry "
+                  << "\"" << kPlacementKeyPrefix
+                  << "<key>\" ranks the serving segments by rendezvous hash";
+    }
+
+    offload_stall_metrics_ =
+        enable_offload_ && config.enable_offload_stall_metrics;
+    if (offload_stall_metrics_) {
+        LOG(INFO) << "Offload stall metrics enabled";
+    }
+
+    if (config.enable_reuse_sampler) {
+        try {
+            reuse_sampler_ = std::make_unique<ReuseSampler>(
+                config.reuse_sampler_rate, config.reuse_sampler_max_entries);
+        } catch (const std::invalid_argument& e) {
+            // A config file value skips the flag validators.
+            LOG(FATAL) << "Invalid reuse sampler config: " << e.what()
+                       << " (reuse_sampler_rate=" << config.reuse_sampler_rate
+                       << ", reuse_sampler_max_entries="
+                       << config.reuse_sampler_max_entries << ")";
+        }
+        LOG(INFO) << "Reuse sampler enabled: sampling_rate="
+                  << reuse_sampler_->sampling_rate()
+                  << ", max_entries=" << reuse_sampler_->capacity();
+    }
+
     // With offload-on-evict and offload_force_evict, a round that has queued
     // offload_cap_ratio of the offloading queue limit lets the rest of the
     // memory it takes go without an offload.
@@ -703,9 +863,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
             .through_oplog = enable_oplog_,
             .allow_evict_soft_pinned = allow_evict_soft_pinned_objects_,
             .offload_on_evict = offload_on_evict_,
-            .offload = {.cap = static_cast<long>(offloading_queue_limit_ *
-                                                 config.offload_cap_ratio),
-                        .force_evict = config.offload_force_evict}});
+            .offload = {
+                .cap = static_cast<long>(offloading_queue_limit_ *
+                                         config.offload_cap_ratio),
+                .force_evict = config.offload_force_evict,
+                .evict_without_local_disk = offload_evict_without_local_disk_,
+                .frontier_only = offload_evict_frontier_only_,
+                .drop_unread = offload_admission_read_since_put_}});
 
     // Growth-triggered heap trimming (see MaybeTrimHeap()). On unless the
     // ratio is explicitly zeroed, because the master's RSS otherwise grows
@@ -842,6 +1006,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::WeightReconciliationThreadFunc, this);
 
     replica_cleanup_worker_.Start();
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Start();
+    }
 
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_url_ is set,
@@ -1050,6 +1217,13 @@ void MasterService::QuiesceBackgroundWork() {
     timed("replica_cleanup", [&] { replica_cleanup_worker_.Stop(); });
     timed("kvcs_capacity_refresh",
           [&] { kvcs_capacity_refresh_worker_.Stop(); });
+    // A pending sweep stops at its next stripe; its owners' replicas stay
+    // hidden on this master, and the handoff export drops them (their owner
+    // is no longer registered).
+    disk_unmount_sweep_stopping_.store(true, std::memory_order_release);
+    if (async_disk_unmount_sweep_) {
+        timed("disk_unmount_sweep", [&] { disk_unmount_sweep_worker_.Stop(); });
+    }
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -1099,6 +1273,7 @@ bool MasterService::BackgroundWorkQuiesced() const {
            !dynamic_replication_.Joinable() &&
            !replica_cleanup_worker_.Joinable() &&
            !kvcs_capacity_refresh_worker_.Joinable() &&
+           !disk_unmount_sweep_worker_.Joinable() &&
            !graceful_unmount_scheduler_.Joinable() &&
            !client_offboarding_worker_.Joinable();
 }
@@ -2224,12 +2399,20 @@ MasterService::BuildStaleHandleCleanupPlan(
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
     const {
     return BuildStaleHandleCleanupPlan(
-        metadata, [&retaining_clients](const Replica& replica) {
-            return (replica.has_invalid_mem_handle() ||
-                    replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
-                   replica.is_completed();
+        metadata, [this, &retaining_clients](const Replica& replica) {
+            return IsStaleHandle(replica, retaining_clients);
         });
+}
+
+bool MasterService::IsStaleHandle(
+    const Replica& replica,
+    const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+    const {
+    return (replica.has_invalid_mem_handle() ||
+            replica.has_invalid_nof_handle() ||
+            replica.has_stale_local_disk_client(retaining_clients) ||
+            IsDiskReplicaOfSweepingOwner(replica)) &&
+           replica.is_completed();
 }
 
 MasterService::StaleHandleCleanupPlan
@@ -2669,73 +2852,90 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
     VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
-        // Reader pre-check: an object with nothing to sweep never takes the
-        // write lock. Each picked object is classified again under its own
-        // write lock below, since it may have changed, and one torn down or
-        // published again meanwhile is left alone.
-        std::vector<route::ObjectRef> to_sweep;
-        for (auto object : ns.objects.ReadCursor()) {
-            const auto& metadata = object.metadata();
-            if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
-                to_sweep.push_back(object.ref());
-            }
-        }
-        for (const auto& object : to_sweep) {
-            // The by-reference accessor skips the invalid-replica cleanup,
-            // which would drop the stale replicas before this pass could see
-            // what it erased.
-            MetadataAccessorRW accessor(this, tenant_id, object);
-            if (!accessor.IsPublished()) {
-                continue;
-            }
-            auto& metadata = accessor.Get();
-            const auto cleanup_plan =
-                BuildStaleHandleCleanupPlan(metadata, is_stale);
-            if (!cleanup_plan.removed_ids.empty()) {
-                if (enable_ha_ && enable_oplog_) {
-                    // The erase runs from the durable-finalize callback.
-                    auto persist_result = PersistStaleHandleCleanupForHA(
-                        "ClearStaleHandles", tenant_id, object.key, metadata,
-                        cleanup_plan);
-                    if (!persist_result && !first_persist_error) {
-                        first_persist_error = persist_result.error();
-                    }
-                    continue;
-                }
-                if (!CleanupStaleHandles(object.key, tenant_id, metadata,
-                                         accessor.GetState(), is_stale)) {
-                    continue;
-                }
-            } else if (metadata.IsValid()) {
-                continue;
-            } else if (enable_ha_) {
-                if (enable_oplog_) {
-                    auto persist_result = AppendOpLogWithDurableFinalize(
-                        OpType::REMOVE, tenant_id.value(), object.key, {},
-                        [this, object](const OpLogEntry& durable_entry) {
-                            FinalizeMetadataEraseAfterDurable(
-                                object, TenantId(durable_entry.tenant_id));
-                        });
-                    if (!persist_result) {
-                        LOG(WARNING)
-                            << "ClearStaleHandles(last replica)"
-                            << ": REMOVE persist failed for key=" << object.key
-                            << ", err="
-                            << static_cast<int>(persist_result.error());
-                        if (!first_persist_error) {
-                            first_persist_error = persist_result.error();
-                        }
-                    }
-                }
-                continue;
-            }
-            accessor.Erase();
-        }
+        ClearStaleHandlesIn(tenant_id, ns, std::nullopt, is_stale, nullptr,
+                            first_persist_error);
     });
     if (first_persist_error) {
         return tl::make_unexpected(*first_persist_error);
     }
     return {};
+}
+
+void MasterService::ClearStaleHandlesIn(
+    const TenantId& tenant_id, metadata::Namespace& ns,
+    std::optional<size_t> stripe,
+    const std::function<bool(const Replica&)>& is_stale,
+    const std::function<void(const Replica&)>* on_removed,
+    std::optional<ErrorCode>& first_persist_error) {
+    // Reader pre-check: an object with nothing to sweep never takes the
+    // write lock. Each picked object is classified again under its own
+    // write lock below, since it may have changed, and one torn down or
+    // published again meanwhile is left alone.
+    std::vector<route::ObjectRef> to_sweep;
+    {
+        auto objects = stripe ? ns.objects.ReadCursor(*stripe)
+                              : ns.objects.ReadCursor();
+        for (auto object : objects) {
+            const auto& metadata = object.metadata();
+            if (metadata.HasReplica(is_stale) || !metadata.IsValid()) {
+                to_sweep.push_back(object.ref());
+            }
+        }
+    }
+    for (const auto& object : to_sweep) {
+        // The by-reference accessor skips the invalid-replica cleanup,
+        // which would drop the stale replicas before this pass could see
+        // what it erased.
+        MetadataAccessorRW accessor(this, tenant_id, object);
+        if (!accessor.IsPublished()) {
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        const auto cleanup_plan =
+            BuildStaleHandleCleanupPlan(metadata, is_stale);
+        if (!cleanup_plan.removed_ids.empty()) {
+            if (enable_ha_ && enable_oplog_) {
+                // The erase runs from the durable-finalize callback.
+                auto persist_result = PersistStaleHandleCleanupForHA(
+                    "ClearStaleHandles", tenant_id, object.key, metadata,
+                    cleanup_plan);
+                if (!persist_result && !first_persist_error) {
+                    first_persist_error = persist_result.error();
+                }
+                continue;
+            }
+            if (on_removed != nullptr) {
+                std::as_const(metadata).VisitReplicas(is_stale, *on_removed);
+            }
+            if (!CleanupStaleHandles(object.key, tenant_id, metadata,
+                                     accessor.GetState(), is_stale)) {
+                continue;
+            }
+        } else if (metadata.IsValid()) {
+            continue;
+        } else if (enable_ha_) {
+            if (enable_oplog_) {
+                auto persist_result = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant_id.value(), object.key, {},
+                    [this, object](const OpLogEntry& durable_entry) {
+                        FinalizeMetadataEraseAfterDurable(
+                            object, TenantId(durable_entry.tenant_id));
+                    });
+                if (!persist_result) {
+                    LOG(WARNING)
+                        << "ClearStaleHandles(last replica)"
+                        << ": REMOVE persist failed for key=" << object.key
+                        << ", err="
+                        << static_cast<int>(persist_result.error());
+                    if (!first_persist_error) {
+                        first_persist_error = persist_result.error();
+                    }
+                }
+            }
+            continue;
+        }
+        accessor.Erase();
+    }
 }
 
 bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
@@ -3132,9 +3332,13 @@ auto MasterService::ProbeKey(const std::string& key, const TenantId& tenant_id)
 auto MasterService::ExistKeyImpl(const std::string& key,
                                  const TenantId& tenant_id, bool grant_lease)
     -> tl::expected<bool, ErrorCode> {
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    // A probe (no lease) is not a use of the object.
+    if (reuse_sampler_ && grant_lease) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "exist");
+    }
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
-    MetadataAccessorRO accessor(this,
-                                MakeObjectIdentityForRequest(key, tenant_id));
+    MetadataAccessorRO accessor(this, object_id);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
@@ -3223,6 +3427,11 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKeyImpl(
     std::vector<tl::expected<bool, ErrorCode>> results(keys.size());
     if (keys.empty()) {
         return results;
+    }
+    if (reuse_sampler_ && grant_lease) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "exist");
+        }
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
@@ -4829,8 +5038,10 @@ std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
 }
 
 bool MasterService::IsReplicaReadable(const Replica& replica) const {
+    // A disk replica whose owner handed its disk tier back is unreadable
+    // while its unmount sweep is pending.
     return replica.is_completed() && replica.is_available() &&
-           !IsAwaitingRemount(replica);
+           !IsAwaitingRemount(replica) && !IsDiskReplicaOfSweepingOwner(replica);
 }
 
 bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
@@ -4879,6 +5090,10 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             }
 
             results.emplace(key, std::move(replica_list));
+            // Not a read for offload_admission_read_since_put: like the
+            // cache-hit counters, the unread mark follows the per-key Get
+            // paths only. A regex lookup is a bulk listing, and marking every
+            // match as read would offload whatever it happens to match.
             metadata.GrantReadLease(
                 std::chrono::milliseconds(default_kv_lease_ttl_));
         }
@@ -4892,6 +5107,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key, "get");
+    }
 
     ReadFollowUps follow_ups;
     auto resp = [&]() -> tl::expected<GetReplicaListResponse, ErrorCode> {
@@ -4927,6 +5145,11 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
     }
 
     if (replica_list.empty()) {
+        if (OnlyReplicasOfSweepingOwners(metadata)) {
+            VLOG(1) << "key=" << key
+                    << ", info=object_not_found, reason=unmount_sweep";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
         if (metadata.AllReplicas([](const Replica& replica) {
                 return replica.status() == ReplicaStatus::REMOVED;
             })) {
@@ -4941,6 +5164,9 @@ auto MasterService::ReadReplicaList(const TenantId& tenant_id,
         MasterMetricManager::instance().inc_mem_cache_hit_nums();
         MasterMetricManager::instance().inc_mem_cache_hit_bytes(
             static_cast<int64_t>(metadata.TotalLength()));
+        if (offload_admission_read_since_put_) {
+            MarkReadFromMemory(metadata);
+        }
     } else if (replica_list[0].is_local_disk_replica() ||
                replica_list[0].is_disk_replica()) {
         MasterMetricManager::instance().inc_file_cache_hit_nums();
@@ -5011,6 +5237,11 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
+    if (OnlyReplicasOfSweepingOwners(accessor.Get())) {
+        VLOG(1) << "key=" << key
+                << ", info=object_not_found, reason=unmount_sweep";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
     auto resp = ReadReplicaListForAdmin(accessor.Get());
     if (!resp.has_value()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
@@ -5045,6 +5276,11 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     }
 
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    if (reuse_sampler_) {
+        for (const auto& key : keys) {
+            SampleReuseReference(normalized_tenant, key, "get");
+        }
+    }
     ReadFollowUps follow_ups;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -5082,6 +5318,48 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         }
     }
     return results;
+}
+
+void MasterService::ExpandPlacementKeys(
+    const ReplicateConfig& config,
+    const ScopedAllocatorAccess& allocator_access,
+    std::vector<std::string>& preferred_segments) const {
+    const std::vector<std::string>* entries = nullptr;
+    std::vector<std::string> single;
+    if (!config.preferred_segment.empty()) {
+        single.push_back(config.preferred_segment);
+        entries = &single;
+    } else {
+        entries = &config.preferred_segments;
+    }
+    if (std::none_of(entries->begin(), entries->end(), [](const auto& entry) {
+            return ParsePlacementKey(entry).has_value();
+        })) {
+        return;
+    }
+
+    // Rebuild the list in the caller's order, each placement key replaced by
+    // the serving segments in its HRW order (first occurrence wins).
+    const auto serving =
+        allocator_access.getAllocatorManager().getServingNames();
+    std::vector<std::string> expanded;
+    auto append = [&expanded](const std::string& name) {
+        if (!name.empty() && std::find(expanded.begin(), expanded.end(),
+                                       name) == expanded.end()) {
+            expanded.push_back(name);
+        }
+    };
+    for (const auto& entry : *entries) {
+        if (auto placement_key = ParsePlacementKey(entry)) {
+            for (const auto& name :
+                 RankSegmentsForPlacementKey(*placement_key, serving)) {
+                append(name);
+            }
+        } else {
+            append(entry);
+        }
+    }
+    preferred_segments = std::move(expanded);
 }
 
 auto MasterService::AllocateReplicas(const std::string& key,
@@ -5123,6 +5401,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
             has_enough_memory_segments = allocator_access.getAllocatorManager()
                                              .getServingNames()
                                              .size() >= config.replica_num;
+            if (placement_key_hrw_) {
+                ExpandPlacementKeys(config, allocator_access,
+                                    preferred_segments);
+            }
             if (!writer_host_id.empty()) {
                 auto host_ordered_segments =
                     allocator_access.GetHostOrderedSegments(writer_host_id,
@@ -5546,6 +5828,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    if (reuse_sampler_) {
+        SampleReuseReference(object_id.tenant_id, object_id.user_key,
+                             "put_start");
+    }
     auto plan = PrepareWriteStart(client_id, key, object_id.tenant_id,
                                   slice_length, config, "put_start");
     if (!plan) {
@@ -5756,13 +6042,23 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         metadata.MutablePart(0).SetChecksum(object_meta.object_checksum);
     }
 
+    // offload_admission_second_put: the first End of a write records the
+    // put in the admission filter whatever its replica type and whether it
+    // can queue an offload, so that a later End of the same write (a MEMORY
+    // End after a DFS End) follows this write's answer. True when the mode
+    // is off.
+    const bool eager_offload_admitted = AdmitEagerOffload(object_id, metadata);
+
     // A key has at most one offload task: a second push would replace the
-    // queued item of the current task with one whose id no task has.
+    // queued item of the current task with one whose id no task has. With
+    // offload_admission_second_put the key must also have been put before
+    // (eager_offload_admitted).
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
         !offload_on_evict_ && !accessor.GetState().offloading_task &&
         !metadata.HasReplica([](const Replica& replica) {
             return replica.is_dfs_replica() && replica.is_processing();
-        })) {
+        }) &&
+        eager_offload_admitted) {
         auto& state = accessor.GetState();
         // One marker covers every mirror pushed below, so the mirrors are
         // collected before the marker is recorded.
@@ -5797,6 +6093,12 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
+    // offload_admission_read_since_put: a new write is unread until a read
+    // is served from memory.
+    if (offload_admission_read_since_put_ && !had_completed_replica) {
+        metadata.unread_since_put.store(true, std::memory_order_relaxed);
+    }
+
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
@@ -5821,6 +6123,29 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         import_write->Accept();
     }
     return {};
+}
+
+bool MasterService::AdmitEagerOffload(const ObjectIdentity& object_id,
+                                      ObjectMetadata& metadata) {
+    if (!offload_admission_filter_) {
+        return true;
+    }
+    // A later End of the same write follows the first End's answer. Asking
+    // the filter again would count that first End as an earlier put.
+    if (metadata.eager_offload_judged) {
+        return metadata.eager_offload_admitted;
+    }
+    const std::string scoped_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+    const bool admitted = offload_admission_filter_->ObservePut(scoped_key);
+    metadata.eager_offload_judged = true;
+    metadata.eager_offload_admitted = admitted;
+    if (admitted) {
+        MasterMetricManager::instance().inc_offload_admission_put_admitted();
+    } else {
+        MasterMetricManager::instance().inc_offload_admission_put_skipped();
+    }
+    return admitted;
 }
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
@@ -6376,6 +6701,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     !has_bucket_dfs_replica && !restore_missing_bucket_dfs) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
+                    // A new write: its first End asks the admission filter
+                    // again (offload_admission_second_put).
+                    metadata.eager_offload_judged = false;
+                    metadata.eager_offload_admitted = false;
 
                     const auto previous_kv_media = KvMediaSnapshot(metadata);
 
@@ -6718,6 +7047,10 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
 
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     if (!metadata.IsValid()) {
+        if (reuse_sampler_) {
+            SampleDiskEviction(object_id.tenant_id, object_id.user_key,
+                               metadata);
+        }
         accessor.Erase();
     }
     return true;
@@ -7937,19 +8270,13 @@ bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id, ObjectMetadata& metadata,
     route::ObjectState& state,
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients) {
-    // Removes replicas with invalid allocators (memory replicas on unmounted
-    // segments) and local_disk replicas whose owner no longer retains
-    // resources.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
     return CleanupStaleHandles(
         key, tenant_id, metadata, state,
-        [&retaining_clients](const Replica& replica) {
-            return (replica.has_invalid_mem_handle() ||
-                    replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(retaining_clients)) &&
-                   replica.is_completed();
+        [this, &retaining_clients](const Replica& replica) {
+            return IsStaleHandle(replica, retaining_clients);
         });
 }
 
@@ -8421,10 +8748,21 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         MasterMetricManager::instance().client_liveness_record_created();
     }
     ErrorCode err = ErrorCode::INTERNAL_ERROR;
+    bool unmount_sweep_pending = false;
     const auto observation =
         record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
             std::shared_lock<std::shared_mutex> snapshot_lock(
                 master_state_mutex_);
+            // A new registration must not coexist with replicas of this
+            // client's previous one. The sweep job is recorded under
+            // master_state_mutex_ held exclusively, so this check and the
+            // registration below see it or come entirely before it.
+            if (async_disk_unmount_sweep_ &&
+                DiskUnmountSweepPending(client_id)) {
+                unmount_sweep_pending = true;
+                err = ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                return false;
+            }
             err =
                 local_ssd_manager_.RegisterClient(client_id, enable_offloading);
             return err == ErrorCode::OK ||
@@ -8432,6 +8770,12 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         });
     if (observation == ClientLivenessObservation::REJECTED_OFFLINE) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (unmount_sweep_pending) {
+        MasterMetricManager::instance().inc_disk_unmount_remount_refused();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=mount_local_disk_segment_deferred"
+                  << ", reason=unmount_sweep_pending";
     }
     if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
         if (inserted) {
@@ -8475,10 +8819,39 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // (the check refuses it). Without the exclusive lock a registration
     // admitted against the old one could land on a key the sweep had
     // already passed and survive as a stale owner.
+    //
+    // With async_disk_unmount_sweep the sweep runs on
+    // disk_unmount_sweep_worker_ instead. The job is recorded in the same
+    // exclusive section as the deregistration, so from the moment this call
+    // can return the owner's replicas are unreadable (IsReplicaReadable) and
+    // a mount of the same client is refused until the sweep ends
+    // (MountLocalDiskSegment).
     std::optional<int64_t> reported_capacity;
+    size_t pending_sweeps = 0;
     {
         std::unique_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
         reported_capacity = local_ssd_manager_.UnregisterClient(client_id);
+        if (reported_capacity && async_disk_unmount_sweep_) {
+            std::unique_lock<std::shared_mutex> sweep_lock(
+                disk_unmount_sweep_mutex_);
+            auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                    disk_unmount_sweep_jobs_.end(),
+                                    [&client_id](const auto& pending) {
+                                        return pending.owner == client_id;
+                                    });
+            if (job == disk_unmount_sweep_jobs_.end()) {
+                disk_unmount_sweep_jobs_.push_back(DiskUnmountSweepJob{
+                    .owner = client_id,
+                    .started = std::chrono::steady_clock::now()});
+            } else {
+                // Not reachable while a pending sweep refuses the mount;
+                // restarting the full pass keeps the invariant regardless.
+                job->stripes_left = route::ObjectRoute::kStripeCount;
+            }
+            pending_sweeps = disk_unmount_sweep_jobs_.size();
+            disk_unmount_sweep_owner_count_.store(pending_sweeps);
+            PublishDiskUnmountSweepProgressLocked();
+        }
     }
     if (!reported_capacity) {
         // Idempotent, the same way MountLocalDiskSegment treats an
@@ -8498,11 +8871,170 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     // erased -- and when that disk replica was the key's only one, the key
     // itself. An owner-id predicate cannot misclassify a concurrent mount,
     // whatever the interleaving.
+    if (async_disk_unmount_sweep_) {
+        disk_unmount_sweep_worker_.Schedule();
+        LOG(INFO) << "client_id=" << client_id
+                  << ", action=unmount_local_disk_segment_by_request"
+                  << ", sweep=background, pending_sweeps=" << pending_sweeps;
+        return {};
+    }
     ClearLocalDiskHandlesOwnedBy(client_id);
 
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_request";
     return {};
+}
+
+bool MasterService::DiskUnmountSweepPending(const UUID& owner) const {
+    if (disk_unmount_sweep_owner_count_.load() == 0) {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+    return std::any_of(
+        disk_unmount_sweep_jobs_.begin(), disk_unmount_sweep_jobs_.end(),
+        [&owner](const auto& job) { return job.owner == owner; });
+}
+
+bool MasterService::IsDiskReplicaOfSweepingOwner(const Replica& replica) const {
+    if (!async_disk_unmount_sweep_ || !replica.is_local_disk_replica()) {
+        return false;
+    }
+    const auto owner = replica.get_local_disk_client_id();
+    return owner && DiskUnmountSweepPending(*owner);
+}
+
+bool MasterService::OnlyReplicasOfSweepingOwners(
+    const ObjectMetadata& metadata) const {
+    if (!async_disk_unmount_sweep_) {
+        return false;
+    }
+    // What the synchronous sweep leaves: no object (or only REMOVED ones).
+    return metadata.AllReplicas([this](const Replica& replica) {
+        return replica.status() == ReplicaStatus::REMOVED ||
+               IsDiskReplicaOfSweepingOwner(replica);
+    });
+}
+
+void MasterService::PublishDiskUnmountSweepProgressLocked() const {
+    constexpr size_t kStripes = route::ObjectRoute::kStripeCount;
+    int64_t remaining_stripes = 0;
+    int64_t remaining_replicas = 0;
+    int64_t oldest_age_seconds = 0;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& job : disk_unmount_sweep_jobs_) {
+        remaining_stripes += static_cast<int64_t>(job.stripes_left);
+        const size_t visited = kStripes - job.stripes_left;
+        if (visited > 0) {
+            // Keys hash uniformly over the stripes.
+            remaining_replicas += static_cast<int64_t>(
+                job.removed_replicas * job.stripes_left / visited);
+        }
+        oldest_age_seconds = std::max<int64_t>(
+            oldest_age_seconds,
+            std::chrono::duration_cast<std::chrono::seconds>(now - job.started)
+                .count());
+    }
+    MasterMetricManager::instance().set_disk_unmount_sweep_progress(
+        static_cast<int64_t>(disk_unmount_sweep_jobs_.size()),
+        remaining_stripes, remaining_replicas, oldest_age_seconds);
+}
+
+void MasterService::RunDiskUnmountSweeps() {
+    // One route stripe per step, round robin, across every namespace. Every
+    // pending owner takes part in each step; an owner is done once it has
+    // taken part in kStripeCount consecutive steps, i.e. once every stripe
+    // was swept for it after its unmount. Owners that unmount together share
+    // the walks.
+    constexpr size_t kStripes = route::ObjectRoute::kStripeCount;
+    while (!disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+        std::vector<UUID> owners;
+        {
+            std::shared_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            if (disk_unmount_sweep_jobs_.empty()) {
+                return;
+            }
+            owners.reserve(disk_unmount_sweep_jobs_.size());
+            for (const auto& job : disk_unmount_sweep_jobs_) {
+                owners.push_back(job.owner);
+            }
+        }
+        const size_t stripe = disk_unmount_sweep_cursor_;
+        disk_unmount_sweep_cursor_ = (stripe + 1) % kStripes;
+        if (disk_unmount_sweep_stripe_hook_) {
+            disk_unmount_sweep_stripe_hook_(stripe);
+        }
+        if (disk_unmount_sweep_stopping_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::vector<uint64_t> removed(owners.size(), 0);
+        const auto owner_index = [&owners](const Replica& replica) {
+            const auto owner = replica.get_local_disk_client_id();
+            if (!owner) return owners.size();
+            return static_cast<size_t>(
+                std::find(owners.begin(), owners.end(), *owner) -
+                owners.begin());
+        };
+        const std::function<bool(const Replica&)> is_stale =
+            [&owners, &owner_index](const Replica& replica) {
+                return replica.is_local_disk_replica() &&
+                       replica.is_completed() &&
+                       owner_index(replica) < owners.size();
+            };
+        const std::function<void(const Replica&)> on_removed =
+            [&removed, &owner_index](const Replica& replica) {
+                const size_t index = owner_index(replica);
+                if (index < removed.size()) ++removed[index];
+            };
+        std::optional<ErrorCode> persist_error;
+        VisitNamespaces([&](const TenantId& tenant_id, metadata::Namespace& ns) {
+            ClearStaleHandlesIn(tenant_id, ns, stripe, is_stale, &on_removed,
+                                persist_error);
+        });
+
+        uint64_t removed_total = 0;
+        std::vector<DiskUnmountSweepJob> finished;
+        {
+            std::unique_lock<std::shared_mutex> lock(disk_unmount_sweep_mutex_);
+            for (size_t k = 0; k < owners.size(); ++k) {
+                auto job = std::find_if(disk_unmount_sweep_jobs_.begin(),
+                                        disk_unmount_sweep_jobs_.end(),
+                                        [&](const auto& pending) {
+                                            return pending.owner == owners[k];
+                                        });
+                if (job == disk_unmount_sweep_jobs_.end()) continue;
+                removed_total += removed[k];
+                job->removed_replicas += removed[k];
+                if (--job->stripes_left == 0) {
+                    finished.push_back(*job);
+                    disk_unmount_sweep_jobs_.erase(job);
+                }
+            }
+            disk_unmount_sweep_owner_count_.store(
+                disk_unmount_sweep_jobs_.size());
+            PublishDiskUnmountSweepProgressLocked();
+        }
+        if (!finished.empty()) {
+            disk_unmount_sweep_cv_.notify_all();
+        }
+        if (removed_total > 0) {
+            MasterMetricManager::instance()
+                .inc_disk_unmount_sweep_removed_replicas(
+                    static_cast<int64_t>(removed_total));
+        }
+        for (const auto& job : finished) {
+            const auto duration_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - job.started)
+                    .count();
+            MasterMetricManager::instance()
+                .observe_disk_unmount_sweep_duration_ms(duration_ms);
+            LOG(INFO) << "client_id=" << job.owner
+                      << ", action=local_disk_unmount_sweep_done"
+                      << ", duration_ms=" << duration_ms
+                      << ", removed_replicas=" << job.removed_replicas;
+        }
+    }
 }
 
 bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
@@ -9019,6 +9551,129 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     MasterMetricManager::instance().inc_offload_enqueued(client_id_str);
     return {};
+}
+
+void MasterService::UpdateOffloadStallMetrics() {
+    const auto now = std::chrono::system_clock::now();
+    int64_t pending = 0;
+    int64_t without_local_disk = 0;
+    std::optional<std::chrono::system_clock::time_point> oldest;
+    // Each store's registration is looked up once per walk.
+    std::unordered_map<UUID, bool, boost::hash<UUID>> registered;
+    auto has_local_disk = [&](const UUID& client_id) {
+        auto [it, inserted] = registered.try_emplace(client_id, false);
+        if (inserted) {
+            it->second = HasMountedLocalDiskSegment(client_id);
+        }
+        return it->second;
+    };
+
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+        VisitNamespaces([&](const TenantId&, metadata::Namespace& ns) {
+            for (auto object : ns.objects.ReadCursor()) {
+                const auto& task = object.state().offloading_task;
+                if (!task) {
+                    continue;
+                }
+                ++pending;
+                if (!oldest || task->start_time < *oldest) {
+                    oldest = task->start_time;
+                }
+                // No target store can take or report it any more: the
+                // pinned source is freed only when the task expires.
+                if (std::none_of(task->mirror_clients.begin(),
+                                 task->mirror_clients.end(), has_local_disk)) {
+                    ++without_local_disk;
+                }
+            }
+        });
+    }
+
+    int64_t oldest_age_seconds = 0;
+    if (oldest) {
+        oldest_age_seconds = std::max<int64_t>(
+            0, std::chrono::duration_cast<std::chrono::seconds>(now - *oldest)
+                   .count());
+    }
+    auto& metrics = MasterMetricManager::instance();
+    metrics.set_offload_tasks_pending(pending);
+    metrics.set_offload_tasks_without_local_disk(without_local_disk);
+    metrics.set_offload_task_oldest_age_seconds(oldest_age_seconds);
+}
+
+namespace {
+
+double ToSeconds(std::chrono::nanoseconds duration) {
+    return std::max(0.0, std::chrono::duration<double>(duration).count());
+}
+
+double SecondsSincePutStart(const ObjectMetadata& metadata) {
+    return ToSeconds(std::chrono::system_clock::now() -
+                     metadata.put_start_time);
+}
+
+}  // namespace
+
+void MasterService::SampleReuseReference(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const char* op) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const auto reuse = reuse_sampler_->RecordReference(
+        fingerprint, ReuseSampler::Clock::now());
+    if (!reuse) {
+        return;
+    }
+    auto& metrics = MasterMetricManager::instance();
+    if (reuse->since_memory_eviction) {
+        metrics.observe_reuse_sampler_memory_reuse_age(
+            reuse->disk_copy_present ? "disk" : "none", op,
+            ToSeconds(*reuse->since_memory_eviction));
+    }
+    if (reuse->since_disk_eviction) {
+        metrics.observe_reuse_sampler_disk_reuse_age(
+            op, ToSeconds(*reuse->since_disk_eviction));
+    }
+}
+
+void MasterService::SampleMemoryEviction(const TenantId& tenant_id,
+                                         const std::string& user_key,
+                                         const ObjectMetadata& metadata) {
+    // A memory replica that survived (pinned for offload, or being
+    // written) keeps the key in memory: nothing left the cache yet.
+    if (metadata.HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() &&
+                   replica.status() != ReplicaStatus::REMOVED;
+        })) {
+        return;
+    }
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    const bool disk_copy_kept = metadata.HasReplica([](const Replica& replica) {
+        return !replica.is_memory_replica() &&
+               replica.status() != ReplicaStatus::REMOVED;
+    });
+    reuse_sampler_->RecordMemoryEviction(fingerprint, disk_copy_kept,
+                                         ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "memory", SecondsSincePutStart(metadata));
+}
+
+void MasterService::SampleDiskEviction(const TenantId& tenant_id,
+                                       const std::string& user_key,
+                                       const ObjectMetadata& metadata) {
+    const uint64_t fingerprint = ReuseSampler::Fingerprint(tenant_id, user_key);
+    if (!reuse_sampler_->IsSampled(fingerprint)) {
+        return;
+    }
+    reuse_sampler_->RecordDiskEviction(fingerprint, ReuseSampler::Clock::now());
+    MasterMetricManager::instance().observe_reuse_sampler_evicted_age(
+        "disk", SecondsSincePutStart(metadata));
 }
 
 bool MasterService::CancelQueuedOffloadTask(ObjectMetadata& metadata,
@@ -10092,8 +10747,11 @@ auto MasterService::NotifyPromotionFailureFor(
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
+    // How often the offload stall gauges are recomputed.
+    constexpr auto kOffloadStallMetricsInterval = std::chrono::seconds(10);
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_offload_stall_metrics_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
         // eviction, expired-processing discard and promotion retry all
@@ -10135,6 +10793,15 @@ void MasterService::EvictionThreadFunc() {
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
+        }
+
+        if (offload_stall_metrics_) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_offload_stall_metrics_time) {
+                UpdateOffloadStallMetrics();
+                next_offload_stall_metrics_time =
+                    steady_now + kOffloadStallMetricsInterval;
+            }
         }
 
         // The namespace policy's own round, such as a tenant over its OWN
@@ -10179,6 +10846,14 @@ void MasterService::EvictionThreadFunc() {
 
         if (!promotion_candidates_.Empty()) {
             RunPromotionCandidateRetry();
+        }
+
+        // offload_admission_second_put: zero the generation the last
+        // rotation retired, a slice per iteration, so that PutEnd never
+        // zeroes or allocates.
+        if (offload_admission_filter_) {
+            offload_admission_filter_->PrepareSpare(
+                kOffloadAdmissionPrepareBytesPerIteration);
         }
 
         // Unconditional call: MaybeTrimHeap() owns both the cadence of
@@ -10556,6 +11231,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
         }
         LOG(WARNING) << "Offloading task expired for key: " << key
                      << " tenant=" << tenant_id;
+        if (offload_stall_metrics_) {
+            MasterMetricManager::instance().inc_offload_tasks_expired();
+        }
         ReleaseOffloadingTask(&accessor.Get(), accessor.GetState());
     }
 

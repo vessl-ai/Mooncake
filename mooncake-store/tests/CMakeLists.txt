@@ -156,6 +156,9 @@ add_store_test(master_service_tenant_quota_test
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
+add_store_test(disk_unmount_sweep_test disk_unmount_sweep_test.cpp)
+add_store_test(placement_key_test placement_key_test.cpp)
+add_store_test(reuse_sampler_test reuse_sampler_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
 add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
@@ -182,6 +185,7 @@ set_tests_properties(master_service_hca_affinity_test
 add_store_test(batch_replica_clear_tenant_rpc_test
                batch_replica_clear_tenant_rpc_test.cpp)
 add_store_test(rpc_worker_pool_test rpc_worker_pool_test.cpp)
+add_store_test(segment_drain_test segment_drain_test.cpp)
 add_test(
   NAME object_checksum_client_test
   COMMAND
@@ -399,6 +403,7 @@ add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(bucket_eviction_read_test bucket_eviction_read_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test

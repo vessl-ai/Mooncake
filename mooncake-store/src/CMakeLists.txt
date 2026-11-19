@@ -48,6 +48,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     handoff/handoff_admission.cpp
     handoff/handoff_runtime.cpp
     master_metric_manager.cpp
+    reuse_sampler.cpp
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp

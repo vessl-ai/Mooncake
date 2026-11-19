@@ -1371,6 +1371,7 @@ struct CompleteOffloadAction {
 };
 
 CompleteOffloadAction CompleteOffload(std::initializer_list<std::string> keys);
+CompleteOffloadAction CompleteOffload(std::vector<std::string> keys);
 
 struct EvictDiskReplicaAction {
     std::string key;

@@ -65,6 +65,8 @@ class FakeStore:
         self.fail_unmount_local_disk = False
         self.fence_local_disk_calls = []
         self.fence_local_disk_ret = 0
+        self.unmount_memory_segments_calls = 0
+        self.unmount_memory_segments_ret = 0
         self.setup_calls = []
 
     def setup(self, *args):
@@ -115,11 +117,16 @@ class FakeStore:
         self.fence_local_disk_calls.append(reason)
         return self.fence_local_disk_ret
 
+    def unmount_memory_segments(self):
+        self.unmount_memory_segments_calls += 1
+        return self.unmount_memory_segments_ret
+
 
 class FakeRequest:
-    def __init__(self, body, json_error=None):
+    def __init__(self, body, json_error=None, remote="127.0.0.1"):
         self.body = body
         self.json_error = json_error
+        self.remote = remote
 
     async def json(self):
         if self.json_error is not None:
@@ -581,6 +588,45 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         resp = await self.service.handle_unmount_local_disk(FakeRequest({}))
         self.assertEqual(resp.status, 500)
         self.assertEqual(self.fake_store.unmount_local_disk_calls, [0])
+
+    # ============= /api/unmount_memory_segments tests =============
+
+    async def test_unmount_memory_segments_ignores_the_body(self):
+        for request in (
+            FakeRequest({}),
+            FakeRequest(None, json_error=json.JSONDecodeError("bad", "doc", 0)),
+        ):
+            resp = await self.service.handle_unmount_memory_segments(request)
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(resp.text)["status"], "success")
+        self.assertEqual(self.fake_store.unmount_memory_segments_calls, 2)
+
+    async def test_unmount_memory_segments_accepts_loopback_callers_only(self):
+        for remote in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            resp = await self.service.handle_unmount_memory_segments(
+                FakeRequest({}, remote=remote)
+            )
+            self.assertEqual(resp.status, 200, remote)
+        for remote in ("10.0.0.5", "198.18.25.19", None, ""):
+            resp = await self.service.handle_unmount_memory_segments(
+                FakeRequest({}, remote=remote)
+            )
+            self.assertEqual(resp.status, 403, remote)
+        self.assertEqual(self.fake_store.unmount_memory_segments_calls, 3)
+
+    async def test_unmount_memory_segments_store_failure(self):
+        self.fake_store.unmount_memory_segments_ret = -1
+        resp = await self.service.handle_unmount_memory_segments(FakeRequest({}))
+        self.assertEqual(resp.status, 500)
+        self.assertIn("ret=-1", json.loads(resp.text)["error"])
+        self.assertEqual(self.fake_store.unmount_memory_segments_calls, 1)
+
+    async def test_unmount_memory_segments_leaves_the_disk_tier_alone(self):
+        resp = await self.service.handle_unmount_memory_segments(FakeRequest({}))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.fake_store.unmount_local_disk_calls, [])
+        self.assertEqual(self.fake_store.unmount_calls, [])
+        self.assertEqual(self.fake_store.free_unmount_calls, [])
 
     # ============= /api/fence_local_disk tests =============
 

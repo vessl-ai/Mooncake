@@ -46,12 +46,14 @@
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
+#include "offload_admission_filter.h"
 #include "metadata/namespace_table.h"
 #include "metadata/object_route.h"
 #include "metadata/object_state.h"
 #include "promotion_candidate_tracker.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "reuse_sampler.h"
 #include "ha/ha_types.h"
 #include "ha/snapshot/batch_oplog/promotion.h"
 #include "task_manager.h"
@@ -746,6 +748,10 @@ class MasterService {
      * registration and writes the replica inside one shared-lock section,
      * which therefore falls entirely before the deregistration (registered,
      * then swept) or entirely after (refused with SEGMENT_NOT_FOUND).
+     *
+     * With async_disk_unmount_sweep the call returns right after the
+     * deregistration and the sweep runs in the background; the replicas are
+     * unreadable from the return on (see DiskUnmountSweepJob).
      */
     auto UnmountLocalDiskSegment(const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -1354,6 +1360,17 @@ class MasterService {
     // handles stale table-wide.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
+    // One namespace's part of ClearStaleHandles, over one route stripe or,
+    // without `stripe`, all of them. `on_removed` (optional) sees each replica
+    // the cleanup removes, before it is erased; with HA oplog the cleanup is
+    // only persisted here, so it sees none. The first OpLog error goes to
+    // `first_persist_error`.
+    void ClearStaleHandlesIn(
+        const TenantId& tenant_id, metadata::Namespace& ns,
+        std::optional<size_t> stripe,
+        const std::function<bool(const Replica&)>& is_stale,
+        const std::function<void(const Replica&)>* on_removed,
+        std::optional<ErrorCode>& first_persist_error);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
@@ -1534,6 +1551,13 @@ class MasterService {
         std::vector<Replica::Descriptor> remaining;
         bool would_invalidate{false};
     };
+    // A completed replica a write's stale cleanup removes: memory on a gone
+    // segment, or a local-disk replica whose owner no longer retains
+    // resources or whose owner's background unmount sweep is pending.
+    bool IsStaleHandle(
+        const Replica& replica,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+        const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
@@ -1615,6 +1639,32 @@ class MasterService {
                           const std::string& writer_host_id,
                           bool* dfs_allocation_failed = nullptr)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    // --placement_key_hrw: when the config names a placement key
+    // (placement_key.h), rebuilds `preferred_segments` with each key replaced
+    // by the serving segments in its HRW order. Leaves it unchanged
+    // otherwise. Called under the allocator access of AllocateReplicas.
+    void ExpandPlacementKeys(
+        const ReplicateConfig& config,
+        const ScopedAllocatorAccess& allocator_access,
+        std::vector<std::string>& preferred_segments) const;
+
+    // offload_admission_read_since_put: a read served from memory clears the
+    // object's unread mark. Loads first so that a hot object's cache line is
+    // not written on every read.
+    static void MarkReadFromMemory(const ObjectMetadata& metadata) {
+        if (metadata.unread_since_put.load(std::memory_order_relaxed)) {
+            metadata.unread_since_put.store(false, std::memory_order_relaxed);
+        }
+    }
+
+    // offload_admission_second_put: whether a PutEnd may queue its eager
+    // offload. True when the mode is off. Otherwise the first call of a write
+    // records the put in the admission filter, answers whether the key was
+    // put before and keeps the answer in `metadata`; a later call of the same
+    // write (metadata.eager_offload_judged) returns that kept answer.
+    bool AdmitEagerOffload(const ObjectIdentity& object_id,
+                           ObjectMetadata& metadata);
 
     class MetadataAccessorRW;
     // Publishes a new object under the key `accessor` holds, which must hold
@@ -1735,6 +1785,65 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         const L4TaskId& task_id, std::vector<UUID>* mirror_clients = nullptr);
 
+    // Ghost-key reuse-age sampler hooks (enable_reuse_sampler). Callers
+    // check reuse_sampler_ first, so with the sampler off each hook costs one
+    // branch. The sampler's own locks are leaf locks, so the eviction hooks
+    // may run while an object's lock is held.
+    //
+    // A reference (ExistKey with lease, GetReplicaList, PutStart) of `key`.
+    // `op` is the metric label: "exist", "get" or "put_start".
+    void SampleReuseReference(const TenantId& tenant_id,
+                              const std::string& user_key, const char* op);
+    // An eviction just freed memory replicas of `metadata`. Records a ghost
+    // when no memory replica is left.
+    void SampleMemoryEviction(const TenantId& tenant_id,
+                              const std::string& user_key,
+                              const ObjectMetadata& metadata);
+    // A disk eviction removed the last replica of `metadata`.
+    void SampleDiskEviction(const TenantId& tenant_id,
+                            const std::string& user_key,
+                            const ObjectMetadata& metadata);
+
+    // Recomputes the offload stall gauges by walking every object's offload
+    // task (enable_offload_stall_metrics). Takes master_state_mutex_ shared
+    // and each object's lock in turn.
+    void UpdateOffloadStallMetrics();
+
+    // ---- Background LOCAL_DISK unmount sweep (async_disk_unmount_sweep).
+    //
+    // With it on, UnmountLocalDiskSegment drops the registration and records
+    // the owner here in the same master_state_mutex_ (exclusive) section,
+    // then returns; disk_unmount_sweep_worker_ erases the owner's replicas.
+    // Until an owner's sweep has visited every route stripe after its
+    // unmount:
+    //   - its LOCAL_DISK replicas are never readable (IsReplicaReadable), so
+    //     no reader is sent to a disk the store has handed back;
+    //   - PutStart, UpsertStart and Remove treat them as stale;
+    //   - the same client cannot mount a LOCAL_DISK tier again
+    //     (MountLocalDiskSegment refuses with UNAVAILABLE_IN_CURRENT_STATUS),
+    //     so a new registration never coexists with replicas of the old one,
+    //     exactly as after the synchronous sweep.
+    // No replica of an unregistered owner can be added (NotifyOffloadSuccess
+    // checks the registration under master_state_mutex_), so a sweep that has
+    // visited every stripe once has erased them all.
+    struct DiskUnmountSweepJob {
+        UUID owner;
+        std::chrono::steady_clock::time_point started;
+        size_t stripes_left = route::ObjectRoute::kStripeCount;
+        uint64_t removed_replicas = 0;
+    };
+    // True if `owner`'s unmount sweep is pending.
+    bool DiskUnmountSweepPending(const UUID& owner) const;
+    // True for a LOCAL_DISK replica whose owner's unmount sweep is pending.
+    bool IsDiskReplicaOfSweepingOwner(const Replica& replica) const;
+    // True when every replica of the object is REMOVED or hidden by a pending
+    // unmount sweep: readers then get OBJECT_NOT_FOUND, as after the
+    // synchronous sweep. Always false with the flag off.
+    bool OnlyReplicasOfSweepingOwners(const ObjectMetadata& metadata) const;
+    // Worker body: visits stripes until no sweep is pending or it stops.
+    void RunDiskUnmountSweeps();
+    void PublishDiskUnmountSweepProgressLocked() const;
+
     // A new id for an L4 offload or promotion task of this instance:
     // l4_task_epoch_ and the next sequence number.
     L4TaskId NextL4TaskId() {
@@ -1770,6 +1879,8 @@ class MasterService {
         graceful_unmount_scheduler_;
     BackgroundWorker replica_cleanup_worker_;
     BackgroundWorker kvcs_capacity_refresh_worker_;
+    // Runs RunDiskUnmountSweeps (async_disk_unmount_sweep).
+    BackgroundWorker disk_unmount_sweep_worker_;
     const bool enable_async_segment_cleanup_;
 
     /**
@@ -2213,6 +2324,66 @@ class MasterService {
     // Offload-on-evict: defer disk offload to eviction time
     // (config: offload_on_evict)
     bool offload_on_evict_{false};
+    // Evict-without-disk: with offload_on_evict, evict a key at once (no
+    // disk copy, as the eager mode does) when its offload push fails because
+    // the owning store has no LOCAL_DISK tier taking offloads. Other push
+    // failures still skip the key. (config: offload_evict_without_local_disk,
+    // only effective when offload_on_evict_=true)
+    bool offload_evict_without_local_disk_{false};
+    // Frontier-only offload: with offload_on_evict, a pool eviction run
+    // queues offloads only for its frontier (the oldest-lease objects its
+    // target asks for). Other objects it visits are freed only when they
+    // already have a disk copy. (config: offload_evict_frontier_only, only
+    // effective when offload_on_evict_=true)
+    bool offload_evict_frontier_only_{false};
+    // Second-put admission: in eager mode PutEnd queues an offload only for a
+    // key the filter has seen put before. Null when off. (config:
+    // offload_admission_second_put, offload_admission_window_puts,
+    // offload_admission_bloom_filter; only with enable_offload_ and
+    // offload_on_evict_=false)
+    std::unique_ptr<OffloadAdmissionFilter> offload_admission_filter_;
+    // Read-since-put admission: with offload_on_evict, eviction drops
+    // without a disk copy an object marked unread_since_put. (config:
+    // offload_admission_read_since_put, only with offload_on_evict_=true)
+    bool offload_admission_read_since_put_{false};
+    // offload_admission_second_put: bytes the eviction thread zeroes per
+    // iteration while preparing the next filter generation (a 256 MiB
+    // generation at the default window takes 8 iterations).
+    static constexpr size_t kOffloadAdmissionPrepareBytesPerIteration =
+        32ULL * 1024 * 1024;
+    // Upper bound of offload_admission_window_puts (24 bytes per window put:
+    // 6 GiB).
+    static constexpr size_t kMaxOffloadAdmissionWindowPuts = 1ULL << 28;
+
+    // Offload stall metrics (config: enable_offload_stall_metrics).
+    bool offload_stall_metrics_{false};
+
+    // Ghost-key reuse-age sampler (config: enable_reuse_sampler). Null when
+    // off; set once in the constructor and never changed.
+    std::unique_ptr<ReuseSampler> reuse_sampler_;
+
+    // --placement_key_hrw (default off; placement_key.h).
+    bool placement_key_hrw_{false};
+
+    // async_disk_unmount_sweep state; see DiskUnmountSweepJob. True when the
+    // flag is on and effective (offload on; HA and CXL off, as for
+    // enable_async_segment_cleanup_).
+    bool async_disk_unmount_sweep_{false};
+    // Guards disk_unmount_sweep_jobs_. A leaf lock: taken under object locks
+    // (readers) and under master_state_mutex_ (unmount, mount); nothing is
+    // acquired while it is held.
+    mutable std::shared_mutex disk_unmount_sweep_mutex_;
+    // Notified when a sweep finishes.
+    std::condition_variable_any disk_unmount_sweep_cv_;
+    std::vector<DiskUnmountSweepJob> disk_unmount_sweep_jobs_;
+    // Fast path for readers: number of entries in disk_unmount_sweep_jobs_.
+    std::atomic<size_t> disk_unmount_sweep_owner_count_{0};
+    std::atomic<bool> disk_unmount_sweep_stopping_{false};
+    // Next stripe the worker visits; only the worker thread touches it.
+    size_t disk_unmount_sweep_cursor_{0};
+    // Test hook: called on the worker thread before each stripe step, with
+    // the stripe index, no lock held.
+    std::function<void(size_t)> disk_unmount_sweep_stripe_hook_;
 
     // Promotion-on-hit: opt-in flag enabling LOCAL_DISK -> MEMORY promotion
     // when a Get observes a key with only LOCAL_DISK replicas.

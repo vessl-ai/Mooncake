@@ -565,18 +565,22 @@ TEST_F(EvictorTest, AScopedRunStaysInItsNamespace) {
 // Accepts the first `capacity` offloads.
 class FakeOffloadQueue final : public eviction::OffloadQueue {
    public:
-    std::optional<L4TaskId> Push(const TenantId&, const std::string& key,
-                                 Replica&,
-                                 std::vector<UUID>* mirror_clients) override {
+    tl::expected<L4TaskId, ErrorCode> Push(
+        const TenantId&, const std::string& key, Replica&,
+        std::vector<UUID>* mirror_clients) override {
         if (pushed.size() >= capacity) {
-            return std::nullopt;
+            return tl::make_unexpected(full_error);
         }
         pushed.push_back(key);
         mirror_clients->push_back(UUID{7, 7});
         return L4TaskId{.epoch = 1, .seq = pushed.size()};
     }
 
+    bool KeepsData(const Replica&) const override { return keeps_data; }
+
     size_t capacity = SIZE_MAX;
+    ErrorCode full_error = ErrorCode::KEYS_ULTRA_LIMIT;
+    bool keeps_data = true;
     std::vector<std::string> pushed;
 };
 
@@ -686,6 +690,103 @@ TEST_F(OffloadingReclaimerTest, ARejectedOffloadKeepsTheObjectUnlessForced) {
     ASSERT_TRUE(forced.has_value());
     EXPECT_EQ(forced->outcome, Outcome::kDropped);
     EXPECT_EQ(forced->reason, eviction::DropReason::kOffloadRejected);
+}
+
+TEST_F(OffloadingReclaimerTest, ADiskCopyThatKeepsNoDataNeedsOffload) {
+    Publish("a", "k", seconds(10));
+    {
+        auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write("k");
+        std::vector<Replica> disk;
+        disk.emplace_back(UUID{3, 4}, 128, "endpoint", ReplicaStatus::COMPLETE);
+        hold->metadata().AddReplicas(std::move(disk));
+    }
+    queue_.keeps_data = false;
+
+    auto effect = Apply("k", {});
+
+    ASSERT_TRUE(effect.has_value());
+    EXPECT_EQ(effect->outcome, Outcome::kOffloadQueued);
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"k"});
+}
+
+TEST_F(OffloadingReclaimerTest, NoLocalDiskDropsOnlyWhenOptedIn) {
+    Publish("a", "kept", seconds(10));
+    Publish("a", "dropped", seconds(10));
+    queue_.capacity = 0;
+    queue_.full_error = ErrorCode::UNABLE_OFFLOADING;
+
+    auto kept = Apply("kept", {});
+    ASSERT_TRUE(kept.has_value());
+    EXPECT_EQ(kept->outcome, Outcome::kKept);
+    EXPECT_EQ(kept->keep_reason, eviction::KeepReason::kNoLocalDisk);
+
+    auto dropped = Apply("dropped", {.evict_without_local_disk = true});
+    ASSERT_TRUE(dropped.has_value());
+    EXPECT_EQ(dropped->outcome, Outcome::kDropped);
+    EXPECT_EQ(dropped->reason, eviction::DropReason::kNoLocalDisk);
+}
+
+// A full queue may drain, so the object waits even when opted in.
+TEST_F(OffloadingReclaimerTest, AFullQueueKeepsTheObjectWithoutLocalDiskOptIn) {
+    Publish("a", "k", seconds(10));
+    queue_.capacity = 0;
+
+    auto effect = Apply("k", {.evict_without_local_disk = true});
+
+    ASSERT_TRUE(effect.has_value());
+    EXPECT_EQ(effect->outcome, Outcome::kKept);
+    EXPECT_EQ(effect->keep_reason, eviction::KeepReason::kNone);
+}
+
+TEST_F(OffloadingReclaimerTest, PastTheFrontierOnlyDiskCopiesGo) {
+    Publish("a", "queued", seconds(10));
+    Publish("a", "past", seconds(10));
+    Publish("a", "on_disk", seconds(10));
+    {
+        auto hold =
+            namespaces_.GetOrCreate(TenantId("a")).objects.Write("on_disk");
+        std::vector<Replica> disk;
+        disk.emplace_back(UUID{3, 4}, 128, "endpoint", ReplicaStatus::COMPLETE);
+        hold->metadata().AddReplicas(std::move(disk));
+    }
+    eviction::Report so_far;
+    so_far.frontier_end = 1;
+
+    EXPECT_EQ(Apply("queued", {.frontier_only = true}, so_far)->outcome,
+              Outcome::kOffloadQueued);
+    so_far.outcomes[static_cast<size_t>(Outcome::kOffloadQueued)] = 1;
+
+    auto past = Apply("past", {.frontier_only = true}, so_far);
+    ASSERT_TRUE(past.has_value());
+    EXPECT_EQ(past->outcome, Outcome::kKept);
+    EXPECT_EQ(past->keep_reason, eviction::KeepReason::kBeyondFrontier);
+    EXPECT_EQ(Apply("on_disk", {.frontier_only = true}, so_far)->outcome,
+              Outcome::kDemoted);
+    EXPECT_EQ(queue_.pushed, std::vector<std::string>{"queued"});
+}
+
+TEST_F(OffloadingReclaimerTest, AnUnreadObjectInTheFrontierGoesWithoutOffload) {
+    Publish("a", "unread", seconds(10));
+    Publish("a", "unread_past", seconds(10));
+    Publish("a", "read", seconds(10));
+    for (const char* key : {"unread", "unread_past"}) {
+        auto hold = namespaces_.GetOrCreate(TenantId("a")).objects.Write(key);
+        hold->metadata().unread_since_put.store(true);
+    }
+
+    auto unread = Apply("unread", {.drop_unread = true});
+    ASSERT_TRUE(unread.has_value());
+    EXPECT_EQ(unread->outcome, Outcome::kDropped);
+    EXPECT_EQ(unread->reason, eviction::DropReason::kUnread);
+    EXPECT_EQ(Apply("read", {.drop_unread = true})->outcome,
+              Outcome::kOffloadQueued);
+
+    // Past the frontier an unread object is queued like any other.
+    eviction::Report so_far;
+    so_far.frontier_end = 1;
+    so_far.outcomes[static_cast<size_t>(Outcome::kDropped)] = 1;
+    EXPECT_EQ(Apply("unread_past", {.drop_unread = true}, so_far)->outcome,
+              Outcome::kOffloadQueued);
 }
 
 TEST_F(OffloadingReclaimerTest, PastTheCapAForcedRunDropsWithoutOffload) {
