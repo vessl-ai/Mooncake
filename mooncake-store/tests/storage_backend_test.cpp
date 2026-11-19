@@ -800,6 +800,40 @@ TEST_F(StorageBackendTest, MissingBucketDataFileCleanup) {
     EXPECT_TRUE(recovered_keys.empty());
 }
 
+TEST_F(StorageBackendTest, BucketKeepsReadableBytesAfterLostCompletionReply) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+
+    std::string value = "published bytes";
+    for (auto error : {ErrorCode::RPC_TIMEOUT, ErrorCode::RPC_FAIL}) {
+        const auto key = toString(error);
+        auto expect_readable = [&] {
+            std::string buffer(value.size(), '\0');
+            std::unordered_map<std::string, Slice> slices{
+                {key, {buffer.data(), buffer.size()}}};
+            ASSERT_TRUE(backend.BatchLoad(slices));
+            EXPECT_EQ(std::string(static_cast<const char*>(slices.at(key).ptr),
+                                  value.size()),
+                      value);
+        };
+
+        auto result = backend.BatchOffload(
+            {{key, {{value.data(), value.size()}}}}, [&](const auto&, auto&) {
+                expect_readable();
+                return error;
+            });
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), error);
+        expect_readable();
+    }
+    auto metadata = backend.GetStoreMetadata();
+    ASSERT_TRUE(metadata);
+    EXPECT_EQ(metadata->total_keys, 2);
+    EXPECT_GE(metadata->total_size, 2 * value.size());
+}
+
 TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
     std::string test_dir = data_path + "/rollback_test";
     fs::create_directories(test_dir);
@@ -874,6 +908,66 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
     }
     EXPECT_EQ(bucket_file_count, 0)
         << "No bucket data or metadata files should remain after rollback";
+}
+
+TEST_F(StorageBackendTest, AdaptorRejectedWriteReleasesQuota) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.total_size_limit = 3;
+    FilePerKeyConfig per_key_config;
+    per_key_config.fsdir = "objects";
+    per_key_config.enable_eviction = false;
+    StorageBackendAdaptor backend(config, per_key_config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(
+        backend.ScanMeta([](const auto&, auto&) { return ErrorCode::OK; }));
+
+    std::string value = "old";
+    const std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"rejected", {{value.data(), value.size()}}}};
+    for (auto error : {ErrorCode::INVALID_READ,
+                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS}) {
+        auto result = backend.BatchOffload(
+            batch, [error](const auto&, auto&) { return error; });
+        ASSERT_FALSE(result);
+        EXPECT_EQ(result.error(), error);
+        EXPECT_FALSE(backend.IsExist("rejected").value());
+        EXPECT_TRUE(backend.IsEnableOffloading().value());
+    }
+}
+
+TEST_F(StorageBackendTest, OffsetRejectedBatchRestoresOldValueAndQuota) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.total_size_limit = 10 * 1024 * 1024;
+    config.total_keys_limit = 2;
+    OffsetAllocatorBackendConfig offset_config;
+    offset_config.low_watermark_keys = 1;
+    offset_config.high_watermark_keys = 2;
+    OffsetAllocatorStorageBackend backend(config, offset_config);
+    ASSERT_TRUE(backend.Init());
+
+    std::string old_value = "old";
+    ASSERT_TRUE(backend.BatchOffload(
+        {{"key", {{old_value.data(), old_value.size()}}}}, nullptr));
+    std::string new_value = "new";
+    auto result = backend.BatchOffload(
+        {{"key", {{new_value.data(), new_value.size()}}},
+         {"rejected", {{new_value.data(), new_value.size()}}}},
+        [](const auto& keys, auto&) {
+            EXPECT_EQ(keys.size(), 2u);
+            return ErrorCode::INVALID_READ;
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_READ);
+    EXPECT_FALSE(backend.IsExist("rejected").value());
+    EXPECT_TRUE(backend.IsEnableOffloading().value());
+
+    std::string loaded(3, '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {"key", {loaded.data(), loaded.size()}}};
+    ASSERT_TRUE(backend.BatchLoad(slices));
+    EXPECT_EQ(loaded, old_value);
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
