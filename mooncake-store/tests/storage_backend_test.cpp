@@ -944,14 +944,16 @@ TEST_F(StorageBackendTest, OffsetRejectedBatchRestoresOldValueAndQuota) {
     OffsetAllocatorBackendConfig offset_config;
     offset_config.low_watermark_keys = 1;
     offset_config.high_watermark_keys = 2;
-    OffsetAllocatorStorageBackend backend(config, offset_config);
-    ASSERT_TRUE(backend.Init());
+    offset_config.persist_mode = OffsetPersistMode::kStrict;
+    auto backend =
+        std::make_unique<OffsetAllocatorStorageBackend>(config, offset_config);
+    ASSERT_TRUE(backend->Init());
 
     std::string old_value = "old";
-    ASSERT_TRUE(backend.BatchOffload(
+    ASSERT_TRUE(backend->BatchOffload(
         {{"key", {{old_value.data(), old_value.size()}}}}, nullptr));
     std::string new_value = "new";
-    auto result = backend.BatchOffload(
+    auto result = backend->BatchOffload(
         {{"key", {{new_value.data(), new_value.size()}}},
          {"rejected", {{new_value.data(), new_value.size()}}}},
         [](const auto& keys, auto&) {
@@ -960,14 +962,22 @@ TEST_F(StorageBackendTest, OffsetRejectedBatchRestoresOldValueAndQuota) {
         });
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error(), ErrorCode::INVALID_READ);
-    EXPECT_FALSE(backend.IsExist("rejected").value());
-    EXPECT_TRUE(backend.IsEnableOffloading().value());
+    auto expect_rollback = [&](OffsetAllocatorStorageBackend& storage) {
+        EXPECT_FALSE(storage.IsExist("rejected").value());
+        EXPECT_TRUE(storage.IsEnableOffloading().value());
+        std::string loaded(3, '\0');
+        std::unordered_map<std::string, Slice> slices{
+            {"key", {loaded.data(), loaded.size()}}};
+        ASSERT_TRUE(storage.BatchLoad(slices));
+        EXPECT_EQ(loaded, old_value);
+    };
+    expect_rollback(*backend);
+    backend->SetSkipFinalCheckpointForTest();
+    backend.reset();
 
-    std::string loaded(3, '\0');
-    std::unordered_map<std::string, Slice> slices{
-        {"key", {loaded.data(), loaded.size()}}};
-    ASSERT_TRUE(backend.BatchLoad(slices));
-    EXPECT_EQ(loaded, old_value);
+    OffsetAllocatorStorageBackend recovered(config, offset_config);
+    ASSERT_TRUE(recovered.Init());
+    expect_rollback(recovered);
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {

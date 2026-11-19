@@ -5751,6 +5751,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (OffloadCompletionRejectedBeforePublication(error_code)) {
+            std::vector<ObjectEntry> pinned_rejected_entries;
             {
                 MutexLocker ev_lock(&eviction_mutex_);
                 for (const auto& key : keys) {
@@ -5762,6 +5763,11 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
                     fifo_index_.erase(entry->second.fifo_seq);
                     auto previous = replaced_entries.find(key);
                     if (previous != replaced_entries.end()) {
+                        if (persist_enabled &&
+                            entry->second.allocation.use_count() > 1) {
+                            pinned_rejected_entries.push_back(
+                                std::move(entry->second));
+                        }
                         entry->second = std::move(previous->second);
                         total_size_.fetch_add(entry->second.total_size,
                                               std::memory_order_relaxed);
@@ -5778,6 +5784,19 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             }
             metadata_dirty_.store(true, std::memory_order_relaxed);
             if (persist_enabled) {
+                // The checkpoint includes extents still pinned by readers.
+                // Recovery must skip a rejected replacement in such an extent.
+                std::array<char, RecordHeader::SIZE> invalid_header{};
+                for (const auto& entry : pinned_rejected_entries) {
+                    iovec header{invalid_header.data(), invalid_header.size()};
+                    auto written =
+                        data_file->vector_write(&header, 1, entry.offset);
+                    if (!written || *written != invalid_header.size()) {
+                        LOG(ERROR) << "Failed to invalidate rejected record at "
+                                   << entry.offset;
+                    }
+                }
+                pinned_rejected_entries.clear();
                 auto checkpoint = data_file->datasync();
                 auto saved = checkpoint
                                  ? SaveMetadata(all_evicted_this_batch_)
