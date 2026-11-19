@@ -8,6 +8,7 @@
 
 #include "client_service.h"
 #include "client_buffer.h"
+#include "offload_read_guard.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
 
@@ -101,6 +102,9 @@ class FileStorage {
         const std::vector<int64_t>& offsets,
         const std::vector<int64_t>& lengths,
         const std::vector<int64_t>& object_sizes);
+
+    // The read guard (config_.offload_read_deadline_ms > 0), else nullptr.
+    const OffloadReadGuard* read_guard() const { return read_guard_.get(); }
 
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
@@ -506,6 +510,24 @@ class FileStorage {
         test_offload_completion_rpc_;
     std::mutex heartbeat_wake_mutex_;
     std::condition_variable heartbeat_wake_cv_;
+    // Bounds BatchGet and BatchGetRanges (peer offload reads) when
+    // configured. Reset first in the destructor: its late reads release
+    // buffers through this object.
+    std::unique_ptr<OffloadReadGuard> read_guard_;
+
+    // Runs `read`, a peer offload read of `keys`, through the read guard
+    // when it is on. `read` may outlive this call, so it owns what it reads.
+    tl::expected<BatchGetResult, ErrorCode> GuardPeerRead(
+        const std::vector<std::string>& keys,
+        std::function<tl::expected<BatchGetResult, ErrorCode>()> read);
+    tl::expected<BatchGetResult, ErrorCode> BatchGetUnguarded(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+    tl::expected<BatchGetResult, ErrorCode> BatchGetRangesUnguarded(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
 };
 
 }  // namespace mooncake

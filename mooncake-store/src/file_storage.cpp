@@ -159,6 +159,18 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     // Export 0 from the start: an unset gauge has no series at all.
     if (ssd_metric_) ssd_metric_->ssd_disk_fenced.update(0);
 
+    if (config_.offload_read_deadline_ms > 0) {
+        read_guard_ = std::make_unique<OffloadReadGuard>(
+            std::chrono::milliseconds(config_.offload_read_deadline_ms),
+            std::chrono::milliseconds(config_.offload_read_shed_ms),
+            config_.offload_read_threads);
+        if (ssd_metric_) ssd_metric_->read_guard_enabled = true;
+        LOG(INFO) << "Offload read guard enabled: deadline_ms="
+                  << config_.offload_read_deadline_ms
+                  << ", shed_ms=" << config_.offload_read_shed_ms
+                  << ", threads=" << config_.offload_read_threads;
+    }
+
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
     // can lazily pick up the registration on their first I/O call.
@@ -183,6 +195,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
+    // Waits for late reads, which release their buffers through this object.
+    read_guard_.reset();
     heartbeat_running_ = false;
     WakeHeartbeat();
     if (heartbeat_thread_.joinable()) {
@@ -380,6 +394,39 @@ FileStorage::LoadRanges(const std::vector<std::string>& keys,
 
 tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    if (!read_guard_) return BatchGetUnguarded(keys, sizes);
+    // The read may outlive this call (and the caller's vectors): it gets
+    // copies.
+    return GuardPeerRead(keys, [this, keys, sizes]() {
+        return BatchGetUnguarded(keys, sizes);
+    });
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::GuardPeerRead(
+    const std::vector<std::string>& keys,
+    std::function<tl::expected<BatchGetResult, ErrorCode>()> read) {
+    // A late result is released here instead of returned.
+    OffloadReadGuard::Outcome outcome = OffloadReadGuard::Outcome::kDone;
+    auto result = read_guard_->Run<BatchGetResult>(
+        std::move(read),
+        [this](const BatchGetResult& late) { ReleaseBuffer(late.batch_id); },
+        &outcome);
+    if (ssd_metric_) {
+        if (outcome == OffloadReadGuard::Outcome::kDeadlineMiss) {
+            ssd_metric_->ssd_read_deadline_miss.inc();
+            ssd_metric_->ssd_read_deadline_miss_keys.inc(keys.size());
+        } else if (outcome == OffloadReadGuard::Outcome::kShed) {
+            ssd_metric_->ssd_read_shed.inc();
+            ssd_metric_->ssd_read_shed_keys.inc(keys.size());
+        }
+    }
+    return result;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetUnguarded(const std::vector<std::string>& keys,
+                               const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto load_result = LoadBatch(keys, sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
@@ -468,6 +515,19 @@ FileStorage::BatchGetRanges(const std::vector<std::string>& keys,
                             const std::vector<int64_t>& offsets,
                             const std::vector<int64_t>& lengths,
                             const std::vector<int64_t>& object_sizes) {
+    if (!read_guard_) {
+        return BatchGetRangesUnguarded(keys, offsets, lengths, object_sizes);
+    }
+    return GuardPeerRead(keys, [this, keys, offsets, lengths, object_sizes]() {
+        return BatchGetRangesUnguarded(keys, offsets, lengths, object_sizes);
+    });
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode>
+FileStorage::BatchGetRangesUnguarded(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& offsets,
+                                     const std::vector<int64_t>& lengths,
+                                     const std::vector<int64_t>& object_sizes) {
     auto load_result = LoadRanges(keys, offsets, lengths, object_sizes, false);
     if (!load_result) return tl::make_unexpected(load_result.error());
 
