@@ -527,11 +527,9 @@ class FileStorage {
     // configured. Reset first in the destructor: its late reads release
     // buffers through this object.
     std::unique_ptr<OffloadReadGuard> read_guard_;
-    // Test-only replacement for DropDiskReplicasAfterReadMiss in the
-    // read-miss evictor. Set before the first BatchGet.
-    std::function<tl::expected<void, ErrorCode>(
+    std::function<std::vector<tl::expected<void, ErrorCode>>(
         const std::vector<std::string>&)>
-        test_read_miss_evict_;
+        test_read_miss_evict_rpc_;
     // Drops the master's LOCAL_DISK replicas of keys whose guarded read
     // failed. Reset in the destructor before the client goes away.
     std::unique_ptr<OffloadReadMissEvictor> read_miss_evictor_;

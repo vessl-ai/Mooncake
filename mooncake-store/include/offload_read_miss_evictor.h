@@ -141,7 +141,7 @@ class OffloadReadMissEvictor {
             auto result = evict_(batch);
             if (!result) {
                 LOG_EVERY_N(WARNING, 100)
-                    << "action=offload_read_miss_evict_failed, keys="
+                    << "action=offload_read_miss_evict_failed, batch_keys="
                     << batch.size() << ", error=" << result.error()
                     << " (logged every 100)";
             }

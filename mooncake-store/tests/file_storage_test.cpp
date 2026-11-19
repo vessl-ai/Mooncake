@@ -923,12 +923,17 @@ class FileStorageTest : public ::testing::Test {
             fileStorage.storage_backend_);
     }
 
-    // Replaces the master call of the read-miss evictor.
+    using EvictResults = std::vector<tl::expected<void, ErrorCode>>;
+
     static void SetReadMissEvictHook(
-        FileStorage& fileStorage, std::function<tl::expected<void, ErrorCode>(
-                                      const std::vector<std::string>&)>
-                                      hook) {
-        fileStorage.test_read_miss_evict_ = std::move(hook);
+        FileStorage& fileStorage,
+        std::function<EvictResults(const std::vector<std::string>&)> hook) {
+        fileStorage.test_read_miss_evict_rpc_ = std::move(hook);
+    }
+
+    static auto DropReadMissReplicas(FileStorage& storage,
+                                     const std::vector<std::string>& keys) {
+        return storage.DropDiskReplicasAfterReadMiss(keys);
     }
 
     // Offload read buffers not yet released (BatchGet results waiting for
@@ -1925,11 +1930,10 @@ TEST_F(FileStorageTest, BatchGetRangesReadMissEvictDropsTheKeysOfFailedReads) {
     FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
     ASSERT_NE(fileStorage.read_guard(), nullptr);
     SetReadMissEvictHook(fileStorage,
-                         [&](const std::vector<std::string>& batch)
-                             -> tl::expected<void, ErrorCode> {
+                         [&](const std::vector<std::string>& batch) {
                              std::lock_guard<std::mutex> lock(evicted_mutex);
                              evicted.insert(batch.begin(), batch.end());
-                             return {};
+                             return EvictResults(batch.size());
                          });
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     std::shared_ptr<void> open_gate_on_exit(nullptr, [&](void*) {
@@ -2055,13 +2059,11 @@ TEST_F(FileStorageTest, BatchGetReadMissEvictDropsTheKeysOfFailedReads) {
     SsdMetric metric;
     FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
     ASSERT_NE(fileStorage.read_miss_evictor(), nullptr);
-    SetReadMissEvictHook(fileStorage,
-                         [&](const std::vector<std::string>& k)
-                             -> tl::expected<void, ErrorCode> {
-                             std::lock_guard<std::mutex> lock(evicted_mutex);
-                             evicted.push_back(k);
-                             return {};
-                         });
+    SetReadMissEvictHook(fileStorage, [&](const std::vector<std::string>& k) {
+        std::lock_guard<std::mutex> lock(evicted_mutex);
+        evicted.push_back(k);
+        return EvictResults(k.size());
+    });
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     // Opens the gate if an assertion returns early, so the store's
     // destructor does not wait forever for the parked read.
@@ -2151,6 +2153,29 @@ TEST_F(FileStorageTest, BatchGetReadMissEvictDropsTheKeysOfFailedReads) {
         HasSample(metrics_text, "mooncake_ssd_read_miss_evict_keys_total"));
 }
 
+TEST_F(FileStorageTest, ReadMissEvictionCountsOnlyFailedKeys) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    SsdMetric metric;
+    FileStorage storage(config, nullptr, "localhost:9003", &metric);
+    SetReadMissEvictHook(storage, [](const auto&) {
+        return EvictResults{{},
+                            tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND),
+                            tl::make_unexpected(ErrorCode::RPC_TIMEOUT)};
+    });
+    auto result = DropReadMissReplicas(storage, {"ok", "gone", "failed"});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(metric.ssd_read_miss_evict_failed_keys.value(), 1);
+
+    SetReadMissEvictHook(storage, [](const auto&) { return EvictResults{}; });
+    result = DropReadMissReplicas(storage, {"unknown_a", "unknown_b"});
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(metric.ssd_read_miss_evict_failed_keys.value(), 3);
+}
+
 // Off by default: with the read guard on and offload_read_miss_evict unset,
 // a failed read evicts nothing and the evictor's metrics are not exported.
 TEST_F(FileStorageTest, BatchGetReadMissEvictIsOffByDefault) {
@@ -2172,12 +2197,11 @@ TEST_F(FileStorageTest, BatchGetReadMissEvictIsOffByDefault) {
     SsdMetric metric;
     FileStorage fileStorage(config, nullptr, "localhost:9003", &metric);
     EXPECT_EQ(fileStorage.read_miss_evictor(), nullptr);
-    SetReadMissEvictHook(
-        fileStorage,
-        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
-            ++evict_calls;
-            return {};
-        });
+    SetReadMissEvictHook(fileStorage,
+                         [&](const std::vector<std::string>& keys) {
+                             ++evict_calls;
+                             return EvictResults(keys.size());
+                         });
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     std::shared_ptr<void> open_gate_on_exit(nullptr, [&](void*) {
         {
@@ -2740,10 +2764,7 @@ TEST_F(FileStorageTest, CompletionsRegisterOnlyThroughTheTaskRpc) {
     rig.Stop();
 }
 
-// When the completion RPC fails (e.g. "function not registered" from a master
-// that predates task ids), the store rolls the bucket back and NACKs: no file
-// stays behind that a key-only master could register.
-TEST_F(FileStorageTest, CompletionRpcErrorRollsTheBucketBack) {
+TEST_F(FileStorageTest, RejectedCompletionRollsTheBucketBack) {
     OffloadRig rig;
     rig.Start();
     rig.Put("rollback_key", std::string(128, 'r'));
@@ -2758,18 +2779,49 @@ TEST_F(FileStorageTest, CompletionRpcErrorRollsTheBucketBack) {
     FileStorage file_storage(config, rig.client, rig.endpoint);
     ASSERT_TRUE(InitStorageBackend(file_storage));
     int completion_calls = 0;
-    SetOffloadCompletionRpc(file_storage,
-                            [&completion_calls](const auto&, const auto&) {
-                                ++completion_calls;
-                                return tl::expected<void, ErrorCode>(
-                                    tl::make_unexpected(ErrorCode::RPC_FAIL));
-                            });
+    SetOffloadCompletionRpc(
+        file_storage, [&completion_calls](const auto&, const auto&) {
+            ++completion_calls;
+            return tl::expected<void, ErrorCode>(
+                tl::make_unexpected(ErrorCode::INVALID_READ));
+        });
     (void)FileStorageProcessDrainedOffloads(file_storage, items);
 
     EXPECT_EQ(completion_calls, 1);
     EXPECT_FALSE(StorageKeyExists(file_storage, "rollback_key"));
     EXPECT_EQ(rig.DiskReplicas("rollback_key"), 0u);
     EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));  // NACKed
+    rig.Stop();
+}
+
+TEST_F(FileStorageTest, LostCompletionReplyKeepsRegisteredBucket) {
+    OffloadRig rig;
+    rig.Start();
+    rig.Put("rollback_key", std::string(128, 'r'));
+    auto items = rig.Drain();
+    ASSERT_EQ(items.size(), 1u);
+
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path + "/rollback_ssd";
+    config.local_buffer_size = 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, rig.client, rig.endpoint);
+    ASSERT_TRUE(InitStorageBackend(file_storage));
+    int completion_calls = 0;
+    SetOffloadCompletionRpc(
+        file_storage, [&](const auto& tasks, const auto& metadata) {
+            ++completion_calls;
+            EXPECT_TRUE(rig.client->NotifyOffloadTaskSuccess(tasks, metadata));
+            return tl::expected<void, ErrorCode>(
+                tl::make_unexpected(ErrorCode::RPC_TIMEOUT));
+        });
+    (void)FileStorageProcessDrainedOffloads(file_storage, items);
+
+    EXPECT_EQ(completion_calls, 1);
+    EXPECT_TRUE(StorageKeyExists(file_storage, "rollback_key"));
+    EXPECT_EQ(rig.DiskReplicas("rollback_key"), 1u);
+    EXPECT_FALSE(rig.HasOffloadTask("rollback_key"));
     rig.Stop();
 }
 
@@ -3836,9 +3888,8 @@ TEST_F(FileStorageTest, RemountAfterSegmentNotFoundDropsUnregisteredFiles) {
 
     std::string local_rpc_addr =
         "127.0.0.1:" + std::to_string(getFreeTcpPort());
-    auto client =
-        Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
-                       std::nullopt, master.master_address());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
     ASSERT_TRUE(client.has_value());
     ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
 

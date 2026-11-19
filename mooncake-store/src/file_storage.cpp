@@ -215,16 +215,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             constexpr size_t kMaxPendingKeys = 1 << 20;
             constexpr size_t kMaxBatchKeys = 4096;
             read_miss_evictor_ = std::make_unique<OffloadReadMissEvictor>(
-                [this](const std::vector<std::string>& keys)
-                    -> tl::expected<void, ErrorCode> {
-                    auto result = test_read_miss_evict_
-                                      ? test_read_miss_evict_(keys)
-                                      : DropDiskReplicasAfterReadMiss(keys);
-                    if (!result && ssd_metric_) {
-                        ssd_metric_->ssd_read_miss_evict_failed_keys.inc(
-                            keys.size());
-                    }
-                    return result;
+                [this](const std::vector<std::string>& keys) {
+                    return DropDiskReplicasAfterReadMiss(keys);
                 },
                 kMaxPendingKeys, kMaxBatchKeys);
             if (ssd_metric_) ssd_metric_->read_miss_evict_enabled = true;
@@ -1046,7 +1038,6 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
 
 tl::expected<void, ErrorCode> FileStorage::DropDiskReplicasAfterReadMiss(
     const std::vector<std::string>& storage_keys) {
-    if (!client_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
         keys_by_tenant;
     for (const auto& storage_key : storage_keys) {
@@ -1054,21 +1045,34 @@ tl::expected<void, ErrorCode> FileStorage::DropDiskReplicasAfterReadMiss(
         keys_by_tenant[tenant_id].push_back(key);
     }
     std::optional<ErrorCode> first_error;
+    size_t failed_keys = 0;
     for (const auto& [tenant_id, keys] : keys_by_tenant) {
-        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
-                                                      ReplicaType::LOCAL_DISK);
+        if (!client_ && !test_read_miss_evict_rpc_) {
+            failed_keys += keys.size();
+            if (!first_error) first_error = ErrorCode::INVALID_PARAMS;
+            continue;
+        }
+        auto results =
+            test_read_miss_evict_rpc_
+                ? test_read_miss_evict_rpc_(keys)
+                : client_->BatchEvictDiskReplica(keys, tenant_id.value(),
+                                                 ReplicaType::LOCAL_DISK);
         if (results.size() != keys.size()) {
+            failed_keys += keys.size();
             if (!first_error) first_error = ErrorCode::INTERNAL_ERROR;
             continue;
         }
         for (const auto& result : results) {
             // OBJECT_NOT_FOUND: removed meanwhile, or dropped by an earlier
             // failed read of the same key.
-            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND &&
-                !first_error) {
-                first_error = result.error();
+            if (!result && result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                ++failed_keys;
+                if (!first_error) first_error = result.error();
             }
         }
+    }
+    if (failed_keys && ssd_metric_) {
+        ssd_metric_->ssd_read_miss_evict_failed_keys.inc(failed_keys);
     }
     if (first_error) return tl::make_unexpected(*first_error);
     return {};
